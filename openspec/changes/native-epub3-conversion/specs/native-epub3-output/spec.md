@@ -2,7 +2,7 @@
 
 ### Requirement: Java/AozoraEpub3 非依存の EPUB 生成
 
-`narou convert` は、Java(JRE) と `AozoraEpub3.jar` がいずれもインストールされていない環境でも、`Device::Epub`（`device=epub`）に対して有効な EPUB3 ファイルを生成 SHALL する。生成には外部プロセス（`java` 等）を起動 MUST しない。
+`narou convert` は、Java(JRE) と `AozoraEpub3.jar` がいずれもインストールされていない環境でも、`.epub` を出力するデバイス（Epub / Reader / Ibooks）に対して有効な EPUB3 ファイルを生成 SHALL する。生成には外部プロセス（`java` 等）を起動 MUST しない。
 
 #### Scenario: Java も AozoraEpub3 も無い環境で EPUB を生成
 - **WHEN** `aozoraepub3dir` が未設定、かつ `java` が PATH に存在しない環境で、変換済み小説に対し `narou convert <target> --device epub` を実行する
@@ -13,17 +13,29 @@
 - **WHEN** ネイティブ経路で生成した `.epub` を `unzip` で展開する
 - **THEN** 破損なく全エントリが展開でき、`mimetype` の内容が `application/epub+zip` である
 
-### Requirement: 経路選択と後方互換
+#### Scenario: Reader / Ibooks でも EPUB を生成
+- **WHEN** Java/AozoraEpub3 不在の環境で `--device reader` または `--device ibooks` を指定して変換する
+- **THEN** Epub と同一経路でネイティブ EPUB3 が生成され、終了コードは 0 になる
 
-ネイティブ EPUB3 生成経路の導入は、既存の AozoraEpub3 経路の挙動を変更 MUST しない。利用者は明示的な設定により経路を選択 SHALL でき、未設定時の既定挙動は決定的（後方互換）でなければならない。
+### Requirement: 経路選択（既定ネイティブ）と退避口
 
-#### Scenario: AozoraEpub3 設定済み環境では既定挙動が不変
-- **WHEN** 有効な `aozoraepub3dir` が設定され、ネイティブ経路を明示要求していない状態で `narou convert` を実行する
-- **THEN** 従来どおり AozoraEpub3 経路で EPUB が生成され、出力結果は本変更導入前と同一になる
+`.epub` を出力するデバイス（Epub / Reader / Ibooks）では、ネイティブ EPUB3 生成経路を既定 SHALL とする。利用者は設定項目（`convert.use-aozoraepub3` 相当）により従来の AozoraEpub3 経路へ明示的に切り替え SHALL できる。経路選択は決定的でなければならない。`Device::Mobi` / `Device::Kobo` の経路は本変更で変更 MUST しない。
 
-#### Scenario: 設定でネイティブ経路を明示選択
-- **WHEN** ネイティブ経路を選択する設定項目を有効にして `narou convert <target> --device epub` を実行する
+#### Scenario: 既定でネイティブ経路を使用
+- **WHEN** 経路を明示指定しない状態で `narou convert <target> --device epub` を実行する
 - **THEN** AozoraEpub3 が利用可能であってもネイティブ経路で EPUB が生成される
+
+#### Scenario: 設定で AozoraEpub3 経路へ退避
+- **WHEN** AozoraEpub3 を選択する設定項目を有効にし、有効な `aozoraepub3dir` がある状態で `narou convert` を実行する
+- **THEN** 従来どおり AozoraEpub3 経路で EPUB が生成される
+
+#### Scenario: AozoraEpub3 選択時に AozoraEpub3 が使えない場合
+- **WHEN** AozoraEpub3 を選択する設定が有効だが `aozoraepub3dir`/Java が解決できない状態で `narou convert <target> --device epub` を実行する
+- **THEN** ネイティブ経路へフォールバックして EPUB を生成し、終了コードは 0 になる
+
+#### Scenario: mobi/kobo の経路は不変
+- **WHEN** `--device mobi` または `--device kobo` で `narou convert` を実行する
+- **THEN** 本変更導入前と同一の経路（AozoraEpub3 / kindlegen）で処理され、挙動は変わらない
 
 ### Requirement: 出力ファイル名・配置・CLI 互換
 

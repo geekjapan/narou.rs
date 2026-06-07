@@ -30,16 +30,15 @@
 ## 5. 外字解決 (gaiji.rs)
 
 - [ ] 5.1 面区点→Unicode のマッピング表を実装（米印・二重山括弧など頻出を最優先で網羅）。
-- [ ] 5.2 未解決外字のフォールバック（外字画像 or 代替文字、空欄/文字化け禁止）とログ出力。
+- [ ] 5.2 未解決外字のフォールバックは代替文字で出力（空欄/文字化け禁止）＋ログ出力。外字画像フォールバックは初版スコープ外。
 - [ ] 5.3 マッピングのユニットテスト。
 
 ## 6. EPUB3 パッケージング (package.rs)
 
 - [ ] 6.1 `mimetype`（無圧縮・先頭）＋ `META-INF/container.xml` を生成し `zip` crate で書き出し。
-- [ ] 6.2 OPF(`version="3.0"`) 生成: metadata（title/creator/language/identifier/modified）、manifest（全 XHTML/CSS/画像/フォント）、spine（`page-progression-direction="rtl"`、`nav` properties）。
-- [ ] 6.3 `nav.xhtml`（`epub:type="toc"` 目次 + landmarks）を生成し各話/タイトルへリンク。
-- [ ] 6.4 （任意）`toc.ncx` 併置の要否を判断し実装。
-- [ ] 6.5 全エントリを ZIP へ統合する `build_epub` 本体を完成。
+- [ ] 6.2 OPF(`version="3.0"`) 生成: metadata（title/creator/language/identifier/modified）、manifest（全 XHTML/CSS/画像/フォント）、spine（`page-progression-direction="rtl"`、`nav` properties）。**OPF パスは `item/standard.opf` 固定、metadata は `</metadata>` で閉じる**（既存 `add_dc_subject_to_epub` 後処理互換のため必須）。identifier は `sha2` 由来の決定論的 `urn:uuid:`。
+- [ ] 6.3 `nav.xhtml`（`epub:type="toc"` 目次 + landmarks）を生成し各話/タイトルへリンク。目次は `nav.xhtml` のみ（`toc.ncx` は出さない）。
+- [ ] 6.4 全エントリを ZIP へ統合する `build_epub` 本体を完成。
 
 ## 7. CSS・フォント・挿絵資産 (assets.rs)
 
@@ -49,9 +48,9 @@
 
 ## 8. device.rs 統合と経路選択
 
-- [ ] 8.1 `device.rs::convert_file` の `Device::Epub` 分岐に経路選択（AozoraEpub3 既定、不在時ネイティブ自動フォールバック）を追加。`run_aozora_epub3` は温存。
-- [ ] 8.2 ローカル設定の明示選択項目（例 `converter.native_epub`）を読み取り、有効時はネイティブを優先。設定追加が既存 setting 読み書きを壊さないこと（`narou setting` 互換）を確認。
-- [ ] 8.3 検証用の環境変数オーバーライド（AozoraEpub3 保有環境でネイティブ強制）を実装。
+- [ ] 8.1 `device.rs::convert_file` の `Device::Epub`/`Reader`/`Ibooks` 分岐を既定ネイティブ経路に切替（`run_aozora_epub3` は温存）。`Mobi`/`Kobo` は不変。
+- [ ] 8.2 ローカル設定 `convert.use-aozoraepub3`（bool, 既定 false）を読み取り、true かつ AozoraEpub3 解決可なら従来経路、解決不可ならネイティブへフォールバック。設定追加が既存 setting 読み書きを壊さないこと（`narou setting` 互換）を確認。
+- [ ] 8.3 検証用の環境変数オーバーライド（経路の強制切替で比較検証）を実装。
 - [ ] 8.4 出力ファイル名・配置・拡張子・エラー/終了コードが従来経路と一致することを確認。
 
 ## 9. 検証
@@ -61,6 +60,7 @@
 - [ ] 9.3 生成 EPUB を `unzip` 検証: mimetype 先頭・無圧縮、container.xml、OPF `version="3.0"`、nav.xhtml 目次、本文 XHTML、縦書き CSS。
 - [ ] 9.4 `epubcheck` があれば通し、FATAL/ERROR が無いことを確認。
 - [ ] 9.5 AozoraEpub3 経路の出力と章構成・本文・ルビ・縦書き・目次を比較し差分を確認。
+- [ ] 9.6 `convert.add-dc-subject-to-epub` 有効時に、ネイティブ生成 EPUB へ `add_dc_subject_to_epub` が `<dc:subject>` を注入できることを確認（OPF 名・`</metadata>`・mimetype 前提の整合）。
 
 ## 10. ドキュメント
 

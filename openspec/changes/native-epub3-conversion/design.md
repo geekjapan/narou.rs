@@ -27,6 +27,10 @@ item/style/*.css               (book-style.css 他)
 - 縦中横 → `<span class="tcy">…</span>`、ルビ → `<ruby>…<rt>…</rt></ruby>`
 - N字下げ → 行頭の全角空白による表現
 
+EPUB 生成後の既存後処理との結合（重要・実測）:
+- `convert.rs::apply_dc_subjects_if_needed` → `add_dc_subject_to_epub`（`convert.rs:631-`）が、生成 EPUB を再 ZIP して OPF に `<dc:subject>` を注入する。この後処理は **OPF 名が `standard.opf` で終わること**、OPF 内に `</metadata>` が存在すること、`mimetype` エントリが存在することを前提とする（`convert.rs:651,668,678`）。
+- ネイティブ経路の OPF はこの前提と整合 MUST。すなわち OPF パスは参照と同じ `item/standard.opf`、metadata は `</metadata>` で閉じ、`mimetype` を含める。これに反すると `convert.add-dc-subject-to-epub` 有効時にネイティブ経路だけ後処理が失敗する。
+
 narou.rs が生成しうる青空注記の語彙は別途網羅調査済み（改頁/区切り線/各種見出し・柱/字下げ・地付き/前書き後書き/太字斜体取消線傍点/縦中横/ルビ/外字（米印・二重山括弧・面区点）/挿絵/URL、および内部 stash マーカー）。
 
 制約: AGENTS.md の外部互換性要件（出力ファイル名・配置・CLI 挙動の不変、AozoraEpub3 出力との構造・本文互換重視、サイト固有ロジックのハードコード禁止、`Cargo.toml` 直接編集禁止）。
@@ -67,26 +71,34 @@ narou.rs が生成しうる青空注記の語彙は別途網羅調査済み（�
 - 理由: `device.rs`（1438 行）にこれ以上ロジックを積まない。注記解析・XHTML 化・パッケージングは関心が異なるためファイル分割し、ユニットテストを各層に置く。
 - 既存層との整合: `converter/`(変換層)内に閉じる。`db`/`downloader`/`web`/`queue` には影響しない。`device.rs` は `convert_file` の `Device::Epub` 分岐から `epub::build_epub` を呼ぶだけにする。
 
-### Decision 3: 経路選択は「設定項目 + 自動フォールバック」
-- 既定: AozoraEpub3 が利用可能（`aozoraepub3dir` 有効かつ Java 解決可）なら従来経路。不可なら自動的にネイティブ経路へフォールバックして EPUB を生成する。
-- 明示選択: ローカル設定（`.narou/local_setting.yaml`）に真偽値の設定項目（例 `converter.native_epub` を想定。最終キー名は実装時に既存設定命名規約へ合わせて確定）を追加し、有効時は AozoraEpub3 が使えてもネイティブ経路を使う。
-- 環境変数によるテスト用オーバーライドも検討（検証で AozoraEpub3 を持つ環境でもネイティブを強制するため）。
+### Decision 3: 既定ネイティブ経路 + AozoraEpub3 退避口（grill 決定 Q1/Q2）
+- **既定**: `.epub` を出力するデバイス（Epub / Reader / Ibooks）はネイティブ経路を既定で使う。AozoraEpub3 が利用可能でもネイティブを使う。
+- **退避口**: ローカル設定（`.narou/local_setting.yaml`）に AozoraEpub3 を選ぶ真偽値設定を追加。既存 convert 系設定は `convert.*` 名前空間で `load_local_setting_bool` 経由（`cli.rs`/`convert.rs` に `convert.no-epub`/`convert.add-dc-subject-to-epub` 等が実在）なので、**キー名は `convert.use-aozoraepub3`（bool, 既定 false）**とする。true かつ AozoraEpub3 解決可なら従来経路、解決不可ならネイティブへフォールバック。
+- **対象デバイス**: Epub / Reader / Ibooks（いずれも `.epub`、`device.rs:583,586,587` で同一の `run_aozora_epub3(...".epub")`）。`Device::Mobi`/`Kobo` は本変更で触らない（Mobi は kindlegen 前提、Kobo は kobo span が必要な後続 change）。
+- 環境変数によるテスト用オーバーライドも実装（AozoraEpub3 を持つ環境で経路を強制切替して比較検証するため）。
 
-- 理由: 「Java 無しでも動く」ことが主目的なので、未設定時はまず後方互換（既存挙動）を守りつつ、AozoraEpub3 不在時だけ自動でネイティブに切り替えると利用者体験が最良。明示設定で先進利用者がネイティブを常用できる。
-- 代替案: 既定でネイティブに切替 → 既存ユーザーの出力が変わり後方互換を損なうため却下。CLI フラグのみ → 設定で恒久化できず不便なため、設定項目を主、必要なら補助フラグ。
-- 互換性: 設定項目は追加のみ。未知キーを既存 setting が破壊しないことを確認する。narou.rb 側に同名設定は無いが、`narou setting` は任意キーの読み書きを許容する方針のため整合する。
+- 理由: ユーザー方針として Java 依存を断つことを最優先（grill Q1）。既定ネイティブにすることで追加ランタイム無しに EPUB が出る。従来出力が必要な利用者には退避設定を残し回帰を回避。
+- 代替案: 既定 AozoraEpub3＋不在時のみ自動ネイティブ → 後方互換は最大だが Java 依存が常用環境で残るため却下（ユーザー決定）。CLI フラグのみ → 設定で恒久化できず不便。
+- 互換性: 設定項目は追加のみ。未知キーを既存 setting が破壊しないことを確認する。`narou setting` は任意キーの読み書きを許容する方針のため整合する。Mobi/Kobo 経路の不変は spec で要件化。
 
 ### Decision 4: EPUB レイアウトは参照構造に倣いつつ簡素化
-参照（AozoraEpub3）の `mimetype`/`META-INF/container.xml`/`item/standard.opf`/`item/nav.xhtml`/`item/xhtml/*`/`item/style/*` の骨格を踏襲する。CSS は AozoraEpub3 の多層 CSS をそのまま使わず、`preset/vertical_font*.css` を母体にした自前の最小縦書き CSS セットへ集約する。`toc.ncx` は EPUB3 単独では必須でないが、リーダ互換のため任意で併置を検討。
+参照（AozoraEpub3）の `mimetype`/`META-INF/container.xml`/`item/standard.opf`/`item/nav.xhtml`/`item/xhtml/*`/`item/style/*` の骨格を踏襲する。**OPF パスは `item/standard.opf` に固定**（Decision 7 の dc:subject 後処理互換のため必須）。CSS は AozoraEpub3 の多層 CSS をそのまま使わず、`preset/vertical_font*.css` を母体にした自前の最小縦書き CSS セットへ集約する。
 
 - 理由: リーダ互換に効く骨格（縦書き・右綴じ・目次）は踏襲しつつ、AozoraEpub3 固有の巨大 CSS を持ち込まない。`preset/` は既にプロジェクト同梱資産で、行高 `<%= line_height %>` 等のテンプレ展開実績がある。
+- **クラス語彙の統一**: `preset/vertical_font.css` は `running_head`/`half_em_space`/`gtc` 等の独自クラス、参照 EPUB 本文は `vrtl`/`hltr`/`tcy`/`introduction`/`mt3`/`font-1em30` を使う。XHTML レンダラと同梱 CSS は**参照 EPUB 互換のクラス語彙（`vrtl`/`hltr`/`tcy`/`introduction`/`mt3` 等）に統一**し、`preset` の縦書き指定（body の writing-mode・行高・フォント）を母体に、これら必要クラスの規則を同梱 CSS へ集約する。これによりレンダラが吐くクラスと CSS 定義が一致し、参照出力に近い見た目になる。
 - マッピング基準: 本文行→`<p>`、空行→`<p><br/></p>`、`［＃区切り線］`→`<hr/>`、中見出し→見出し要素、前書き→`introduction` クラス、縦中横→`tcy` クラス、ルビ→`<ruby>` を採用（参照出力に一致）。
 
-### Decision 5: 外字(gaiji)はマッピング表で解決、未解決は代替へ
-`epub/gaiji.rs` に面区点(N-N-N)→Unicode の対応表を持ち、米印・二重山括弧など頻出外字を最優先で網羅する。Unicode 化できないものは (a) `preset`/AozoraEpub3 同梱の外字画像、(b) 判読可能な代替文字、のいずれかで出力し、空欄・文字化けを禁止する。
+### Decision 7: 章/話分割は `［＃改ページ］` 境界、決定論的メタデータ
+- **分割境界**: 中間テキストは各 section の直前に `［＃改ページ］` を置く（`render.rs:72`）。本文 XHTML はこの `［＃改ページ］` を境界に分割する（参照 EPUB の `0001.xhtml`=前付け / `0002.xhtml`=本文… と同型）。柱/大見出しページも `［＃改ページ］` を伴うため独立 XHTML になり、参照挙動に一致。
+- **目次ラベル**: 各分割 XHTML の見出し（中見出し→subtitle、無ければ大見出し→chapter、いずれも無ければ作品タイトル）を `nav.xhtml` の項目ラベルにする。
+- **identifier の決定論化**: OPF の `dc:identifier` は、AozoraEpub3 同様 `urn:uuid:` 形式とするが、wall-clock ではなく `toc_url`（無ければ ncode/サイト+ID）から**既存依存の `sha2` を用いて決定論的に**生成（UUIDv5 風に整形）する。新規 crate は追加しない。再変換で identifier が安定し、出力比較・回帰確認が容易になる。
+- **`dc:modified` の方針**: 決定性と AozoraEpub3 互換（wall-clock）が競合するため Open Question Q3 でユーザー確認する（推奨: 小説の最終更新日時など決定論的ソース）。
 
-- 理由: spec 要件「文字化け・欠落の禁止」を満たす。多くの面区点は Unicode に対応文字があるため、まず Unicode マッピングで実用十分。
-- 代替案: 全外字を画像化 → EPUB 肥大化と実装コスト大。Unicode 優先＋限定画像フォールバックが妥当。
+### Decision 5: 外字(gaiji)は Unicode マッピング＋代替文字（初版、画像は後続。grill 決定 Q5）
+`epub/gaiji.rs` に面区点(N-N-N)→Unicode の対応表を持ち、米印・二重山括弧など頻出外字を最優先で網羅する。Unicode 化できない外字は判読可能な**代替文字**で出力し、空欄・文字化けを禁止する。**外字画像フォールバックは初版スコープ外**（将来拡充。未解決外字はログに残す）。
+
+- 理由: spec 要件「文字化け・欠落の禁止」を代替文字で満たせる。多くの面区点は Unicode に対応文字があり実用十分。画像同梱は EPUB 肥大化と実装コストが大きいため後続に分離（ユーザー決定）。
+- 代替案: 初版から画像フォールバック → コスト過大で却下。
 
 ### Decision 6: ZIP 生成は既存 `zip` crate を使用
 `device.rs` で既に `zip`(`ZipWriter`, `SimpleFileOptions`, `CompressionMethod`)を利用中。EPUB の `mimetype` は `CompressionMethod::Stored` で先頭に、その他は Deflate で格納する。
@@ -112,8 +124,13 @@ narou.rs が生成しうる青空注記の語彙は別途網羅調査済み（�
 
 ## Open Questions
 
-- 経路選択の最終的な設定キー名（`converter.native_epub` 等）と、補助 CLI フラグの要否。既存 `NovelSettings`/`local_setting.yaml` の命名規約に合わせて実装時に確定。
-- `toc.ncx` を併置するか（EPUB3 では nav が正だが、古いリーダ互換のため）。
-- フォント埋め込みの既定値（ON/OFF）。EPUB サイズと表示品質のトレードオフ。
-- 外字画像の調達元（`preset/` か AozoraEpub3 同梱 `gaiji/` を参照するか、Unicode 代替のみで足りるか）。
-- Kobo/Ibooks/Reader をネイティブ経路に含める範囲（本変更は Epub 限定。.kepub.epub の kobo span 付与は後続 change を想定）。
+grill ゲート（`openspec/grill/Grill-native-epub3-conversion-20260607.md`）で全件解決済み。決定:
+
+- **Q1（解決）**: 既定をネイティブ経路にする。AozoraEpub3 退避は `convert.use-aozoraepub3`（bool, 既定 false）。CLI フラグは追加しない。
+- **Q2（解決）**: 対象デバイスは Epub + Reader + Ibooks。Kobo/Mobi は対象外（経路不変）。
+- **Q3（解決）**: `dc:modified` は決定論的ソース（小説の最終更新日時等）を使う。
+- **Q4（解決）**: フォント埋め込みは既定 OFF（設定で ON）。
+- **Q5（解決）**: 外字は Unicode マッピング＋未解決は代替文字。外字画像は後続。
+- **Q6（解決）**: 目次は `nav.xhtml` のみ。`toc.ncx` は出さない。
+
+自己グリルで確定（inline 反映済み）: OPF パス `item/standard.opf` 固定（dc:subject 後処理互換）、クラス語彙を参照 EPUB 互換へ統一、分割境界＝`［＃改ページ］`、identifier は `sha2` 由来の決定論的 UUID。

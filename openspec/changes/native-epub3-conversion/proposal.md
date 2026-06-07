@@ -8,8 +8,8 @@
 - 対応注記: 改頁/区切り線/ページ左右中央、大・中見出しと柱(running head)、各種字下げ・地付き・地寄せ、前書き/後書き、傍点・傍線・太字・斜体・取消線、縦中横、ルビ（`｜親《ルビ》`）、外字(gaiji: 面区点 `［＃…、N-N-N］`・米印・二重山括弧)、挿絵 `［＃挿絵（…）入る］`、URL注記。
 - 縦書き EPUB3（`writing-mode: vertical-rl`、spine `page-progression-direction="rtl"`）を既定とし、CSS は `preset/vertical_font*.css` を母体に EPUB3 同梱用へ整備する。
 - EPUB3 パッケージ生成: 先頭・無圧縮 `mimetype` + `META-INF/container.xml` + OPF(`version="3.0"`) + `nav.xhtml`(目次) + 本文 XHTML(章/話単位分割) + 表紙(title) + CSS、フォント/外字画像の埋め込み（任意・設定で制御）。ZIP 生成は `zip` crate を使用。
-- 経路選択（既定 vs ネイティブ）は後方互換を保って導入する。既存 AozoraEpub3 経路は当面残す。具体的な切替方式（自動フォールバック／設定項目／フラグ）は design で確定する。
-- スコープは Device::Epub を最低ラインとする。mobi/kindle は kindlegen 依存が残るため本変更のスコープ外（design で明記）。Kobo(.kepub.epub)・Ibooks・Reader への拡張余地を設計段階で残す。
+- **ネイティブ経路を既定**にする（grill 決定 Q1）。`.epub` を生成するデバイス（Epub / Reader / Ibooks）は既定でネイティブ経路を使う。既存 AozoraEpub3 経路はコードとして残し、設定項目（`convert.use-aozoraepub3` を想定）で従来挙動に戻せる退避口を用意する。
+- スコープ対象デバイスは **Epub + Reader + Ibooks**（いずれも `.epub` 出力で同一経路に吸収。grill 決定 Q2）。Kobo(.kepub.epub) は kobo span 付与が必要なため後続 change、mobi/kindle は kindlegen 依存が残るため本変更のスコープ外。`Device::Mobi`/`Kobo` は従来経路のまま。
 
 ## Capabilities
 
