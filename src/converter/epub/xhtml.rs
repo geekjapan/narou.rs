@@ -429,6 +429,20 @@ mod tests {
     }
 
     #[test]
+    fn nav_binds_epub_namespace() {
+        // epub:type を使う nav.xhtml は xmlns:epub を宣言していなければ整形式でない。
+        let nav = render_nav_xhtml(
+            "題",
+            &[NavEntry {
+                href: "xhtml/title.xhtml".into(),
+                label: "題".into(),
+            }],
+        );
+        assert!(nav.contains("xmlns:epub=\"http://www.idpf.org/2007/ops\""));
+        assert!(nav.contains("epub:type=\"toc\""));
+    }
+
+    #[test]
     fn renders_horizontal_page_class() {
         let text = "題\n著\n本文\n";
         let doc = parse_document(text);
