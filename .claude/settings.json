@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/gitnexus-auto-analyze.sh\"",
+            "timeout": 15,
+            "statusMessage": "Refreshing GitNexus index..."
+          }
+        ]
+      }
+    ]
+  }
+}
