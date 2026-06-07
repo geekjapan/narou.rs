@@ -39,6 +39,9 @@ errors.txt
 
 *.txt
 !preset/custom_chuki_tag.txt
+
+# Claude Code runtime locks (per-session state, must not be tracked)
+.claude/*.lock
 # CocoIndex Code (ccc)
 /.cocoindex_code/
 /dist/
