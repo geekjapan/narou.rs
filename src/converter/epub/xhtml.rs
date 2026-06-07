@@ -69,9 +69,11 @@ fn render_inline_ctx(s: &str, illust: Option<&IllustMap>) -> String {
                     .strip_prefix("挿絵（")
                     .and_then(|r| r.strip_suffix("）入る"))
                 {
+                    // 行内に混在した場合は <p> をネストさせないよう裸の <img/> を出す。
+                    // 行全体が挿絵のみの場合はブロック側 (render_illust_line) が処理する。
                     if let Some(href) = illust.and_then(|m| m.get(path)) {
                         out.push_str(&format!(
-                            "<p class=\"illust\"><img src=\"{}\" alt=\"\"/></p>",
+                            "<img src=\"{}\" alt=\"\"/>",
                             escape_attr(href)
                         ));
                     }
@@ -232,10 +234,16 @@ fn render_page_body(page: &Page, illust: &IllustMap) -> String {
                 }
             }
             Block::Line(text) => {
-                out.push_str(&format!(
-                    "<p>{}</p>\n",
-                    render_inline_ctx(text, Some(illust))
-                ));
+                // 行全体が挿絵注記なら、ブロックレベルの <p class="illust"> を直接出力する
+                // （通常行の <p> 包みと二重にならないようにする）。
+                if let Some(frag) = render_illust_line(text, illust) {
+                    out.push_str(&frag);
+                } else {
+                    out.push_str(&format!(
+                        "<p>{}</p>\n",
+                        render_inline_ctx(text, Some(illust))
+                    ));
+                }
             }
         }
     }
@@ -245,6 +253,23 @@ fn render_page_body(page: &Page, illust: &IllustMap) -> String {
         out.push_str("</div>\n");
     }
     out
+}
+
+/// 行全体が単独の挿絵注記なら、ブロックレベルの `<p class="illust">` 断片を返す。
+/// 解決できない（画像不在・埋め込み無効）場合も挿絵行として `Some("")` を返し、
+/// 呼び出し側が空の `<p>` を出さない／二重に包まないようにする。
+fn render_illust_line(text: &str, illust: &IllustMap) -> Option<String> {
+    let path = text
+        .trim()
+        .strip_prefix("［＃挿絵（")?
+        .strip_suffix("）入る］")?;
+    match illust.get(path) {
+        Some(href) => Some(format!(
+            "<p class=\"illust\"><img src=\"{}\" alt=\"\"/></p>\n",
+            escape_attr(href)
+        )),
+        None => Some(String::new()),
+    }
 }
 
 fn render_heading(level: &HeadingLevel, text: &str) -> String {

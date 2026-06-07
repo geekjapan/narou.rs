@@ -305,6 +305,9 @@ mod tests {
 
         let page = read_zip_entry(&out, "item/xhtml/0002.xhtml").unwrap();
         assert!(page.contains("<img src=\"../image/img0001.png\""));
+        // 挿絵はブロックレベルの <p class="illust"> として出力し、<p> をネストしない。
+        assert!(page.contains("<p class=\"illust\"><img src=\"../image/img0001.png\" alt=\"\"/></p>"));
+        assert!(!page.contains("<p><p"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
