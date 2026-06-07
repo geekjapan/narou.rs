@@ -2,23 +2,54 @@ schema: spec-driven
 
 # Project context (optional)
 # This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
 context: |
   言語：日本語
-  すべての成果物（proposal / spec / design / tasks など）は日本語で作成してください。
-  ただし API・REST・CLI・コマンド名・コード識別子などの技術用語は原語（英語）のまま記述してください。
+  すべての成果物（proposal / design / tasks / specs など）は日本語で作成してください。
+  ただし API・REST・CLI・コマンド名・型名・コード識別子などの技術用語は原語（英語）のまま記述してください。
+
+  プロジェクト: narou_rs。Ruby 製 narou.rb を Rust (edition 2024) へ移植した日本語 Web 小説の
+  取得・管理・変換 CLI / Web UI ツール。内部実装は Rust 流に再設計してよいが、外部から観測できる
+  挙動の互換性は妥協なく追求するのが核となる方針。
+
+  権威あるドキュメント（変更前に必ず参照し、本 context と矛盾する場合はこちらを正とする）:
+  - AGENTS.md … 開発方針・互換性要件・Git 運用・アーキテクチャの唯一の正本（CLAUDE.md は @AGENTS.md を import するだけのラッパー）。
+  - COMMANDS.md … narou.rb 全24コマンドのオプション・挙動と Rust 実装状況のマスタードキュメント。
+  - sample/narou/ … Ruby 参照ソース（読取専用）。外部仕様の参照元。
+
+  最重要の互換性制約（内部実装自由方針の例外。narou.rb と完璧に一致させる）:
+  - 設定ファイルの位置と読み書き互換（.narou/local_setting.yaml, ~/.narousetting/global_setting.yaml 等）。Rust と Ruby が相互に読める YAML。default.* / force.* / default_args.* の動的変数名も受理。
+  - CLI の引数・戻り値・エラーメッセージ・終了コードを Ruby 版と同一にする。help は未実装コマンド分も移植。
+  - サイト定義は webnovel/*.yaml 駆動。サイト固有ロジックを Rust にハードコードしない。前処理は preprocess.pest DSL + セーフインタプリタで表現する。
+  - 最終的な変換出力ファイルは narou.rb とバイト一致を目指す（なろう・カクヨムは達成済み）。
+
+  アーキテクチャ: CLI (main.rs → cli.rs → commands/*) と Web UI (web/mod.rs の Axum ルーター) が
+  共通ドメイン層を呼ぶ。主要サブシステムは db/（Database + Inventory シングルトン）、
+  downloader/（DL パイプライン + site_setting + preprocess DSL + html.rs）、
+  converter/（converter_base 変換パイプライン + render + device + user_converter）、web/（Axum + worker + scheduler + push）、queue.rs。
+
+  技術スタック: Axum 0.8, Tokio, serde + serde_yaml + serde_json, reqwest + curl crate, clap 4,
+  chrono/chrono-tz, regex, sha2, thiserror, askama, tracing, pest（前処理 DSL）。
+
+  コーディング/運用規約:
+  - コミットには機能的意味を持つ変更だけを含める。整形のみ（改行替え・import 並べ替え等）の差分は禁止。
+  - Cargo.toml は直接編集せず cargo add / cargo update 経由。
+  - Web UI の CSS は色・サイズ・間隔を var(--xxx) で指定し、単位は em/rem/%/vw/vh のみ（px 等の絶対単位は避ける）。@media ブレークポイントは em。
+  - edition 2024: {} フォーマット直後に . で始まる式を書くと prefix 扱いでコンパイルエラー。変数代入かスペースで回避。
+  - Git は develop 上で作業し main へ直接コミットしない。commit メッセージは英語の短い命令形。
+  - コマンドの実装・オプション追加・挙動変更を行うたびに COMMANDS.md を同期更新する。
 
 # Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+rules:
+  proposal:
+    - narou.rb との外部互換性（CLI 挙動・設定ファイル・YAML 構文・出力）への影響を明記する。
+    - 影響する narou.rb コマンドを示し、COMMANDS.md の該当箇所と対応付ける。
+  specs:
+    - 要件は外部から観測できる挙動（CLI 引数・終了コード・エラーメッセージ・ファイル出力・YAML 構文理解）で記述し、内部実装詳細に依存させない。
+    - narou.rb の参照挙動（sample/narou/）との一致が必要な箇所を明示する。
+  design:
+    - 既存アーキテクチャ層（db / downloader / converter / web / queue）との整合を示す。
+    - サイト固有ロジックは webnovel/*.yaml + preprocess DSL で表現し、Rust ハードコードを避ける設計にする。
+  tasks:
+    - タスクは小さく分割する。
+    - 完了前の検証として cargo check と cargo test（変換変更時は cargo test --test convert_parity）を含める。
+    - コマンド挙動を変える場合は COMMANDS.md 更新タスクを含める。
