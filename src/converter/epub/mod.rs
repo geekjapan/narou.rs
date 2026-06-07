@@ -29,6 +29,10 @@ pub struct EpubOptions {
     pub include_illust: bool,
     /// 行高（global setting `line-height`、既定 1.8）。
     pub line_height: f64,
+    /// 縦書き（既定 true）。false で横書き（`enable_yokogaki` 相当）。
+    pub vertical: bool,
+    /// 濁点フォント（`［＃濁点］` 注記）使用時に DMincho を埋め込む。
+    pub dakuten_font: bool,
 }
 
 impl Default for EpubOptions {
@@ -37,6 +41,8 @@ impl Default for EpubOptions {
             embed_font: false,
             include_illust: true,
             line_height: 1.8,
+            vertical: true,
+            dakuten_font: false,
         }
     }
 }
@@ -77,11 +83,12 @@ pub fn build_epub(
         properties: None,
         in_spine: false,
         zip_path: "item/style/book-style.css".into(),
-        data: assets::book_style_css(opts.line_height, opts.embed_font).into_bytes(),
+        data: assets::book_style_css(opts.line_height, opts.embed_font, opts.dakuten_font)
+            .into_bytes(),
     });
 
-    // フォント（埋め込み時のみ）。
-    if opts.embed_font {
+    // フォント（全体埋め込み、または濁点フォント使用時に DMincho を同梱）。
+    if opts.embed_font || opts.dakuten_font {
         items.push(ManifestItem {
             id: "font-mincho".into(),
             href: assets::FONT_FILE.into(),
@@ -127,7 +134,8 @@ pub fn build_epub(
     for (idx, page) in doc.pages.iter().enumerate() {
         let file = format!("{:04}.xhtml", idx + 1);
         let id = format!("sec{:04}", idx + 1);
-        let data = xhtml::render_page_xhtml(page, &display_title, &illust_map).into_bytes();
+        let data =
+            xhtml::render_page_xhtml(page, &display_title, &illust_map, opts.vertical).into_bytes();
         if let Some(label) = &page.nav_label {
             nav_entries.push(NavEntry {
                 href: format!("xhtml/{file}"),
@@ -156,7 +164,7 @@ pub fn build_epub(
         modified: modified_timestamp(input_txt),
     };
 
-    let opf = package::build_opf(&meta, &items);
+    let opf = package::build_opf(&meta, &items, opts.vertical);
     package::write_epub(&output_path, package::container_xml(), &opf, &items)?;
 
     Ok(output_path)
@@ -361,6 +369,52 @@ mod tests {
         let file = std::fs::File::open(&out).unwrap();
         let mut zip = zip::ZipArchive::new(file).unwrap();
         assert!(zip.by_name("item/image/img0001.png").is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn embeds_dakuten_font_when_requested() {
+        let dir = std::env::temp_dir().join(format!("narou_epub_dakuten_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("濁点.txt");
+        std::fs::write(&txt, "濁点\n著者\n本文［＃濁点］か［＃濁点終わり］です\n").unwrap();
+
+        let opts = EpubOptions {
+            dakuten_font: true,
+            ..EpubOptions::default()
+        };
+        let out = build_epub(&txt, &dir, ".epub", &opts).unwrap();
+
+        // 本文埋め込み OFF でも、濁点フォントは DMincho を同梱して .dakuten へ適用する。
+        let file = std::fs::File::open(&out).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        assert!(zip.by_name("item/font/DMincho.ttf").is_ok());
+
+        let css = read_zip_entry(&out, "item/style/book-style.css").unwrap();
+        assert!(css.contains("@font-face"));
+        assert!(css.contains(".dakuten {\n  font-family: \"DMincho\", serif;"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn horizontal_mode_emits_ltr_and_hltr() {
+        let dir = std::env::temp_dir().join(format!("narou_epub_hor_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("横書き.txt");
+        std::fs::write(&txt, "横書き\n著者\n本文\n").unwrap();
+
+        let opts = EpubOptions {
+            vertical: false,
+            ..EpubOptions::default()
+        };
+        let out = build_epub(&txt, &dir, ".epub", &opts).unwrap();
+
+        let opf = read_zip_entry(&out, "item/standard.opf").unwrap();
+        assert!(opf.contains("page-progression-direction=\"ltr\""));
+        let page = read_zip_entry(&out, "item/xhtml/0001.xhtml").unwrap();
+        assert!(page.contains("class=\"hltr\""));
 
         std::fs::remove_dir_all(&dir).ok();
     }

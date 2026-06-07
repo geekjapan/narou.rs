@@ -47,8 +47,8 @@ pub fn container_xml() -> &'static str {
 </container>\n"
 }
 
-/// OPF を生成する。
-pub fn build_opf(meta: &OpfMeta, items: &[ManifestItem]) -> String {
+/// OPF を生成する。`vertical` が false なら綴じ方向を ltr にする（横書き）。
+pub fn build_opf(meta: &OpfMeta, items: &[ManifestItem], vertical: bool) -> String {
     let mut manifest = String::new();
     for item in items {
         let props = item
@@ -94,12 +94,13 @@ pub fn build_opf(meta: &OpfMeta, items: &[ManifestItem]) -> String {
 \t\t<meta property=\"dcterms:modified\">{modified}</meta>\n\
 \t</metadata>\n\
 \t<manifest>\n{manifest}\t</manifest>\n\
-\t<spine page-progression-direction=\"rtl\">\n{spine}\t</spine>\n\
+\t<spine page-progression-direction=\"{ppd}\">\n{spine}\t</spine>\n\
 </package>\n",
         title = escape_xml(&meta.title),
         creator = creator,
         ident = escape_xml(&meta.identifier),
         modified = escape_xml(&meta.modified),
+        ppd = if vertical { "rtl" } else { "ltr" },
         manifest = manifest,
         spine = spine,
     )
@@ -203,10 +204,13 @@ mod tests {
             zip_path: "item/xhtml/0001.xhtml".into(),
             data: Vec::new(),
         }];
-        let opf = build_opf(&meta, &items);
+        let opf = build_opf(&meta, &items, true);
         assert!(opf.contains("version=\"3.0\""));
         assert!(opf.contains("</metadata>"));
         assert!(opf.contains("page-progression-direction=\"rtl\""));
         assert!(opf.contains("<itemref idref=\"sec0001\""));
+
+        let opf_h = build_opf(&meta, &items, false);
+        assert!(opf_h.contains("page-progression-direction=\"ltr\""));
     }
 }

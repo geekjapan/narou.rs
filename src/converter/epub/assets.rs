@@ -9,9 +9,12 @@ pub const DMINCHO_TTF: &[u8] = include_bytes!("../../../preset/DMincho.ttf");
 /// EPUB 内のフォントファイル名。
 pub const FONT_FILE: &str = "font/DMincho.ttf";
 
-/// 本文 CSS を生成する。`embed_font` 有効時は @font-face を含める。
-pub fn book_style_css(line_height: f64, embed_font: bool) -> String {
-    let font_face = if embed_font {
+/// 本文 CSS を生成する。`embed_font` 有効時、または濁点フォント (`dakuten_font`)
+/// 使用時は DMincho の @font-face を含める。濁点表示には DMincho の専用グリフが
+/// 必須のため、`.dakuten` はフォント埋め込み時に DMincho を参照する。
+pub fn book_style_css(line_height: f64, embed_font: bool, dakuten_font: bool) -> String {
+    let need_font = embed_font || dakuten_font;
+    let font_face = if need_font {
         format!(
             "@font-face {{\n  font-family: \"DMincho\";\n  src: url(\"../{font}\");\n}}\n",
             font = FONT_FILE
@@ -20,6 +23,12 @@ pub fn book_style_css(line_height: f64, embed_font: bool) -> String {
         String::new()
     };
     let body_font = if embed_font {
+        "\"DMincho\", serif"
+    } else {
+        "serif"
+    };
+    // 濁点合成グリフは DMincho にしか無いため、フォント埋め込み時は .dakuten へ適用する。
+    let dakuten_family = if need_font {
         "\"DMincho\", serif"
     } else {
         "serif"
@@ -37,7 +46,7 @@ hr {{\n  border: none;\n  border-top: 1px solid currentColor;\n  margin: 1em 0;\
 rt {{\n  font-size: 0.6em;\n}}\n\
 .tcy {{\n  -webkit-text-combine: horizontal;\n  text-combine-upright: all;\n}}\n\
 .em-sesame {{\n  font-style: normal;\n  -webkit-text-emphasis-style: sesame;\n  text-emphasis-style: sesame;\n}}\n\
-.dakuten {{\n  font-family: serif;\n}}\n\
+.dakuten {{\n  font-family: {dakuten_family};\n}}\n\
 h1.oo-midashi {{\n  font-size: 1.6em;\n  font-weight: bold;\n  margin: 0;\n}}\n\
 h2.naka-midashi {{\n  font-size: 1.3em;\n  font-weight: bold;\n  margin: 0;\n}}\n\
 h3.ko-midashi {{\n  font-size: 1.15em;\n  font-weight: bold;\n  margin: 0;\n}}\n\
@@ -52,6 +61,7 @@ h3.ko-midashi {{\n  font-size: 1.15em;\n  font-weight: bold;\n  margin: 0;\n}}\n
 .clear {{\n  clear: both;\n}}\n",
         font_face = font_face,
         body_font = body_font,
+        dakuten_family = dakuten_family,
         lh = line_height,
     )
 }
@@ -86,17 +96,28 @@ mod tests {
 
     #[test]
     fn css_contains_vertical_and_line_height() {
-        let css = book_style_css(1.8, false);
+        let css = book_style_css(1.8, false, false);
         assert!(css.contains("writing-mode: vertical-rl"));
         assert!(css.contains("line-height: 1.8em"));
         assert!(!css.contains("@font-face"));
+        assert!(css.contains(".dakuten {\n  font-family: serif;"));
     }
 
     #[test]
     fn css_includes_font_face_when_embedding() {
-        let css = book_style_css(1.8, true);
+        let css = book_style_css(1.8, true, false);
         assert!(css.contains("@font-face"));
         assert!(css.contains("DMincho.ttf"));
+    }
+
+    #[test]
+    fn css_embeds_dmincho_for_dakuten_without_body_embed() {
+        // 濁点フォントのみ要求: @font-face は出力し、.dakuten は DMincho を参照するが、
+        // 本文 body は serif のまま（フォント全体埋め込みではない）。
+        let css = book_style_css(1.8, false, true);
+        assert!(css.contains("@font-face"));
+        assert!(css.contains(".dakuten {\n  font-family: \"DMincho\", serif;"));
+        assert!(css.contains("body {\n  font-family: serif;"));
     }
 
     #[test]

@@ -144,12 +144,13 @@ fn inline_open_tag(tag: &str) -> Option<(&'static str, (&'static str, &'static s
     Some(m)
 }
 
-/// 本文ページの XHTML ドキュメントを生成する。
-pub fn render_page_xhtml(page: &Page, title: &str, illust: &IllustMap) -> String {
+/// 本文ページの XHTML ドキュメントを生成する。`vertical` が false なら横書き。
+pub fn render_page_xhtml(page: &Page, title: &str, illust: &IllustMap, vertical: bool) -> String {
     let body = render_page_body(page, illust);
+    let html_class = if vertical { "vrtl" } else { "hltr" };
     format!(
         "{header}{body}\n</div>\n</body>\n</html>\n",
-        header = page_header(title, "vrtl"),
+        header = page_header(title, html_class),
         body = body,
     )
 }
@@ -420,10 +421,19 @@ mod tests {
     fn renders_full_page_structure() {
         let text = "題\n著\n本文\n\n［＃区切り線］\n";
         let doc = parse_document(text);
-        let xhtml = render_page_xhtml(&doc.pages[0], &doc.title, &IllustMap::new());
+        let xhtml = render_page_xhtml(&doc.pages[0], &doc.title, &IllustMap::new(), true);
         assert!(xhtml.contains("class=\"vrtl\""));
         assert!(xhtml.contains("<p>本文</p>"));
         assert!(xhtml.contains("<p><br/></p>"));
         assert!(xhtml.contains("<hr/>"));
+    }
+
+    #[test]
+    fn renders_horizontal_page_class() {
+        let text = "題\n著\n本文\n";
+        let doc = parse_document(text);
+        let xhtml = render_page_xhtml(&doc.pages[0], &doc.title, &IllustMap::new(), false);
+        assert!(xhtml.contains("class=\"hltr\""));
+        assert!(!xhtml.contains("class=\"vrtl\""));
     }
 }

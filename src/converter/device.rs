@@ -514,10 +514,15 @@ impl OutputManager {
         output_ext: &str,
         include_illust: bool,
     ) -> Result<PathBuf> {
+        // 濁点フォントは設定 (`use_dakuten_font`) もしくは中間テキストに ［＃濁点］ が
+        // 含まれる場合に有効化する（AozoraEpub3 経路 run_aozora_epub3 と同条件）。
+        let needs_dakuten = self.use_dakuten_font || file_contains_dakuten_chuki(input_txt);
         let opts = super::epub::EpubOptions {
             embed_font: crate::compat::load_local_setting_bool("convert.epub-embed-font"),
             include_illust,
             line_height: self.epub_line_height(),
+            vertical: !self.yokogaki,
+            dakuten_font: needs_dakuten,
         };
         if self.verbose {
             eprintln!("EPUBを生成しています");
@@ -716,12 +721,12 @@ impl OutputManager {
     }
 
     pub fn available_devices() -> Vec<(String, bool)> {
+        // epub/reader/ibooks はネイティブ EPUB3 経路が既定で、AozoraEpub3/Java 非依存。
+        // よって外部ツールの有無に関わらず常に利用可能。mobi(kindlegen)/kobo(AozoraEpub3)
+        // は従来どおり外部ツール依存。
         let devices = vec![
             ("text".to_string(), true),
-            (
-                "epub".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
+            ("epub".to_string(), true),
             ("mobi".to_string(), {
                 Self::find_external_tool("kindlegen").is_some()
                     && Self::find_external_tool("AozoraEpub3").is_some()
@@ -731,14 +736,8 @@ impl OutputManager {
                 Self::find_external_tool("AozoraEpub3").is_some(),
             ),
             ("ibunko".to_string(), true),
-            (
-                "reader".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
-            (
-                "ibooks".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
+            ("reader".to_string(), true),
+            ("ibooks".to_string(), true),
         ];
         devices
     }
