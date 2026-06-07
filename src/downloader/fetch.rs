@@ -287,7 +287,9 @@ impl HttpFetcher {
             .arg(format!("--read-timeout={READ_TIMEOUT_SECS}"))
             .arg(format!("--timeout={TOTAL_TIMEOUT_SECS}"))
             .arg(format!("--max-redirect={max_redirects}"))
-            .arg(format!("--max-filesize={MAX_RESPONSE_BYTES}"))
+            // NOTE: GNU wget has no --max-filesize (that is a curl option). The
+            // response size cap is enforced after the fact via the
+            // output.stdout.len() > MAX_RESPONSE_BYTES check below.
             .arg(format!("--user-agent={}", &self.user_agent))
             .arg("--header=Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
             .arg("--header=Accept-Language: ja,en-US;q=0.9,en;q=0.8")
