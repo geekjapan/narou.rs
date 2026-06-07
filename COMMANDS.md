@@ -193,6 +193,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `update.interval` 設定対応（最低2.5秒、YAMLの数値/文字列を許容）
 - `update.strong` 設定対応。同日更新時は保存済み `本文/*.yaml` の本文要素と取得本文をハッシュ比較し、実質同一なら更新扱いにしない
 - Ruby版同様 `.narou/section_hash_cache.yaml` を永続化し、strong update 時の既存 section digest を再利用する
+- カクヨムは各話の `publishedAt` を初回掲載日時、`editedAt`（無い場合は `publishedAt`）を `subupdate` として扱い、本文改稿のみの通常 Update でも対象話を更新する
 - `update.convert-only-new-arrival` 設定対応（YAMLの真偽値/文字列/数値を許容）
 - `last_check_date` 追跡
 - `download.choices-of-digest-options` 設定対応。Ruby版と同じ 1-8 のダイジェスト化選択肢を処理し、キャンセル・凍結・バックアップ・あらすじ表示・ブラウザ起動・保存フォルダ起動・変換を実行
@@ -266,7 +267,10 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
 - Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector や CP932/Windows-31J 未定義文字 (`♠` / `♡` / `♢` / `♣` / `𠮷` など) を含み、Java/AozoraEpub3 側で出力名がずれやすい小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\\Users\\rumia\\Documents\\Narou` の n5853lh で EPUB 生成を確認済み
 
-**注**: EPUB/MOBI 生成は AozoraEpub3.jar と kindlegen への依存がある。Rust 側のテキスト変換 (`novel.txt` 生成) は完了しているが、AozoraEpub3 の呼び出しパイプラインは別途必要。
+- **ネイティブ EPUB3 生成 (Java/AozoraEpub3 非依存)**: `.epub` を出力するデバイス (`epub` / `reader` / `ibooks`) は既定で Rust ネイティブ経路 (`src/converter/epub/`) を使い、青空文庫中間テキストから直接縦書き EPUB3 を生成する。Java(JRE) も `AozoraEpub3.jar` も不要。`convert.use-aozoraepub3=true`（local_setting）かつ AozoraEpub3/Java が解決可能なときのみ従来経路へ退避し、解決不可ならネイティブへフォールバックする。検証用に環境変数 `NAROU_RS_EPUB_ENGINE=native|aozora` で強制切替できる。`mobi` / `kobo` の経路は不変（mobi は kindlegen、kobo は AozoraEpub3 依存のまま）。
+- ネイティブ EPUB は `mimetype`(無圧縮先頭) + `META-INF/container.xml` + `item/standard.opf`(OPF v3.0, `page-progression-direction="rtl"`) + `item/nav.xhtml`(目次) + 章/話単位の本文 XHTML(縦書き `vrtl`) + タイトルページ + `book-style.css` で構成。注記→XHTML(改頁/区切り線/大中見出し/柱/前書き後書き/字下げ地付き/ルビ/縦中横/傍点傍線/太字斜体取消線/外字/挿絵/URL)、外字は Unicode マッピング＋未解決は代替文字、フォント埋め込みは既定 OFF (`convert.epub-embed-font=true` で ON)。`dc:identifier` は `toc_url` 由来の決定論的 `urn:uuid`、`dcterms:modified` は入力ファイル更新時刻。OPF を `item/standard.opf` 固定にし `</metadata>` を保持するため、既存 `convert.add-dc-subject-to-epub` の後処理がネイティブ EPUB にもそのまま効く。実機の `~/run/narou_rs` で短編・連載・カクヨム計8作品を変換し epubcheck 5.3.0 で 0 エラー/0 警告を確認済み。
+
+**注**: ネイティブ経路により EPUB 生成は Java/AozoraEpub3 非依存になった。MOBI 生成は引き続き kindlegen に、Kobo(.kepub.epub) は AozoraEpub3 に依存する。
 
 ---
 

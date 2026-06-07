@@ -743,7 +743,18 @@ impl Downloader {
         {
             Ok(mut body) => {
                 pretreatment_source(&mut body, setting.encoding(), Some(setting));
-                Ok(NovelInfo::from_novel_info_source(setting, &body))
+                let mut info = NovelInfo::from_novel_info_source(setting, &body);
+                // The novel_info page (e.g. syosetu.org `?mode=ss_detail`) can be
+                // blocked or served as an anti-bot interstitial with a 200 status,
+                // in which case some or all fields fail to extract. Backfill any
+                // missing core display field (title/author/story/tags) from the
+                // already fetched, reliable TOC page so they are not silently
+                // dropped. fill_missing_from never overwrites a value the
+                // novel_info page did provide.
+                if info.has_missing_core_fields() {
+                    info.fill_missing_from(NovelInfo::from_toc_source(setting, toc_source));
+                }
+                Ok(info)
             }
             Err(_) => Ok(NovelInfo::from_toc_source(setting, toc_source)),
         }
@@ -2410,7 +2421,7 @@ mod tests {
                         },
                         "TableOfContentsChapter:10": {
                             "chapter": {"__ref": "Chapter:10"},
-                            "episodeUnions": [{"__ref": "Episode:20"}]
+                            "episodeUnions": [{"__ref": "Episode:20"}, {"__ref": "Episode:21"}]
                         },
                         "Chapter:10": {
                             "__typename": "Chapter",
@@ -2422,7 +2433,14 @@ mod tests {
                             "__typename": "Episode",
                             "id": "20",
                             "publishedAt": "2021-01-12T16:13:02Z",
+                            "editedAt": "2021-01-13T16:13:02Z",
                             "title": "第1話"
+                        },
+                        "Episode:21": {
+                            "__typename": "Episode",
+                            "id": "21",
+                            "publishedAt": "2021-01-14T16:13:02Z",
+                            "title": "第2話"
                         }
                     }
                 }
@@ -2448,7 +2466,25 @@ mod tests {
         assert_eq!(super::sanitize_site_tags(&tags), vec!["tag-a", "tag-b"]);
         assert!(html.contains("Chapter;1;10;第一章"));
         assert!(!html.contains("Chapter;1;10;;第一章"));
-        assert!(html.contains("Episode;20;2021-01-12T16:13:02Z;第1話"));
+        assert!(html.contains(
+            "Episode;20;2021-01-12T16:13:02Z;2021-01-13T16:13:02Z;第1話"
+        ));
+        assert!(html.contains(
+            "Episode;21;2021-01-14T16:13:02Z;2021-01-14T16:13:02Z;第2話"
+        ));
+        let mut url_captures = HashMap::new();
+        url_captures.insert("ncode".to_string(), "1177354055617350769".to_string());
+        let subtitles = super::toc::parse_subtitles(setting, &html, &url_captures).unwrap();
+        assert_eq!(subtitles[0].subdate, "2021-01-12T16:13:02Z");
+        assert_eq!(
+            subtitles[0].subupdate.as_deref(),
+            Some("2021-01-13T16:13:02Z")
+        );
+        assert_eq!(subtitles[1].subdate, "2021-01-14T16:13:02Z");
+        assert_eq!(
+            subtitles[1].subupdate.as_deref(),
+            Some("2021-01-14T16:13:02Z")
+        );
     }
 
     #[test]

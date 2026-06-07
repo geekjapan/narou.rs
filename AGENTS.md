@@ -91,23 +91,22 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - これらの整形変更は、機能変更に付随して不可避な場合（例: 引数追加で行長が変わる）のみ許容する。
 
 ## Git 運用ルール
-- 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
-- 作業開始時に対象ブランチが `origin` より遅れている場合は、`git pull` で最新へ追従してから作業を始める。
-- 大幅な変更、新機能、複数ファイルにまたがる設計変更、長時間かかる検証を伴う作業は、`develop` から機能単位のブランチを作成して進める。
+- 作業は `main` から切った作業ブランチ上で行う。通常の修正・軽微な機能追加・ドキュメント更新も含め、`main` に直接コミットしない（PreToolUse フックが `main`/`master` 上の commit をブロックする）。作業開始前に現在ブランチと作業ツリーを確認する。
+- 作業開始時に `main` が `origin/main` より遅れている場合は、`git pull` で最新へ追従してから作業ブランチを切る。
+- 大幅な変更、新機能、複数ファイルにまたがる設計変更、長時間かかる検証を伴う作業も、`main` から機能単位のブランチを作成して進める。
 - 機能ブランチ名は内容が分かる短い英数字・ハイフン形式にする。例: `fix-web-concurrency`, `feature-series-url`。
-- 機能ブランチでは適切な動作テストを済ませてから `develop` に統合する。統合後も `develop` 上で必要なテストを再実行する。
-- `main` への統合は、ユーザーが明示的に依頼した場合、またはリリース作業として明確に合意された場合だけ行う。`develop` は削除せず残す。
-- `main` へ統合する前に、`develop` が clean であること、必要なテストが通っていること、バージョン更新や README 更新などリリースに必要な差分が揃っていることを確認する。
+- 機能ブランチでは適切な動作テストを済ませてから `main` に統合する。統合は PR を作成し、base は `main` にする。統合後も `main` 上で必要なテストを再実行する。
+- `main` への統合（マージ）は、ユーザーが明示的に依頼した場合に行う。リリースに関わる差分（バージョン更新・README 更新など）が必要なときは、それらを揃えてから統合する。
+- `main` へ統合する前に、作業ブランチが clean であること、必要なテストが通っていること、（リリース時は）バージョン更新や README 更新などリリースに必要な差分が揃っていることを確認する。
 - タグ作成はユーザーがバージョン番号を明示した場合だけ行う。タグは `main` のリリースコミットを指すようにし、作成後に push する。
 - 実装が一区切りついたら、機能単位で git commit する。無関係な変更をひとつの commit に混ぜず、レビューやロールバックがしやすい粒度に分ける。
 - commit 前には `git diff` / `git status` を確認し、ユーザー由来または別作業由来の変更を混ぜない。意図しない整形差分、改行だけの変更、import 並び替えだけの変更を含めない。
 - commit メッセージは英語の短い命令形または要約形にする。例: `Fix web download concurrency`, `Document release setup steps`。
 - push は原則として作業単位の commit 後に行う。ユーザーが「push しないで」と明示した場合は commit までに留め、push しない。
-- `develop` で作業した commit は `origin/develop` に push する。機能ブランチで作業した場合は、そのブランチを push し、`develop` 統合後に `origin/develop` も push する。
-- `main` 統合後は `origin/main` を push する。リリースタグを作成した場合はタグも push する。
+- 機能ブランチで作業した commit は、そのブランチを `origin` に push する。`main` 統合後は `origin/main` を push する。リリースタグを作成した場合はタグも push する。
 - **バージョン更新時は必ず `cargo check` を実行し、ビルドが通ることを確認してから commit・push・タグ作成を行う。** `Cargo.toml` のバージョン更新と `cargo check` による `Cargo.lock` 更新は同じ commit に含める。
 - `git reset --hard`、`git checkout --`、強制 push、履歴改変 rebase は、ユーザーが明示的に依頼した場合以外は行わない。
-- ブランチ削除はユーザーが明示的に依頼した場合だけ行う。特に `develop` は残す。
+- ブランチ削除はユーザーが明示的に依頼した場合だけ行う。
 
 ## サブエージェント運用ルール
 - サブエージェントを使うのは、広範囲の監査、複数の独立トラックへ分解できる実装、並列化メリットが明確な作業に限る。
@@ -225,7 +224,14 @@ src/
     output.rs                      - create_output_text_path/filename, extract_domain/ncode_like
     ini.rs                         - IniData / IniValue (INI parser/serializer)
     settings.rs                    - NovelSettings (44 items, INI overlay, replace.txt)
-    device.rs                      - OutputManager (端末別出力: epub, mobi, kindle等)
+    device.rs                      - OutputManager (端末別出力: epub, mobi, kindle等。epub/reader/ibooks は既定でネイティブ経路、convert.use-aozoraepub3 で AozoraEpub3 退避)
+    epub/                          - ネイティブ EPUB3 生成 (Java/AozoraEpub3 非依存)
+      mod.rs                       - build_epub オーケストレーション, EpubOptions
+      parser.rs                    - 青空中間テキスト→中間表現(Block/Page/Document), 改ページ分割
+      xhtml.rs                     - インライン注記/ブロック→XHTML, page/title/nav 生成
+      gaiji.rs                     - 外字(面区点/米印/二重山括弧)→Unicode 解決
+      package.rs                   - OPF(v3.0)/container.xml 生成, mimetype先頭無圧縮ZIP書出し, 決定論的UUID
+      assets.rs                    - 縦書きCSS, 埋め込みフォント, メディアタイプ判定
     dakuten_font.rs                - 濁点フォント処理
     inspector.rs                   - 調査ログ生成 (Inspector)
     converter_base/
@@ -276,6 +282,7 @@ sample/
 - **なろう**: narou.rb参照データと完全互換確認済み
 - **カクヨム (ID=1177354055617350769)**: **完全互換達成** — 行数完全一致 (25,273/25,273)、行単位 diff 0件。`cargo test` の `tests/convert_parity.rs` で byte-for-byte fixture テスト通過
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
+- **ネイティブ EPUB3 生成 (2026-06)**: Java/AozoraEpub3 非依存の Rust ネイティブ経路 (`src/converter/epub/`) を実装。`epub`/`reader`/`ibooks` は既定でネイティブ生成し、青空中間テキスト→縦書き EPUB3 (mimetype無圧縮先頭 + container + OPF v3.0 rtl + nav + 章分割XHTML + CSS) を出力。`convert.use-aozoraepub3` で AozoraEpub3 退避、`NAROU_RS_EPUB_ENGINE` で強制切替。`~/run/narou_rs` の8作品で epubcheck 5.3.0 を 0 エラー/0 警告で通過。既存 `convert.add-dc-subject-to-epub` 後処理 (`standard.opf` 前提) とも互換。mobi(kindlegen)/kobo(AozoraEpub3) は従来経路のまま。
 
 ### ダウンロード互換性
 - なろう (n8858hb, 24セクション) DL完走確認済み

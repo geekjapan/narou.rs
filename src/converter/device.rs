@@ -477,6 +477,69 @@ impl OutputManager {
         Ok(output_path)
     }
 
+    /// EPUB を生成する。既定はネイティブ経路（grill Q1）。`convert.use-aozoraepub3` 有効かつ
+    /// AozoraEpub3/Java が解決可能なときのみ従来経路を使い、解決不可ならネイティブへフォールバックする。
+    /// 検証用に環境変数 `NAROU_RS_EPUB_ENGINE`(`native`/`aozora`) で強制切替できる。
+    fn build_epub_output(
+        &self,
+        input_txt: &Path,
+        output_dir: &Path,
+        output_ext: &str,
+        include_illust: bool,
+    ) -> Result<PathBuf> {
+        if self.use_aozora_engine() {
+            return self.run_aozora_epub3(input_txt, output_dir, output_ext);
+        }
+        self.run_native_epub(input_txt, output_dir, output_ext, include_illust)
+    }
+
+    /// AozoraEpub3 経路を使うべきか判定する。
+    fn use_aozora_engine(&self) -> bool {
+        match std::env::var("NAROU_RS_EPUB_ENGINE").ok().as_deref() {
+            Some("native") => return false,
+            Some("aozora") => return true,
+            _ => {}
+        }
+        if !crate::compat::load_local_setting_bool("convert.use-aozoraepub3") {
+            return false;
+        }
+        // 退避指定でも AozoraEpub3/Java が解決できなければネイティブへフォールバック。
+        self.aozora_epub3_path.is_some() && resolve_java_command_path().is_some()
+    }
+
+    fn run_native_epub(
+        &self,
+        input_txt: &Path,
+        output_dir: &Path,
+        output_ext: &str,
+        include_illust: bool,
+    ) -> Result<PathBuf> {
+        // 濁点フォントは設定 (`use_dakuten_font`) もしくは中間テキストに ［＃濁点］ が
+        // 含まれる場合に有効化する（AozoraEpub3 経路 run_aozora_epub3 と同条件）。
+        let needs_dakuten = self.use_dakuten_font || file_contains_dakuten_chuki(input_txt);
+        let opts = super::epub::EpubOptions {
+            embed_font: crate::compat::load_local_setting_bool("convert.epub-embed-font"),
+            include_illust,
+            line_height: self.epub_line_height(),
+            vertical: !self.yokogaki,
+            dakuten_font: needs_dakuten,
+        };
+        if self.verbose {
+            eprintln!("EPUBを生成しています");
+        }
+        let path = super::epub::build_epub(input_txt, output_dir, output_ext, &opts)?;
+        eprintln!("変換しました");
+        Ok(path)
+    }
+
+    /// EPUB 本文の行高。global setting `line-height` を参照し、無ければ 1.8。
+    fn epub_line_height(&self) -> f64 {
+        load_global_setting_string("line-height")
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(1.8)
+    }
+
     fn create_ibunko_zip(&self, input_txt: &Path, include_illust: bool) -> Result<PathBuf> {
         eprintln!("zipファイルを作成中です...");
         let mut data = std::fs::read_to_string(input_txt)?;
@@ -580,11 +643,11 @@ impl OutputManager {
     ) -> Result<PathBuf> {
         match self.device {
             Device::Text => Ok(input_txt.to_path_buf()),
-            Device::Epub => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
+            Device::Epub => self.build_epub_output(input_txt, output_dir, ".epub", include_illust),
             Device::Kobo => self.run_aozora_epub3(input_txt, output_dir, ".kepub.epub"),
             Device::Ibunko => self.create_ibunko_zip(input_txt, include_illust),
-            Device::Reader => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
-            Device::Ibooks => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
+            Device::Reader => self.build_epub_output(input_txt, output_dir, ".epub", include_illust),
+            Device::Ibooks => self.build_epub_output(input_txt, output_dir, ".epub", include_illust),
             Device::Mobi => {
                 let temp_input = output_dir.join(format!("{}_mobi_source.txt", base_name));
                 std::fs::copy(input_txt, &temp_input)?;
@@ -658,12 +721,12 @@ impl OutputManager {
     }
 
     pub fn available_devices() -> Vec<(String, bool)> {
+        // epub/reader/ibooks はネイティブ EPUB3 経路が既定で、AozoraEpub3/Java 非依存。
+        // よって外部ツールの有無に関わらず常に利用可能。mobi(kindlegen)/kobo(AozoraEpub3)
+        // は従来どおり外部ツール依存。
         let devices = vec![
             ("text".to_string(), true),
-            (
-                "epub".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
+            ("epub".to_string(), true),
             ("mobi".to_string(), {
                 Self::find_external_tool("kindlegen").is_some()
                     && Self::find_external_tool("AozoraEpub3").is_some()
@@ -673,14 +736,8 @@ impl OutputManager {
                 Self::find_external_tool("AozoraEpub3").is_some(),
             ),
             ("ibunko".to_string(), true),
-            (
-                "reader".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
-            (
-                "ibooks".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
+            ("reader".to_string(), true),
+            ("ibooks".to_string(), true),
         ];
         devices
     }
