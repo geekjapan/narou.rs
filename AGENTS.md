@@ -1,3 +1,37 @@
+# Project Runtime Kernel
+
+このファイルは、この fork で AI エージェント（Claude Code / Codex 等）が作業するときの project-scope 初期化ルールと、`narou.rs` 固有の開発ルールをまとめたものです。`CLAUDE.md` はこのファイルをインポートするだけの薄いラッパーであり、Claude / Codex のどちらで作業しても本ファイルが唯一の正本となります。既存の project 固有情報を正とし、個人用の運用補助はこの先頭節に限定して重ねます。
+
+## Always-On Rules
+- 日本語で応答する。明示指定がある場合だけ別言語にする。
+- 非自明な実装、デバッグ、設計、レビュー、workflow 変更は、実ファイルや実サービスを確認してから結論を出す。
+- 狭い単発変更は、現物確認、編集、最小検証、報告まで直接進める。
+- 完了を主張する前に、対象に合った最小の検証を実行する。
+- `rg` と token-efficient な確認手段を優先し、不要な大量出力を避ける。
+- 秘密情報、API key、token、local auth、machine-local cache の値は表示・記録・コミットしない。
+- repository 内では、より近い `AGENTS.md`、`CLAUDE.md`、domain docs、ADR を優先する。
+
+## Workflow Routing
+- change / spec / feature / 設計 / policy / architecture / multi-session 系の作業は、可能なら OPSX/OpenSpec を背骨にする。
+- trivial で可逆な単発変更、またはドキュメントの狭い追記は、OPSX を省略して直接処理してよい。
+- `diagnose`、検証、レビュー系など非変更系の skill は必要に応じて使ってよい。
+- mattpocock 系 skill は OPSX と競合させず、要件整理、TDD、診断、設計深化の精度レイヤーとして使う。
+
+## Response Economy
+- 人間との思考・相談・最終説明は日本語で短く書く。
+- エージェント運用、worklog、handoff、subagent report は英語で簡潔に書く。
+- 前提、不確実性、file path、command、error、test result、risk、changed file、remaining task、next action は省略しない。
+- サブエージェントは、広範囲の監査や明確に並列化できる作業だけに使う。1ファイル編集や軽微修正では使わない。
+
+## Project Rules
+- 以降の `narou.rs` 固有ルールは、この fork の実装・互換性・Git 運用の正本として扱う。
+- user-scope の詳細ルールは各エージェントの user 設定（Codex は `~/.codex/AGENTS.md` / `~/.codex/RTK.md`、Claude は `~/.claude/CLAUDE.md`）側に置き、project に混ぜる必要があるものだけここへ昇格する。
+
+## GitNexus 注入の運用ルール
+- `CLAUDE.md` は本ファイル（`AGENTS.md`）を `@AGENTS.md` でインポートするだけの薄いラッパーに保つ。ルール本体・GitNexus ブロックを CLAUDE.md に重複させない。
+- ただし `npx gitnexus analyze` は既定で AGENTS.md と CLAUDE.md の**両方**に GitNexus セクションを注入する（片方だけに絞るフラグは無い）。CLAUDE.md への重複注入を防ぐため、**analyze は必ず `--skip-agents-md` を付けて実行する**（例: `npx gitnexus analyze --skip-agents-md`）。
+- GitNexus ブロックを更新したい場合は、一度フラグ無しで analyze して再生成した後、CLAUDE.md 側の `<!-- gitnexus:start -->`〜`<!-- gitnexus:end -->` を削除し、AGENTS.md 側だけを残す。
+
 # narou.rs — Rust Port of narou.rb
 
 ## Overview
@@ -9,9 +43,8 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 | 完了度 | コマンド数 | 内訳 |
 |:------:|:---------:|------|
 | ✅ 完了 | 18 | init, list, tag, freeze, remove, setting, diff, send, backup, clean, help, version, log, folder, browser, alias, inspect, csv, trace |
-| 🟡 部分 | 4 | download, update, convert, web |
-| 🟡 部分 | 1 | mail |
-| ❌ 未実装 | 1 | — (全コマンド実装済み) |
+| 🟡 部分 | 5 | download, update, convert, web, mail |
+| ❌ 未実装 | 0 | — (全コマンド何らかの実装あり) |
 
 ## Porting Policy
 - このプログラムは `sample/narou` にある本家 narou.rb を Rust へ移行するための互換実装である。
@@ -109,12 +142,18 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 ## Build & Run
 ```powershell
 cargo build              # Build (edition 2024)
+cargo check              # Type-check
+cargo test               # 全テスト
+cargo test --test convert_parity   # 変換互換性テストのみ
 cargo run -- convert 2  # カクヨム小説を変換（CWD: sample/novel/）
 cargo run -- convert 1  # なろう小説を変換
-cargo check              # Type-check
+cargo local-build        # Release と同構成の narou/ フォルダを生成 (= run --bin cargo-local-build)
 ```
 
 **重要**: `cargo run` は `sample/novel/` をCWDとして実行する必要がある（`.narou/` ディレクトリが必要なため）。
+
+- バイナリは 3 つ: `narou_rs`(`src/main.rs`)、`narou_rs_updater`(`src/bin/updater.rs`)、`cargo-local-build`(`src/bin/cargo-local-build.rs`)。
+- テストは `tests/convert_parity.rs`（byte-for-byte fixture テスト）と各 `src/**/mod.rs` 内のインラインユニットテスト（68 モジュール）。
 
 ## Edition 2024 注意事項
 - `{}`フォーマット直後に文字列を書くとprefix扱いされるためスペースが必要
@@ -355,3 +394,47 @@ For each section:
 - **WebSocket**: tokio-tungstenite
 - **HTTP client (low-level)**: curl crate
 - **Random UA**: ua_generator
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **narou.rs** (5485 symbols, 13818 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
+- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/narou.rs/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/narou.rs/clusters` | All functional areas |
+| `gitnexus://repo/narou.rs/processes` | All execution flows |
+| `gitnexus://repo/narou.rs/process/{name}` | Step-by-step execution trace |
+
+## CLI
+
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+
+<!-- gitnexus:end -->
