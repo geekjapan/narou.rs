@@ -107,10 +107,15 @@ fn render_inline_ctx(s: &str, illust: Option<&IllustMap>) -> String {
             }
         }
 
-        // ルビ ｜親《ルビ》。
+        // ルビ。標準青空形式 ｜親《ルビ》を優先し、無ければ narou.rb がギュメ ≪≫ /
+        // パーレン （） ルビを変換した ｜親「ルビ」形式（ConverterBase::narou_ruby）を解釈する。
+        // 《》 を優先することで base に 「」 を含む `｜「引用」《いんよう》` の誤判定を避ける。
         if chars[i] == '｜' {
-            if let Some(obrace) = find_char(&chars, i + 1, '《') {
-                if let Some(cbrace) = find_char(&chars, obrace + 1, '》') {
+            let bracket = find_char(&chars, i + 1, '《')
+                .map(|o| (o, '》'))
+                .or_else(|| find_char(&chars, i + 1, '「').map(|o| (o, '」')));
+            if let Some((obrace, close)) = bracket {
+                if let Some(cbrace) = find_char(&chars, obrace + 1, close) {
                     let base: String = chars[i + 1..obrace].iter().collect();
                     let ruby: String = chars[obrace + 1..cbrace].iter().collect();
                     out.push_str("<ruby>");
@@ -379,6 +384,24 @@ mod tests {
         assert_eq!(
             render_inline("｜親文字《おやもじ》です"),
             "<ruby>親文字<rt>おやもじ</rt></ruby>です"
+        );
+    }
+
+    #[test]
+    fn renders_corner_bracket_ruby_from_narou_ruby() {
+        // narou.rb の ConverterBase::narou_ruby はギュメ/パーレンルビを ｜親「ルビ」へ変換する。
+        assert_eq!(
+            render_inline("｜漢字「かんじ」です"),
+            "<ruby>漢字<rt>かんじ</rt></ruby>です"
+        );
+    }
+
+    #[test]
+    fn prefers_guillemet_when_base_contains_quotes() {
+        // base に 「」 を含む標準形 ｜「引用」《いんよう》 は《》を優先して解釈する。
+        assert_eq!(
+            render_inline("｜「引用」《いんよう》"),
+            "<ruby>「引用」<rt>いんよう</rt></ruby>"
         );
     }
 
