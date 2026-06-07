@@ -107,13 +107,23 @@ fn render_inline_ctx(s: &str, illust: Option<&IllustMap>) -> String {
             }
         }
 
-        // ルビ。標準青空形式 ｜親《ルビ》を優先し、無ければ narou.rb がギュメ ≪≫ /
-        // パーレン （） ルビを変換した ｜親「ルビ」形式（ConverterBase::narou_ruby）を解釈する。
-        // 《》 を優先することで base に 「」 を含む `｜「引用」《いんよう》` の誤判定を避ける。
+        // ルビ。標準青空形式 ｜親《ルビ》と、narou.rb がギュメ ≪≫ / パーレン （） ルビを
+        // 変換した ｜親「ルビ」形式（ConverterBase::narou_ruby）の両方を解釈する。
+        // 開き括弧は ｜ の直後で先に現れる方を採用するが、｜ 直後がいきなり 「 の場合は
+        // base 先頭の引用符（例 ｜「引用」《いんよう》）とみなし 《 を優先する。これにより
+        // 同一行に両形式が混在しても（例 ｜漢字「かんじ」と｜別《べつ》）正しく分割される。
         if chars[i] == '｜' {
-            let bracket = find_char(&chars, i + 1, '《')
-                .map(|o| (o, '》'))
-                .or_else(|| find_char(&chars, i + 1, '「').map(|o| (o, '」')));
+            let g = find_char(&chars, i + 1, '《');
+            let c = find_char(&chars, i + 1, '「');
+            let bracket = match (g, c) {
+                // 「 が先かつ base が空でない → corner ルビ。
+                (Some(gp), Some(cp)) if cp < gp && cp > i + 1 => Some((cp, '」')),
+                // それ以外で 《 があれば標準ルビ。
+                (Some(gp), _) => Some((gp, '》')),
+                // 《 が無く、base が空でない 「 のみ → corner ルビ。
+                (None, Some(cp)) if cp > i + 1 => Some((cp, '」')),
+                _ => None,
+            };
             if let Some((obrace, close)) = bracket {
                 if let Some(cbrace) = find_char(&chars, obrace + 1, close) {
                     let base: String = chars[i + 1..obrace].iter().collect();
@@ -230,7 +240,13 @@ fn render_page_body(page: &Page, illust: &IllustMap) -> String {
                 out.push_str(&render_heading(level, text));
             }
             Block::OpenDiv(kind) => {
-                out.push_str(&format!("<div class=\"{}\">\n", div_class(kind)));
+                // N 字下げは実際の段数を字数ぶんのインデントとして反映する
+                // （`.indent` クラスの固定マージンだけでは段数が失われるため）。
+                let extra = match kind {
+                    DivKind::Indent(n) if *n > 0 => format!(" style=\"margin-top:{n}em\""),
+                    _ => String::new(),
+                };
+                out.push_str(&format!("<div class=\"{}\"{}>\n", div_class(kind), extra));
                 open_div_depth += 1;
             }
             Block::CloseDiv(_) => {
@@ -406,6 +422,15 @@ mod tests {
     }
 
     #[test]
+    fn splits_mixed_corner_and_guillemet_ruby_on_one_line() {
+        // 同一行に corner ルビと標準ルビが混在しても、近い閉じ括弧で正しく分割する。
+        assert_eq!(
+            render_inline("｜漢字「かんじ」と｜別《べつ》"),
+            "<ruby>漢字<rt>かんじ</rt></ruby>と<ruby>別<rt>べつ</rt></ruby>"
+        );
+    }
+
+    #[test]
     fn renders_tcy_and_bouten() {
         assert_eq!(
             render_inline("［＃縦中横］10［＃縦中横終わり］話"),
@@ -463,6 +488,14 @@ mod tests {
         );
         assert!(nav.contains("xmlns:epub=\"http://www.idpf.org/2007/ops\""));
         assert!(nav.contains("epub:type=\"toc\""));
+    }
+
+    #[test]
+    fn honors_range_indent_amount() {
+        let text = "題\n著\n［＃ここから８字下げ］\n字下げ本文\n［＃ここで字下げ終わり］\n";
+        let doc = parse_document(text);
+        let xhtml = render_page_xhtml(&doc.pages[0], &doc.title, &IllustMap::new(), true);
+        assert!(xhtml.contains("<div class=\"indent\" style=\"margin-top:8em\">"));
     }
 
     #[test]
