@@ -743,7 +743,16 @@ impl Downloader {
         {
             Ok(mut body) => {
                 pretreatment_source(&mut body, setting.encoding(), Some(setting));
-                Ok(NovelInfo::from_novel_info_source(setting, &body))
+                let mut info = NovelInfo::from_novel_info_source(setting, &body);
+                // The novel_info page (e.g. syosetu.org `?mode=ss_detail`) can be
+                // blocked or served as an anti-bot interstitial with a 200 status,
+                // in which case no fields are extracted. Fall back to the already
+                // fetched, reliable TOC page for the core display fields so the
+                // title/author are not silently dropped.
+                if info.title.as_deref().unwrap_or("").is_empty() {
+                    info.fill_missing_from(NovelInfo::from_toc_source(setting, toc_source));
+                }
+                Ok(info)
             }
             Err(_) => Ok(NovelInfo::from_toc_source(setting, toc_source)),
         }
