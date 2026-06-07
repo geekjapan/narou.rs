@@ -183,6 +183,7 @@ fn collect_illustrations(
     }
     let re = Regex::new(r"［＃挿絵（(.+?)）入る］")?;
     let mut seq = 0usize;
+    let mut cover_assigned = false;
     for caps in re.captures_iter(text) {
         let rel = caps[1].to_string();
         if map.contains_key(&rel) {
@@ -203,11 +204,20 @@ fn collect_illustrations(
         let zip_path = format!("item/image/{file}");
         let href_from_xhtml = format!("../image/{file}");
         let media_type = assets::media_type_for(&file).to_string();
+        // 表紙画像（render::create_cover_chuki が出力する `cover.{jpg,png,jpeg}`）には
+        // EPUB3 の cover-image プロパティを付与し、リーダーが表紙として認識できるようにする
+        // （旧 Aozora 経路の `-c 0` 相当）。cover-image は EPUB 内で 1 つだけ許される。
+        let properties = if !cover_assigned && is_cover_image(&rel) {
+            cover_assigned = true;
+            Some("cover-image".to_string())
+        } else {
+            None
+        };
         items.push(ManifestItem {
             id: format!("img{seq:04}"),
             href: format!("image/{file}"),
             media_type,
-            properties: None,
+            properties,
             in_spine: false,
             zip_path,
             data,
@@ -215,6 +225,13 @@ fn collect_illustrations(
         map.insert(rel, href_from_xhtml);
     }
     Ok(map)
+}
+
+/// 表紙画像注記かどうかを判定する。`render::create_cover_chuki` は
+/// アーカイブ直下の `cover.{jpg,png,jpeg}` を表紙として出力する。
+fn is_cover_image(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    matches!(lower.as_str(), "cover.jpg" | "cover.jpeg" | "cover.png")
 }
 
 /// 挿絵の相対パスを検証し、`output_dir` 配下に収まる安全な実体パスのみ `Some` で返す。
@@ -415,6 +432,26 @@ mod tests {
         assert!(opf.contains("page-progression-direction=\"ltr\""));
         let page = read_zip_entry(&out, "item/xhtml/0001.xhtml").unwrap();
         assert!(page.contains("class=\"hltr\""));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn marks_cover_image_with_cover_property() {
+        let dir = std::env::temp_dir().join(format!("narou_epub_cover_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cover.jpg"), b"\xff\xd8\xff\xe0fakejpeg").unwrap();
+
+        let txt = dir.join("表紙テスト.txt");
+        // render::create_cover_chuki と同じく本文先頭に表紙注記を置く。
+        std::fs::write(&txt, "表紙テスト\n著者\n［＃挿絵（cover.jpg）入る］\n本文\n").unwrap();
+
+        let out = build_epub(&txt, &dir, ".epub", &EpubOptions::default()).unwrap();
+        let opf = read_zip_entry(&out, "item/standard.opf").unwrap();
+        // 表紙画像の manifest 項目に cover-image プロパティが付く。
+        assert!(opf.contains("properties=\"cover-image\""));
+        // cover-image は 1 つだけ。
+        assert_eq!(opf.matches("cover-image").count(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
