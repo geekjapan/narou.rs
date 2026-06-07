@@ -21,6 +21,19 @@ use super::security::{
 
 const FAIL_THRESHOLD: u8 = 5;
 
+/// Backoff schedule used when every fetch tier fails with a *transient* error
+/// (connection reset/refused, timeout, etc. — not 404/503). Some sites (e.g.
+/// 暁 www.akatsuki-novels.com) drop connections at the TCP level after a burst
+/// of requests; without a backoff+retry a single transient drop aborts the
+/// whole download. The schedule length is the number of retries, so the default
+/// makes up to 4 total attempts per URL. Each delay is several seconds, which is
+/// enough for the burst-throttle window to clear.
+const DEFAULT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
+
 pub struct HttpFetcher {
     pub client: reqwest::blocking::Client,
     pub manual_redirect_client: reqwest::blocking::Client,
@@ -28,6 +41,8 @@ pub struct HttpFetcher {
     pub tier_failures: HashMap<String, [u8; 3]>,
     pub rate_limiter: RateLimiter,
     pub prefer_curl: bool,
+    /// Backoff delays applied between retry attempts in [`Self::fetch_text`].
+    pub retry_delays: Vec<Duration>,
 }
 
 impl HttpFetcher {
@@ -42,6 +57,7 @@ impl HttpFetcher {
             tier_failures: HashMap::new(),
             rate_limiter: RateLimiter::new(false),
             prefer_curl: false,
+            retry_delays: DEFAULT_RETRY_DELAYS.to_vec(),
         })
     }
 
@@ -57,6 +73,53 @@ impl HttpFetcher {
     ) -> Result<String> {
         validate_public_url(url).map_err(io_error)?;
         let domain = domain_of(url).to_string();
+        self.fetch_text_with_retry(url, &domain, cookie, encoding)
+    }
+
+    /// Retry wrapper around the tier cascade. Kept separate from `fetch_text`
+    /// (which validates the URL first) so it can be unit-tested against a
+    /// loopback server without tripping the SSRF guard in `validate_public_url`.
+    fn fetch_text_with_retry(
+        &mut self,
+        url: &str,
+        domain: &str,
+        cookie: Option<&str>,
+        encoding: Option<&str>,
+    ) -> Result<String> {
+        let retry_delays = self.retry_delays.clone();
+        let total_attempts = retry_delays.len() + 1;
+        let mut last_error = None;
+
+        for attempt in 0..total_attempts {
+            match self.fetch_text_once(url, domain, cookie, encoding) {
+                Ok(body) => return Ok(body),
+                // 404/503 are definitive answers, never worth retrying here.
+                Err(err) if should_stop_fetch_fallback(&err) => return Err(err),
+                Err(err) => {
+                    last_error = Some(err);
+                    if let Some(delay) = retry_delays.get(attempt) {
+                        // Transient failure (e.g. burst throttle dropping the
+                        // connection). Back off, then give every tier a fresh
+                        // probe so a temporary block does not permanently
+                        // disable the connection-based tiers for this domain.
+                        std::thread::sleep(*delay);
+                        self.tier_failures.remove(domain);
+                        self.prefer_curl = false;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| NarouError::NotFound(url.to_string())))
+    }
+
+    fn fetch_text_once(
+        &mut self,
+        url: &str,
+        domain: &str,
+        cookie: Option<&str>,
+        encoding: Option<&str>,
+    ) -> Result<String> {
         let mut last_error = None;
 
         if self.prefer_curl {
@@ -69,15 +132,15 @@ impl HttpFetcher {
 
         let skip_curl = self
             .tier_failures
-            .get(&domain)
+            .get(domain)
             .map_or(false, |f| f[0] >= FAIL_THRESHOLD);
         let skip_reqwest = self
             .tier_failures
-            .get(&domain)
+            .get(domain)
             .map_or(false, |f| f[1] >= FAIL_THRESHOLD);
         let skip_wget = self
             .tier_failures
-            .get(&domain)
+            .get(domain)
             .map_or(false, |f| f[2] >= FAIL_THRESHOLD);
 
         if !skip_curl && !self.prefer_curl {
@@ -91,7 +154,7 @@ impl HttpFetcher {
                         return Err(err);
                     }
                     last_error = Some(err);
-                    self.tier_failures.entry(domain.clone()).or_insert([0; 3])[0] += 1;
+                    self.tier_failures.entry(domain.to_string()).or_insert([0; 3])[0] += 1;
                 }
             }
         }
@@ -104,7 +167,7 @@ impl HttpFetcher {
                         return Err(err);
                     }
                     last_error = Some(err);
-                    self.tier_failures.entry(domain.clone()).or_insert([0; 3])[1] += 1;
+                    self.tier_failures.entry(domain.to_string()).or_insert([0; 3])[1] += 1;
                 }
             }
         }
@@ -117,7 +180,7 @@ impl HttpFetcher {
                         return Err(err);
                     }
                     last_error = Some(err);
-                    self.tier_failures.entry(domain.clone()).or_insert([0; 3])[2] += 1;
+                    self.tier_failures.entry(domain.to_string()).or_insert([0; 3])[2] += 1;
                 }
             }
         }
@@ -293,7 +356,12 @@ impl HttpFetcher {
             .arg(format!("--user-agent={}", &self.user_agent))
             .arg("--header=Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
             .arg("--header=Accept-Language: ja,en-US;q=0.9,en;q=0.8")
-            .arg("--header=Accept-Encoding: gzip, deflate")
+            // NOTE: do NOT advertise gzip/deflate here. GNU wget does not
+            // transparently decompress a response unless it is built with zlib
+            // *and* invoked with --compression=auto; with a manual
+            // Accept-Encoding header it hands back the raw gzip bytes, which the
+            // code below then mis-decodes as text (garbage body). Letting wget
+            // default to identity encoding makes the server return plain HTML.
             .arg("--header=Connection: keep-alive");
         if let Some(cookie) = cookie {
             if !is_safe_header_value(cookie) {
@@ -552,6 +620,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn curl_404_is_not_found() {
@@ -581,5 +650,107 @@ mod tests {
         assert!(should_stop_fetch_fallback(&NarouError::NotFound(
             "https://example.com/missing".into()
         )));
+    }
+
+    /// Regression test for the 暁 (akatsuki) burst-throttle abort: a site that
+    /// drops connections at the TCP level for a short window must not abort the
+    /// whole download. `fetch_text` should back off and retry, and eventually
+    /// succeed once the throttle window clears.
+    ///
+    /// To stay deterministic and fast, the server returns a *complete* HTTP 500
+    /// for every request during the first `BLOCK` window (a transient,
+    /// retryable error — unlike 404/503 which deliberately stop the fallback),
+    /// then a normal 200 afterwards. The real-world akatsuki trigger is a TCP
+    /// connection drop, but the retry loop handles any non-404/503 error
+    /// identically, so a 500 exercises the same code path without depending on
+    /// how each tier's underlying client times out a dropped socket.
+    #[test]
+    fn fetch_text_retries_after_transient_failures() {
+        const BLOCK: Duration = Duration::from_millis(300);
+        let body = "<html><body>ok</body></html>";
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/section");
+
+        let body_owned = body.to_string();
+        let server = thread::spawn(move || {
+            let start = Instant::now();
+            // Serve connections until we have answered one successful request
+            // (after the block window), then exit so the thread is joinable.
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                if start.elapsed() < BLOCK {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_owned.len(),
+                    body_owned
+                );
+                let _ = stream.write_all(response.as_bytes());
+                break;
+            }
+        });
+
+        let mut fetcher = HttpFetcher::new("narou_rs-test").unwrap();
+        // Keep the test fast: one retry, backoff just past the block window.
+        fetcher.retry_delays = vec![Duration::from_millis(500)];
+
+        // Call the retry core directly: fetch_text() would reject the loopback
+        // address via the SSRF guard before any request is made.
+        let result = fetcher.fetch_text_with_retry(&url, "127.0.0.1", None, None);
+        server.join().unwrap();
+
+        let fetched = result.expect("fetch_text should recover after the throttle window clears");
+        assert!(
+            fetched.contains("ok"),
+            "expected recovered body, got: {fetched:?}"
+        );
+    }
+
+    /// A definitive 404 must NOT be retried — it should fail fast even with a
+    /// retry schedule configured, so missing sections don't waste backoff time.
+    #[test]
+    fn fetch_text_does_not_retry_not_found() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/missing");
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+
+        let mut fetcher = HttpFetcher::new("narou_rs-test").unwrap();
+        // Long delays would make the test slow *iff* a retry happened; a 404
+        // must short-circuit before any backoff.
+        fetcher.retry_delays = vec![Duration::from_secs(30)];
+
+        let started = Instant::now();
+        // Call the retry core directly (see the recovery test for why).
+        let err = fetcher
+            .fetch_text_with_retry(&url, "127.0.0.1", None, None)
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(matches!(err, NarouError::NotFound(_)), "got: {err:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "404 should not trigger backoff, took {elapsed:?}"
+        );
     }
 }
