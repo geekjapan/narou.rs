@@ -105,6 +105,31 @@ impl NovelInfo {
         info
     }
 
+    /// Fill empty/missing core display fields from a fallback source (e.g. the
+    /// TOC page) without overwriting any value already extracted from the
+    /// primary novel_info page.
+    pub fn fill_missing_from(&mut self, fallback: NovelInfo) {
+        let fill = |target: &mut Option<String>, source: Option<String>| {
+            if target.as_deref().is_none_or(str::is_empty) {
+                if let Some(v) = source.filter(|s| !s.is_empty()) {
+                    *target = Some(v);
+                }
+            }
+        };
+        fill(&mut self.title, fallback.title);
+        fill(&mut self.author, fallback.author);
+        fill(&mut self.story, fallback.story);
+        fill(&mut self.tags, fallback.tags);
+    }
+
+    /// Whether any core display field (title/author/story/tags) is missing and
+    /// could be recovered from a fallback source.
+    pub fn has_missing_core_fields(&self) -> bool {
+        [&self.title, &self.author, &self.story, &self.tags]
+            .iter()
+            .any(|field| field.as_deref().is_none_or(str::is_empty))
+    }
+
     pub fn from_toc_source(setting: &SiteSetting, toc_source: &str) -> Self {
         let mut info = Self::empty();
         let keys = ["title", "author", "story", "tags"];
@@ -132,7 +157,75 @@ fn parse_narou_date_with_timezone(
 #[cfg(test)]
 mod tests {
     use super::parse_narou_date;
+    use super::NovelInfo;
+    use crate::downloader::site_setting::SiteSetting;
     use chrono::{Datelike, Timelike};
+
+    #[test]
+    fn syosetu_org_title_falls_back_to_toc_when_detail_page_blocked() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "syosetu.org")
+            .unwrap();
+
+        // Anti-bot interstitial served with HTTP 200: none of the `t:` / `w:`
+        // novel_info patterns match, so from_novel_info_source yields nothing.
+        let challenge = "<!DOCTYPE html><html><head><title>Just a moment...</title>\
+            </head><body>checking your browser</body></html>";
+        let detail_info = NovelInfo::from_novel_info_source(setting, challenge);
+        assert!(detail_info.title.as_deref().unwrap_or("").is_empty());
+
+        // The TOC page (reliably fetched during body DL) carries the title/author
+        // via the `title:` / `author:` patterns.
+        let toc = "<br>\n\
+            <span style=\"font-size:150%\" itemprop=\"name\">テスト小説</span>\n\
+            <div align=\"right\">作者：<span itemprop=\"author\">著者名</span></div>";
+
+        let mut info = detail_info;
+        info.fill_missing_from(NovelInfo::from_toc_source(setting, toc));
+
+        assert_eq!(info.title.as_deref(), Some("テスト小説"));
+        assert_eq!(info.author.as_deref(), Some("著者名"));
+    }
+
+    #[test]
+    fn fill_missing_from_does_not_overwrite_existing_values() {
+        let mut info = NovelInfo::empty();
+        info.title = Some("primary".to_string());
+        info.author = Some(String::new());
+
+        let mut fallback = NovelInfo::empty();
+        fallback.title = Some("fallback-title".to_string());
+        fallback.author = Some("fallback-author".to_string());
+        fallback.story = Some("fallback-story".to_string());
+
+        info.fill_missing_from(fallback);
+
+        assert_eq!(info.title.as_deref(), Some("primary"));
+        assert_eq!(info.author.as_deref(), Some("fallback-author"));
+        assert_eq!(info.story.as_deref(), Some("fallback-story"));
+    }
+
+    #[test]
+    fn partial_detail_parse_still_backfills_missing_author_from_toc() {
+        // The detail page yielded a title but not the author (e.g. markup change
+        // or a user-edited YAML pattern that only breaks author extraction).
+        // has_missing_core_fields must still trigger so the TOC author is kept.
+        let mut info = NovelInfo::empty();
+        info.title = Some("詳細ページのタイトル".to_string());
+
+        assert!(info.has_missing_core_fields());
+
+        let mut toc = NovelInfo::empty();
+        toc.title = Some("TOCタイトル".to_string());
+        toc.author = Some("TOC著者".to_string());
+
+        info.fill_missing_from(toc);
+
+        assert_eq!(info.title.as_deref(), Some("詳細ページのタイトル"));
+        assert_eq!(info.author.as_deref(), Some("TOC著者"));
+    }
 
     #[test]
     fn parse_narou_date_accepts_kakuyomu_rfc3339() {

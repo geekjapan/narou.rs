@@ -743,7 +743,18 @@ impl Downloader {
         {
             Ok(mut body) => {
                 pretreatment_source(&mut body, setting.encoding(), Some(setting));
-                Ok(NovelInfo::from_novel_info_source(setting, &body))
+                let mut info = NovelInfo::from_novel_info_source(setting, &body);
+                // The novel_info page (e.g. syosetu.org `?mode=ss_detail`) can be
+                // blocked or served as an anti-bot interstitial with a 200 status,
+                // in which case some or all fields fail to extract. Backfill any
+                // missing core display field (title/author/story/tags) from the
+                // already fetched, reliable TOC page so they are not silently
+                // dropped. fill_missing_from never overwrites a value the
+                // novel_info page did provide.
+                if info.has_missing_core_fields() {
+                    info.fill_missing_from(NovelInfo::from_toc_source(setting, toc_source));
+                }
+                Ok(info)
             }
             Err(_) => Ok(NovelInfo::from_toc_source(setting, toc_source)),
         }
