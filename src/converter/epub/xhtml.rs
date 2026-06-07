@@ -323,11 +323,8 @@ fn sanitize_anchor(frag: &str) -> String {
 }
 
 fn starts_with(chars: &[char], at: usize, pat: &str) -> bool {
-    let p: Vec<char> = pat.chars().collect();
-    if at + p.len() > chars.len() {
-        return false;
-    }
-    chars[at..at + p.len()] == p[..]
+    // 文字走査ループから毎文字呼ばれるため、Vec 確保を避けてイテレータ比較する。
+    pat.chars().enumerate().all(|(i, c)| chars.get(at + i) == Some(&c))
 }
 
 fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {

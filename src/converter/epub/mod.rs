@@ -223,9 +223,10 @@ fn modified_timestamp(input_txt: &Path) -> String {
     let systime = std::fs::metadata(input_txt)
         .and_then(|m| m.modified())
         .ok();
+    // メタデータ取得失敗時も決定論を保つため、現在時刻ではなく UNIX_EPOCH へフォールバックする。
     let dt = systime
         .map(chrono::DateTime::<chrono::Utc>::from)
-        .unwrap_or_else(chrono::Utc::now);
+        .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::UNIX_EPOCH));
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
