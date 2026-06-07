@@ -186,7 +186,14 @@ src/
     output.rs                      - create_output_text_path/filename, extract_domain/ncode_like
     ini.rs                         - IniData / IniValue (INI parser/serializer)
     settings.rs                    - NovelSettings (44 items, INI overlay, replace.txt)
-    device.rs                      - OutputManager (端末別出力: epub, mobi, kindle等)
+    device.rs                      - OutputManager (端末別出力: epub, mobi, kindle等。epub/reader/ibooks は既定でネイティブ経路、convert.use-aozoraepub3 で AozoraEpub3 退避)
+    epub/                          - ネイティブ EPUB3 生成 (Java/AozoraEpub3 非依存)
+      mod.rs                       - build_epub オーケストレーション, EpubOptions
+      parser.rs                    - 青空中間テキスト→中間表現(Block/Page/Document), 改ページ分割
+      xhtml.rs                     - インライン注記/ブロック→XHTML, page/title/nav 生成
+      gaiji.rs                     - 外字(面区点/米印/二重山括弧)→Unicode 解決
+      package.rs                   - OPF(v3.0)/container.xml 生成, mimetype先頭無圧縮ZIP書出し, 決定論的UUID
+      assets.rs                    - 縦書きCSS, 埋め込みフォント, メディアタイプ判定
     dakuten_font.rs                - 濁点フォント処理
     inspector.rs                   - 調査ログ生成 (Inspector)
     converter_base/
@@ -237,6 +244,7 @@ sample/
 - **なろう**: narou.rb参照データと完全互換確認済み
 - **カクヨム (ID=1177354055617350769)**: **完全互換達成** — 行数完全一致 (25,273/25,273)、行単位 diff 0件。`cargo test` の `tests/convert_parity.rs` で byte-for-byte fixture テスト通過
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
+- **ネイティブ EPUB3 生成 (2026-06)**: Java/AozoraEpub3 非依存の Rust ネイティブ経路 (`src/converter/epub/`) を実装。`epub`/`reader`/`ibooks` は既定でネイティブ生成し、青空中間テキスト→縦書き EPUB3 (mimetype無圧縮先頭 + container + OPF v3.0 rtl + nav + 章分割XHTML + CSS) を出力。`convert.use-aozoraepub3` で AozoraEpub3 退避、`NAROU_RS_EPUB_ENGINE` で強制切替。`~/run/narou_rs` の8作品で epubcheck 5.3.0 を 0 エラー/0 警告で通過。既存 `convert.add-dc-subject-to-epub` 後処理 (`standard.opf` 前提) とも互換。mobi(kindlegen)/kobo(AozoraEpub3) は従来経路のまま。
 
 ### ダウンロード互換性
 - なろう (n8858hb, 24セクション) DL完走確認済み

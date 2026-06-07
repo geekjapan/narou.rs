@@ -30,7 +30,7 @@
 | `init` | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | 🟡 部分 | `--force`/`-f`, `--no-convert`/`-n`, `--freeze`/`-z`, `--remove`/`-r` 実装済み。Nコード指定時の `\k<ncode>` 展開修正済み。`--mail`/`-m` スタブ。インタラクティブモード実装済み。 |
 | `update` | 🟡 部分 | Ruby版ターゲット解決、既存DBのtoc_url/sitename優先、あらすじ正規化比較、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較は実装済み。ただし hotentry、差分用 cache 退避、周辺出力/イベント細部が未完 |
-| `convert` | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
+| `convert` | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足。EPUB3 はネイティブ生成 (Java/AozoraEpub3 非依存) を既定化 (2026-06、`src/converter/epub/`)。`convert.use-aozoraepub3`/`NAROU_RS_EPUB_ENGINE` で経路切替。詳細は `conversion/native_epub3_2026-06-07.md` |
 | `list` | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
 | `tag` | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |
 | `freeze` | 🟡 部分 | 全オプションは実装済み。ただし `.narou/freeze.yaml` 互換と Ruby版ターゲット解決が未完 |
