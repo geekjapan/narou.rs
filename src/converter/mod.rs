@@ -1,6 +1,7 @@
 pub mod converter_base;
 pub mod dakuten_font;
 pub mod device;
+pub mod epub;
 pub mod ini;
 pub mod inspector;
 pub mod output;
