@@ -180,10 +180,11 @@ fn collect_illustrations(
         if map.contains_key(&rel) {
             continue;
         }
-        let src = output_dir.join(&rel);
-        if !src.exists() {
+        // セキュリティ: 挿絵パスは DL コンテンツ由来のため、output_dir 配下に収まる
+        // 安全な相対パスのみ許可する（絶対パス・`..`・ドライブ接頭辞・シンボリックリンク脱出を拒否）。
+        let Some(src) = safe_asset_path(output_dir, &rel) else {
             continue;
-        }
+        };
         let data = std::fs::read(&src)?;
         seq += 1;
         let ext = Path::new(&rel)
@@ -206,6 +207,33 @@ fn collect_illustrations(
         map.insert(rel, href_from_xhtml);
     }
     Ok(map)
+}
+
+/// 挿絵の相対パスを検証し、`output_dir` 配下に収まる安全な実体パスのみ `Some` で返す。
+/// 中間テキストはダウンロードした小説本文由来のため、パストラバーサル
+/// （絶対パス `/etc/passwd`・`../` 脱出・ドライブ接頭辞・シンボリックリンク脱出）を防ぐ。
+fn safe_asset_path(output_dir: &Path, rel: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    // セパレータ混在による検証回避を防ぐ（Aozora 形式は `/` 区切りのみ想定）。
+    if rel.contains('\\') {
+        return None;
+    }
+    let mut has_normal = false;
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(_) => has_normal = true,
+            Component::CurDir => {}
+            // RootDir / Prefix（絶対・ドライブ） / ParentDir（..）はすべて拒否。
+            _ => return None,
+        }
+    }
+    if !has_normal {
+        return None;
+    }
+    // 実体（シンボリックリンク解決後）が output_dir 配下に収まることを確認（多層防御）。
+    let real = output_dir.join(rel).canonicalize().ok()?;
+    let base = output_dir.canonicalize().ok()?;
+    real.starts_with(&base).then_some(real)
 }
 
 /// `dc:identifier` 用の決定論シード。掲載ページ URL があればそれを、無ければ題名+著者。
@@ -333,6 +361,45 @@ mod tests {
         let file = std::fs::File::open(&out).unwrap();
         let mut zip = zip::ZipArchive::new(file).unwrap();
         assert!(zip.by_name("item/image/img0001.png").is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_path_traversal_illustration() {
+        let dir = std::env::temp_dir().join(format!("narou_epub_trav_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // output_dir の外に「機密」ファイルを置く。
+        let secret = dir.parent().unwrap().join(format!("secret_{}.png", std::process::id()));
+        std::fs::write(&secret, b"\x89PNG\r\n\x1a\ntopsecret").unwrap();
+
+        let txt = dir.join("脱出.txt");
+        let content = format!(
+            "脱出\n著者\n本文\n［＃挿絵（../{}）入る］\n",
+            secret.file_name().unwrap().to_str().unwrap()
+        );
+        std::fs::write(&txt, content).unwrap();
+
+        let out = build_epub(&txt, &dir, ".epub", &EpubOptions::default()).unwrap();
+        let file = std::fs::File::open(&out).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        // 親ディレクトリのファイルは EPUB に埋め込まれない。
+        assert!(zip.by_name("item/image/img0001.png").is_err());
+
+        std::fs::remove_file(&secret).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn safe_asset_path_rejects_unsafe_and_accepts_relative() {
+        let dir = std::env::temp_dir().join(format!("narou_epub_safe_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("挿絵")).unwrap();
+        std::fs::write(dir.join("挿絵/1.png"), b"x").unwrap();
+
+        assert!(safe_asset_path(&dir, "挿絵/1.png").is_some());
+        assert!(safe_asset_path(&dir, "../etc/passwd").is_none());
+        assert!(safe_asset_path(&dir, "/etc/passwd").is_none());
+        assert!(safe_asset_path(&dir, "挿絵/../../escape").is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
