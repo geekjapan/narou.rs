@@ -1072,15 +1072,19 @@ fn prepare_aozora_invocation(
 }
 
 fn should_use_aozora_temp_workspace(input_txt: &Path, output_dir: &Path) -> bool {
-    cfg!(windows)
-        && (path_contains_windows_aozora_risky_chars(input_txt)
-            || path_contains_windows_aozora_risky_chars(output_dir))
+    path_contains_aozora_risky_chars(input_txt) || path_contains_aozora_risky_chars(output_dir)
 }
 
-fn path_contains_windows_aozora_risky_chars(path: &Path) -> bool {
+fn path_contains_aozora_risky_chars(path: &Path) -> bool {
     let path_text = path.to_string_lossy();
-    windows_31j_encode_has_errors(&path_text)
-        || path_text.chars().any(is_windows_aozora_mapping_risky_char)
+    // AozoraEpub3(Java) 自身がファイル名正規化で取りこぼす Unicode 文字は OS 非依存で退避する
+    // （Issue #11: Linux でも ～/〜 等を含むタイトルで出力名がずれて変換失敗するため）。
+    if path_text.chars().any(is_aozora_mapping_risky_char) {
+        return true;
+    }
+    // Windows-31J(CP932) でエンコード不能な文字は Windows のパス/コンソール encoding 固有問題のため
+    // Windows 限定で退避トリガにする。非 Windows での扱いは実機検証で別途判断する。
+    cfg!(windows) && windows_31j_encode_has_errors(&path_text)
 }
 
 fn windows_31j_encode_has_errors(text: &str) -> bool {
@@ -1088,7 +1092,7 @@ fn windows_31j_encode_has_errors(text: &str) -> bool {
     had_errors
 }
 
-fn is_windows_aozora_mapping_risky_char(ch: char) -> bool {
+fn is_aozora_mapping_risky_char(ch: char) -> bool {
     matches!(
         ch,
         '\u{301C}'
@@ -1290,7 +1294,7 @@ mod tests {
 
     use super::{
         Device, OutputManager, StripError, absolutize_path, decode_ibunko_html_entities,
-        path_contains_windows_aozora_risky_chars, prepare_aozora_invocation,
+        path_contains_aozora_risky_chars, prepare_aozora_invocation,
         normalize_windows_verbatim_path, strip_mobi_sources,
     };
 
@@ -1350,41 +1354,54 @@ mod tests {
     }
 
     #[test]
-    fn windows_aozora_risky_chars_are_detected() {
-        assert!(path_contains_windows_aozora_risky_chars(Path::new(
-            "title〜.txt"
-        )));
-        assert!(path_contains_windows_aozora_risky_chars(Path::new(
-            "title～.txt"
-        )));
-        assert!(path_contains_windows_aozora_risky_chars(Path::new(
-            "price¢.txt"
-        )));
-        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+    fn aozora_unicode_risky_chars_detected_cross_platform() {
+        // AozoraEpub3 の出力名正規化で問題になる Unicode 文字は OS を問わず検出する（Issue #11）。
+        assert!(path_contains_aozora_risky_chars(Path::new("title〜.txt")));
+        assert!(path_contains_aozora_risky_chars(Path::new("title～.txt")));
+        assert!(path_contains_aozora_risky_chars(Path::new("price¢.txt")));
+        assert!(path_contains_aozora_risky_chars(Path::new(
             "救世主って誰ですかっ⁉.txt"
         )));
-        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+        assert!(path_contains_aozora_risky_chars(Path::new(
             "救世主って誰ですかっ⁉︎.txt"
         )));
-        assert!(path_contains_windows_aozora_risky_chars(Path::new(
-            "title‼⁇⁈.txt"
-        )));
-        assert!(path_contains_windows_aozora_risky_chars(Path::new(
-            "title♠♡♢♣.txt"
-        )));
-        assert!(path_contains_windows_aozora_risky_chars(Path::new(
-            "title\u{20bb7}.txt"
-        )));
-        assert!(!path_contains_windows_aozora_risky_chars(Path::new(
-            "title①.txt"
-        )));
-        assert!(!path_contains_windows_aozora_risky_chars(Path::new(
+        assert!(path_contains_aozora_risky_chars(Path::new("title‼⁇⁈.txt")));
+        // リスキー文字を含まないタイトルは OS を問わず検出しない。
+        assert!(!path_contains_aozora_risky_chars(Path::new("title①.txt")));
+        assert!(!path_contains_aozora_risky_chars(Path::new(
             "普通のタイトル.txt"
         )));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn aozora_temp_workspace_copies_assets_for_risky_windows_paths() {
+    fn aozora_cp932_unencodable_chars_detected_on_windows() {
+        // CP932 未定義かつ Unicode リスト外の文字は Windows でのみリスキー扱い（Windows-31J encode 判定）。
+        assert!(path_contains_aozora_risky_chars(Path::new("title♠♡♢♣.txt")));
+        assert!(path_contains_aozora_risky_chars(Path::new(
+            "title\u{20bb7}.txt"
+        )));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn aozora_cp932_unencodable_chars_not_detected_off_windows() {
+        // 非 Windows では CP932 encode 判定を行わないため、Unicode リスト外の CP932 未定義文字は退避しない。
+        assert!(!path_contains_aozora_risky_chars(Path::new("title♠♡♢♣.txt")));
+        assert!(!path_contains_aozora_risky_chars(Path::new(
+            "title\u{20bb7}.txt"
+        )));
+        // ただし Unicode リスト由来のリスキー文字は非 Windows でも検出し、退避トリガになる。
+        assert!(path_contains_aozora_risky_chars(Path::new("title〜.txt")));
+        assert!(super::is_aozora_mapping_risky_char('～'));
+        assert!(super::should_use_aozora_temp_workspace(
+            Path::new("title～.txt"),
+            Path::new("out")
+        ));
+    }
+
+    #[test]
+    fn aozora_temp_workspace_copies_assets_for_risky_paths() {
         let dir = create_test_dir("aozora-temp");
         let input = dir.join("title〜.txt");
         fs::write(&input, "title\nauthor\n［＃挿絵（cover.jpg）入る］").unwrap();
@@ -1396,21 +1413,16 @@ mod tests {
         let final_output = dir.join("title〜.epub");
         let invocation = prepare_aozora_invocation(&input, &dir, ".epub", &final_output).unwrap();
 
-        if cfg!(windows) {
-            assert_ne!(invocation.input_txt, input);
-            assert_eq!(
-                invocation.expected_output_path.file_name().unwrap().to_str().unwrap(),
-                "input.epub"
-            );
-            assert!(invocation.input_txt.exists());
-            assert!(invocation.output_dir.join("cover.jpg").exists());
-            assert!(invocation.output_dir.join("挿絵").join("1-0.jpg").exists());
-            assert!(invocation.needs_final_copy());
-        } else {
-            assert_eq!(invocation.input_txt, input);
-            assert_eq!(invocation.expected_output_path, final_output);
-            assert!(!invocation.needs_final_copy());
-        }
+        // 〜(U+301C) は Unicode リスキー文字なので OS を問わず安全名ワークスペースへ退避する（Issue #11）。
+        assert_ne!(invocation.input_txt, input);
+        assert_eq!(
+            invocation.expected_output_path.file_name().unwrap().to_str().unwrap(),
+            "input.epub"
+        );
+        assert!(invocation.input_txt.exists());
+        assert!(invocation.output_dir.join("cover.jpg").exists());
+        assert!(invocation.output_dir.join("挿絵").join("1-0.jpg").exists());
+        assert!(invocation.needs_final_copy());
     }
 
     #[test]
