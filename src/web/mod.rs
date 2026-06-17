@@ -729,8 +729,7 @@ mod tests {
     }
 
     fn test_artifact_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::current_dir()
-            .unwrap()
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-artifacts")
             .join(format!("web-mod-{name}-{}", std::process::id()));
