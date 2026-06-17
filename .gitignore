@@ -46,3 +46,10 @@ errors.txt
 /.cocoindex_code/
 /dist/
 /narou
+
+# graphify generated working state — machine-specific (absolute paths, mtimes) and run logs.
+# Keep only the shareable deliverables: graphify-out/{graph.html,graph.json,GRAPH_REPORT.md}.
+graphify-out/cache/
+graphify-out/manifest.json
+graphify-out/cost.json
+graphify-out/.graphify_*
