@@ -26,11 +26,7 @@
 ## Project Rules
 - 以降の `narou.rs` 固有ルールは、この fork の実装・互換性・Git 運用の正本として扱う。
 - user-scope の詳細ルールは各エージェントの user 設定（Codex は `~/.codex/AGENTS.md` / `~/.codex/RTK.md`、Claude は `~/.claude/CLAUDE.md`）側に置き、project に混ぜる必要があるものだけここへ昇格する。
-
-## GitNexus 注入の運用ルール
-- `CLAUDE.md` は本ファイル（`AGENTS.md`）を `@AGENTS.md` でインポートするだけの薄いラッパーに保つ。ルール本体・GitNexus ブロックを CLAUDE.md に重複させない。
-- ただし `npx gitnexus analyze` は既定で AGENTS.md と CLAUDE.md の**両方**に GitNexus セクションを注入する（片方だけに絞るフラグは無い）。CLAUDE.md への重複注入を防ぐため、**analyze は必ず `--skip-agents-md` を付けて実行する**（例: `npx gitnexus analyze --skip-agents-md`）。
-- GitNexus ブロックを更新したい場合は、一度フラグ無しで analyze して再生成した後、CLAUDE.md 側の `<!-- gitnexus:start -->`〜`<!-- gitnexus:end -->` を削除し、AGENTS.md 側だけを残す。
+- GitNexus は廃止済み。`.gitnexus/`、GitNexus hook、GitNexus skill、GitNexus 注入ブロックは再導入しない。
 
 # narou.rs — Rust Port of narou.rb
 
@@ -401,47 +397,3 @@ For each section:
 - **WebSocket**: tokio-tungstenite
 - **HTTP client (low-level)**: curl crate
 - **Random UA**: ua_generator
-
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
-
-This project is indexed by GitNexus as **narou.rs** (5485 symbols, 13818 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
-
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
-
-## Always Do
-
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
-
-## Never Do
-
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/narou.rs/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/narou.rs/clusters` | All functional areas |
-| `gitnexus://repo/narou.rs/processes` | All execution flows |
-| `gitnexus://repo/narou.rs/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
