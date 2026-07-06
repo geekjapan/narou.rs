@@ -1,4 +1,5 @@
 # Project Runtime Kernel
+dev-gear: G3 — OpenSpec 導入済み。trivial かつ可逆な単発修正のみ G2 ループ可(gear 定義は user-scope CLAUDE.md の 3 ギア制)
 
 このファイルは、この fork で AI エージェント（Claude Code / Codex 等）が作業するときの project-scope 初期化ルールと、`narou.rs` 固有の開発ルールをまとめたものです。`CLAUDE.md` はこのファイルをインポートするだけの薄いラッパーであり、Claude / Codex のどちらで作業しても本ファイルが唯一の正本となります。
 
@@ -83,6 +84,3 @@ cargo local-build        # Release と同構成の narou/ フォルダを生成
 
 ## Dependency Policy
 - `Cargo.toml` は原則として直接編集しない。依存クレートの追加・更新は `cargo add`/`cargo update` 経由で行う。
-
-## Canonical Memory Order
-情報が競合した場合の正規順序: project.yaml → world.md → characters.yaml → timeline.yaml → open_threads.yaml → summaries/*.md → chapters/*.md。生成テキストは最低優先。
