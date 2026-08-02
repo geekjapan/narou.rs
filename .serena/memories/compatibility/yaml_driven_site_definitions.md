@@ -31,3 +31,10 @@ Kakuyomu preprocessing is fully YAML-driven via a pest-based DSL:
 - Add a `preprocess: |-` section to any `webnovel/*.yaml` file
 - The DSL supports the same operations needed for most JSON-embedded sites
 - If the DSL is insufficient, extend `preprocess.pest` and `preprocess.rs` with new operations
+
+## Hameln tag extraction (2026-08-02)
+
+- `webnovel/syosetu.org.yaml` version 1.8 defines both detail-table and TOC tag patterns.
+- The detail-table pattern extracts both normal `タグ` and `必須タグ` rows without crossing into `掲載開始`.
+- The TOC fallback stops at the first `<br>` or `<hr>`, preventing short-story synopsis/body HTML from becoming tags.
+- Site-specific behavior remains entirely in YAML; Rust changes are regression fixtures only.
