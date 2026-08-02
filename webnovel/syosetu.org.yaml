@@ -20,7 +20,7 @@ title_strip_pattern: null
 cookie: over18=off
 over18_pattern: ※この作品はR-18です。
 sitename: *name
-version: 1.7
+version: 1.8
 
 # ------------------------------------------------------------
 # 目次取得設定
@@ -84,5 +84,6 @@ w: 作者</td><td.*?>(?:<a href=.+?>)?(?<writer>.+?)(?:</a>)?</td>
 l: 合計文字数</td><td.*?>(?<length>.+?)文字
 
 # tags タグ
-tags: |-
-  タグ：(?<tags>.+?)\s*<br\s*/?>
+tags:
+  - '<td class="label">(?:必須)?タグ</td><td.*?>(?<tags>.*?)</td>'
+  - 'タグ：(?<tags>.+?)\s*(?i:<br\s*/?>|<hr\b)'

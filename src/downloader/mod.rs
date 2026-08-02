@@ -2686,13 +2686,48 @@ mod tests {
         let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
         let html = r#"
 <tr><td class="label">タグ</td><td colspan=3 ><a href="https://syosetu.org/search/?mode=search&word=和風ファンタジー">和風ファンタジー</a> <a href="https://syosetu.org/search/?mode=search&word=妖">妖</a> <a href="https://syosetu.org/search/?mode=search&word=ヤンデレ">ヤンデレ</a> <a href="https://syosetu.org/search/?mode=search&word=闇夜の蛍">闇夜の蛍</a> </td></tr>
+<tr><td class="label">必須タグ</td><td colspan=3 ><a href="https://syosetu.org/search/?mode=search&word=残酷な描写" class="alert_color">残酷な描写</a> </td></tr>
+<tr><td class="label">掲載開始</td><td>2020年08月01日(土) 00:33</td></tr>
 "#;
 
         let tags = setting.resolve_info_pattern("tags", html).unwrap();
 
         assert_eq!(
             super::sanitize_site_tags(&tags),
-            vec!["和風ファンタジー", "妖", "ヤンデレ", "闇夜の蛍"]
+            vec!["和風ファンタジー", "妖", "ヤンデレ", "闇夜の蛍", "残酷な描写"]
+        );
+    }
+
+    #[test]
+    fn syosetu_org_toc_tag_pattern_supports_series_and_stops_before_short_story_body() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+        let short_story_html = r#"
+<br>タグ：<span itemprop="keywords"><a href="/search/?word=tag1">タグ1</a></span> <span itemprop="keywords"><a href="/search/?word=tag2">タグ2</a></span>
+<hr style="margin:20px 0px;"></div>
+<div class="ss">本文に含めてはいけないあらすじ<hr style="margin:20px 0px;">
+<div id="honbun">本文に含めてはいけない本文</div>
+<br>
+"#;
+        let series_html = r##"
+<BR>タグ：<a href="/search/?word=R-15" class="alert_color">R-15</a> <span itemprop="keywords"><a href="/search/?word=tag3">タグ3</a></span>
+<br /><a href="#fmenu">▼下部メニューに飛ぶ</a>
+<hr style="margin:20px 0px;"></div>
+<div class="ss">本文に含めてはいけないあらすじ</div>
+"##;
+
+        let short_story_tags = setting
+            .resolve_info_pattern("tags", short_story_html)
+            .unwrap();
+        let series_tags = setting.resolve_info_pattern("tags", series_html).unwrap();
+
+        assert_eq!(
+            super::sanitize_site_tags(&short_story_tags),
+            vec!["タグ1", "タグ2"]
+        );
+        assert_eq!(
+            super::sanitize_site_tags(&series_tags),
+            vec!["R-15", "タグ3"]
         );
     }
 
@@ -2782,10 +2817,26 @@ mod tests {
         let toc_source = r##"
 <div class="ss">
 <span style="font-size:150%" itemprop="name">一次創作キャットファイトとかレズバトルもの</span>
-<table width=100%>
-<tr bgcolor="#FFFFFF" class="bgcolor3"><td width=60%><span id="1">　</span> <a href=./1.html style="text-decoration:none;">ソープランドがレズバトルで抗争するようです</a></td><td><NOBR>2020年05月31日(日) 20:38</NOBR></td></tr>
-<tr bgcolor="#F5F5F5" class="bgcolor2"><td width=60%><span id="2">　</span> <a href=./2.html style="text-decoration:none;">北の王女と西の王女</a></td><td><NOBR>2021年02月21日(日) 09:31</NOBR></td></tr>
-</table>
+<section class="episode-list" aria-label="話一覧">
+<ul class="episode-list__items">
+<li class="episode-list__item">
+<a href="./1.html" class="episode-list__link">
+<span class="episode-list__mark"></span>
+<span class="episode-list__title" >ソープランドがレズバトルで抗争するようです</span>
+<time class="episode-list__date">2020/05/31 20:38</time>
+<span class="episode-list__revision"></span>
+</a>
+</li>
+<li class="episode-list__item">
+<a href="./2.html" class="episode-list__link">
+<span class="episode-list__mark"></span>
+<span class="episode-list__title" >北の王女と西の王女</span>
+<time class="episode-list__date">2021/02/21 09:31</time>
+<span class="episode-list__revision"></span>
+</a>
+</li>
+</ul>
+</section>
 </div>
 "##;
         let info = NovelInfo {
