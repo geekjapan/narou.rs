@@ -491,6 +491,55 @@ mod tests {
         assert_eq!(subtitles[1].subtitle, "第2話");
         assert_eq!(subtitles[1].file_subtitle, "第2話");
     }
+
+    #[test]
+    fn hameln_episode_list_parses_ruby_titles() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "syosetu.org")
+            .unwrap();
+        let r18_url = "https://h.syosetu.org/novel/420138/";
+        assert!(setting.matches_url(r18_url));
+        assert_eq!(
+            setting.toc_url_with_url_captures(r18_url).as_deref(),
+            Some("https://h.syosetu.org/novel/420138/")
+        );
+        // 2026 年以降のハーメルン目次形式。章名・各話タイトルの双方に
+        // HTML ruby が含まれても、保存用の subtitle ではタグだけ除去する。
+        let toc_source = r#"
+<li class="episode-list__chapter">
+  <div class="episode-list__chapter-title">『<ruby><rb>双花魔人譚</rb><rp>(</rp><rt>モンストルム・オラトリア</rt><rp>)</rp></ruby>』編</div>
+</li>
+<li class="episode-list__item">
+<a href="./1.html" class="episode-list__link">
+  <span class="episode-list__mark"></span>
+  <span class="episode-list__title" >〖<ruby><rb>神々の給仕</rb><rp>(</rp><rt>ゴッズプライド</rt><rp>)</rp></ruby>〗</span>
+  <time class="episode-list__date" itemprop="datePublished" datetime="2023-06-04T11:14Z">2023/06/04 11:14</time>
+  <span class="episode-list__revision" title="2023/10/21 21:29改稿">(<u>改</u>)</span>
+</a>
+</li>
+<li class="episode-list__item">
+<a href="./2.html" class="episode-list__link">
+  <span class="episode-list__mark"></span>
+  <span class="episode-list__title" >通常タイトル</span>
+  <time class="episode-list__date">2023/06/11 14:21</time>
+  <span class="episode-list__revision"> </span>
+</a>
+</li>
+"#;
+
+        let subtitles = parse_subtitles(setting, toc_source, &HashMap::new()).unwrap();
+
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].chapter, "『<ruby><rb>双花魔人譚</rb><rp>(</rp><rt>モンストルム・オラトリア</rt><rp>)</rp></ruby>』編");
+        assert_eq!(subtitles[0].subtitle, "〖神々の給仕(ゴッズプライド)〗");
+        assert_eq!(subtitles[0].file_subtitle, "〖神々の給仕(ゴッズプライド)〗");
+        assert_eq!(subtitles[0].subdate, "2023/06/04 11:14");
+        assert_eq!(subtitles[0].subupdate.as_deref(), Some("2023/10/21 21:29"));
+        assert_eq!(subtitles[1].chapter, "");
+        assert_eq!(subtitles[1].subtitle, "通常タイトル");
+    }
 }
 
 pub fn create_short_story_subtitles(
