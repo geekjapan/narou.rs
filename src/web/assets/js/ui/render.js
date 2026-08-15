@@ -2,7 +2,7 @@
  * Novel list rendering — full narou.rb column set with time badges, status marks,
  * context menu, click-to-select, and per-row action buttons.
  */
-import { State, El, lsSet } from '../core/state.js';
+import { State, El, lsSet, persistListState } from '../core/state.js';
 import { fetchJson, postJson } from '../core/http.js';
 import { showContextMenu, showTagColorMenu } from './context_menu.js';
 
@@ -55,6 +55,7 @@ export function renderNovelList() {
 
   updateSelectionBadge();
   updateEnableSelected();
+  persistListState();
 }
 
 function normalizePageLength(value) {
@@ -813,6 +814,8 @@ function renderTags(tags) {
 export function renderTagList() {
   const canvas = El.tagListCanvas;
   if (!canvas) return;
+  const scrollContainer = canvas.closest('.dropdown-menu');
+  const scrollTop = scrollContainer ? scrollContainer.scrollTop : 0;
   canvas.textContent = '';
 
   for (const tag of State.tags) {
@@ -831,6 +834,13 @@ export function renderTagList() {
       showTagColorMenu(e, tag);
     });
     canvas.appendChild(span);
+  }
+
+  if (scrollContainer) {
+    scrollContainer.scrollTop = scrollTop;
+    requestAnimationFrame(() => {
+      scrollContainer.scrollTop = scrollTop;
+    });
   }
 }
 

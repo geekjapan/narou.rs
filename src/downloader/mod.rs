@@ -13,7 +13,7 @@ pub mod toc;
 pub mod types;
 pub mod util;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -34,10 +34,11 @@ use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::{
     compute_section_hash, ensure_default_files, load_section_file, load_toc_file, move_file_to_dir,
-    remove_dir_if_empty, save_raw_file, save_section_file, save_toc_file,
+    remove_dir_if_empty, save_raw_file, save_section_file, save_toc_file, section_filename,
 };
 use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
+use crate::progress::safe_println as safe_println_fn;
 use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles, parse_subtitles_multipage};
 use self::security::is_safe_public_url;
 use self::util::{
@@ -275,10 +276,6 @@ fn resolve_novel_type(
     }
 
     (1u8, false)
-}
-
-fn section_filename(subtitle: &SubtitleInfo) -> String {
-    format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle)
 }
 
 fn section_relative_path(subtitle: &SubtitleInfo) -> String {
@@ -592,6 +589,19 @@ fn section_timestamp_ymd(
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let dt = DateTime::<Utc>::from(modified);
     Some(timezone.ymd(dt))
+}
+
+fn illustration_sources<'a>(
+    section: &'a SectionElement,
+    raw_html: Option<&'a str>,
+) -> impl Iterator<Item = &'a str> {
+    [
+        section.body.as_str(),
+        section.introduction.as_str(),
+        section.postscript.as_str(),
+    ]
+    .into_iter()
+    .chain(raw_html)
 }
 
 impl Downloader {
@@ -909,9 +919,10 @@ impl Downloader {
         &mut self,
         setting: &SiteSetting,
         section: &SectionElement,
-        section_dir: &PathBuf,
-        subtitle: &SubtitleInfo,
+        illust_dir: &Path,
+        illustration_store: &mut crate::illustration_store::IllustrationStore,
         toc_url: &str,
+        raw_html: Option<&str>,
     ) -> Result<()> {
         let illust_url_pattern = match &setting.illust_grep_pattern {
             Some(p) => p,
@@ -920,17 +931,11 @@ impl Downloader {
 
         let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
 
-        let intro_text = section.introduction.as_str();
-        let post_text = section.postscript.as_str();
-        let sources = [&section.body, intro_text, post_text];
+        std::fs::create_dir_all(illust_dir)?;
 
-        let mut illust_dir = section_dir.clone();
-        illust_dir.pop();
-        illust_dir.push("挿絵");
-        std::fs::create_dir_all(&illust_dir)?;
-
-        let mut illust_count = 0usize;
-        for source in &sources {
+        // 解析済みセクションには、本文として保存しないサイト固有マークアップが含まれないことがある。
+        // 保存済みデータや変換結果を変えずにその中の挿絵も取得できるよう、今回取得した raw HTML も検索する。
+        for source in illustration_sources(section, raw_html) {
             for caps in re.captures_iter(source) {
                 if let Some(url_match) = caps.get(1) {
                     let raw_url = url_match.as_str();
@@ -938,42 +943,45 @@ impl Downloader {
                         continue;
                     }
                     let resolved = build_section_url(setting, toc_url, raw_url);
-                    let url = resolved.as_str();
-                    if !is_safe_public_url(url) {
-                        eprintln!("WARN: skipping unsafe illustration URL: {url}");
-                        illust_count += 1;
-                        continue;
-                    }
+                        let url = resolved.as_str();
+                        if !is_safe_public_url(url) {
+                            crate::progress::safe_stderr_println(&format!(
+                                "WARN: skipping unsafe illustration URL: {url}"
+                            ));
+                            continue;
+                        }
 
-                    let ext = if url.contains(".png") {
-                        "png"
-                    } else if url.contains(".gif") {
-                        "gif"
-                    } else if url.contains(".webp") {
-                        "webp"
-                    } else {
-                        "jpg"
-                    };
-
-                    let filename = format!("{}-{}.{}", subtitle.index, illust_count, ext);
-                    let save_path = illust_dir.join(&filename);
-
-                    if save_path.exists() {
-                        illust_count += 1;
+                    if illustration_store
+                        .cached_filename_for_source(url, illust_dir)
+                        .is_some()
+                    {
                         continue;
                     }
 
                     self.fetcher.rate_limiter.wait_for_url(url);
                     match self.fetcher.fetch_bytes(url, None) {
-                        Ok(bytes) => {
-                            let _ = std::fs::write(&save_path, &bytes);
+                        Ok((bytes, content_type)) => {
+                            let ext =
+                                crate::illustration_store::illustration_extension_from_content_type(
+                                    &content_type,
+                                )
+                                .unwrap_or_else(|| {
+                                    crate::illustration_store::guessed_extension_from_url(url)
+                                });
+                            if let Err(err) =
+                                illustration_store.store_bytes(illust_dir, url, &bytes, ext)
+                            {
+                                crate::progress::safe_stderr_println(&format!(
+                                    "WARN: failed to save illustration {url}: {err}"
+                                ));
+                            }
                         }
                         Err(err) => {
-                            eprintln!("WARN: failed to download illustration {url}: {err}");
+                            crate::progress::safe_stderr_println(&format!(
+                                "WARN: failed to download illustration {url}: {err}"
+                            ));
                         }
                     }
-
-                    illust_count += 1;
                 }
             }
         }
@@ -1063,11 +1071,13 @@ impl Downloader {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
         let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
+        self.fetcher.configure_rate_limiter(setting.is_narou);
         let toc_url = match self.fetcher.resolve_final_url(&toc_url, setting.cookie()) {
             Ok(final_url) if final_url != toc_url => {
                 let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
                 if let Some(final_setting) = self.find_site_setting(&final_url) {
                     setting = final_setting;
+                    self.fetcher.configure_rate_limiter(setting.is_narou);
                     setting
                         .toc_url_with_url_captures(&final_url)
                         .unwrap_or(final_url)
@@ -1078,12 +1088,20 @@ impl Downloader {
             _ => toc_url,
         };
         let url_captures = setting.extract_url_captures(&toc_url).unwrap_or(url_captures);
-        self.fetcher.configure_rate_limiter(setting.is_narou);
+        // リダイレクト解決で toc_url が入力時と変わった場合、解決後の URL で
+        // 既存レコードを再照合して ID を引き継ぐ。別ドメインへ転送されるサイト
+        // (例: ハーメルンの h.syosetu.org 分離)で同じ小説が重複登録されるのを防ぐ。
+        let existing_id = existing_id.or_else(|| {
+            crate::db::with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|record| record.id)))
+                .ok()
+                .flatten()
+        });
+        let provisional_id = existing_id.unwrap_or(provisional_id);
         let toc_source = match fetch_toc(&mut self.fetcher, &setting, &toc_url) {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
-                println!("小説が削除されているか非公開な可能性があります");
+                safe_println_fn("小説が削除されているか非公開な可能性があります");
                 let _ = crate::compat::mark_not_found_and_freeze(id);
                 let (title, author, novel_dir) = crate::db::with_database(|db| {
                     let record = db.get(id).cloned();
@@ -1172,16 +1190,44 @@ impl Downloader {
 
         let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
 
-        let title = info.title.clone().unwrap_or_default();
         let author = info.author.clone().unwrap_or_default();
         let existing_record = existing_id.and_then(|eid| {
             crate::db::with_database(|db| Ok(db.get(eid).cloned()))
                 .ok()
                 .flatten()
         });
+        let fetched_raw_title = info.title.clone().unwrap_or_default();
+        let raw_title = if fetched_raw_title.is_empty() {
+            existing_record
+                .as_ref()
+                .map(|record| record.raw_title().to_string())
+                .unwrap_or_default()
+        } else {
+            fetched_raw_title
+        };
         let previous_novel_dir = existing_record
             .as_ref()
-            .map(|record| crate::db::novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record));
+            .map(|record| {
+                crate::db::existing_novel_dir_for_record(
+                    Path::new(types::ARCHIVE_ROOT_DIR),
+                    record,
+                )
+            });
+        let settings_dir = previous_novel_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(types::ARCHIVE_ROOT_DIR).join(".new-novel-settings"));
+        let title_settings = crate::converter::settings::NovelSettings::load_for_novel(
+            provisional_id,
+            &raw_title,
+            &author,
+            &settings_dir,
+        );
+        let strip_title_prefix = title_settings.enable_strip_title_prefix;
+        let track_raw_title = strip_title_prefix
+            || existing_record
+                .as_ref()
+                .is_some_and(NovelRecord::has_raw_title);
+        let title = crate::title::project_title(&raw_title, strip_title_prefix);
 
         let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
 
@@ -1226,6 +1272,14 @@ impl Downloader {
             .unwrap_or_else(|| setting.sitename.clone());
 
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
+        if let Some(existing) = existing_record.as_ref() {
+            crate::title::rename_projected_outputs(
+                &novel_dir,
+                &author,
+                &existing.title,
+                &title,
+            )?;
+        }
         std::fs::create_dir_all(&novel_dir)?;
 
         let section_dir = novel_dir.join(types::SECTION_SAVE_DIR);
@@ -1286,6 +1340,16 @@ impl Downloader {
                 });
             }
         }
+
+        let illust_dir = novel_dir.join("挿絵");
+        let mut illustration_store = if setting.illust_grep_pattern.is_some() {
+            Some(
+                crate::illustration_store::IllustrationStore::load(&novel_dir)
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
 
         struct SectionPlan {
             latest_section_path: PathBuf,
@@ -1353,10 +1417,10 @@ impl Downloader {
 
             let download_time = if needs_download {
                 if !started_download {
-                    println!(
-                        "{}",
-                        bold_colored(&format!("ID:{}　{} のDL開始", display_id, title), "green")
-                    );
+                    safe_println_fn(&bold_colored(
+                        &format!("ID:{}　{} のDL開始", display_id, title),
+                        "green",
+                    ));
                     started_download = true;
                 }
                 if let Some(ref p) = self.progress {
@@ -1369,11 +1433,11 @@ impl Downloader {
                 }
 
                 if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
-                    println!("{}", subtitle.chapter);
+                    safe_println_fn(&subtitle.chapter);
                     last_chapter = subtitle.chapter.clone();
                 }
                 if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
-                    println!("{}", subtitle.subchapter);
+                    safe_println_fn(&subtitle.subchapter);
                     last_subchapter = subtitle.subchapter.clone();
                 }
 
@@ -1406,20 +1470,30 @@ impl Downloader {
                     pending_section_hashes.insert(relative_path, digest);
                 }
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
-                self.download_illustration(&setting, &section, &section_dir, subtitle, &toc_url)?;
+                if let Some(store) = illustration_store.as_mut() {
+                    self.download_illustration(
+                        &setting,
+                        &section,
+                        &illust_dir,
+                        store,
+                        &toc_url,
+                        Some(raw_html.as_str()),
+                    )?;
+                }
                 updated_count += 1;
                 downloaded_index += 1;
                 Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string())
             } else {
-                if setting.illust_grep_pattern.is_some() {
+                if let Some(store) = illustration_store.as_mut() {
                     if let Ok(content) = std::fs::read_to_string(&latest_section_path) {
                         if let Ok(section_file) = serde_yaml::from_str::<SectionFile>(&content) {
                             self.download_illustration(
                                 &setting,
                                 &section_file.element,
-                                &section_dir,
-                                subtitle,
+                                &illust_dir,
+                                store,
                                 &toc_url,
+                                None,
                             )?;
                         }
                     }
@@ -1463,7 +1537,7 @@ impl Downloader {
                         line.push_str(" (更新あり)");
                     }
                 }
-                println!("{}", line);
+                safe_println_fn(&line);
                 if let Some(ref p) = self.progress {
                     p.inc(1);
                 }
@@ -1471,6 +1545,9 @@ impl Downloader {
         }
 
         remove_cache_dir_if_empty(cache_dir.as_deref())?;
+        if let Some(store) = illustration_store.as_mut() {
+            store.flush(&novel_dir)?;
+        }
 
         if let Some(ref p) = self.progress {
             p.finish_with_message(&format!(
@@ -1530,7 +1607,7 @@ impl Downloader {
         save_toc_file(&novel_dir, &toc_file)?;
         ensure_default_files(&novel_dir, &toc_title, &toc_author, &toc_url);
 
-        let record = NovelRecord {
+        let mut record = NovelRecord {
             id: provisional_id,
             author: toc_author.clone(),
             title: toc_title.clone(),
@@ -1573,25 +1650,20 @@ impl Downloader {
             convert_failure: false,
             extra_fields: Default::default(),
         };
+        if track_raw_title {
+            record.set_raw_title(raw_title);
+        }
 
         let auto_add_tags = load_local_setting_bool("auto-add-tags");
-        let mut merged_tags = existing_record
-            .as_ref()
-            .map(|record| record.tags.clone())
-            .unwrap_or_default();
-        if auto_add_tags {
-            let raw_tags_opt = info
-                .tags
+        let auto_tags = if auto_add_tags {
+            info.tags
                 .clone()
-                .or_else(|| setting.resolve_info_pattern("tags", &toc_source));
-            if let Some(raw_tags) = raw_tags_opt {
-                for tag in sanitize_site_tags(&raw_tags) {
-                    if !merged_tags.contains(&tag) {
-                        merged_tags.push(tag);
-                    }
-                }
-            }
-        }
+                .or_else(|| setting.resolve_info_pattern("tags", &toc_source))
+                .map(|raw_tags| sanitize_site_tags(&raw_tags))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let status = resolve_download_status(
             force,
@@ -1604,14 +1676,18 @@ impl Downloader {
         );
 
         let id = crate::db::with_database_mut(|db| {
-            let id = if let Some(eid) = existing_id {
-                if let Some(existing) = db.get(eid) {
+            db.update_records(|mut records: BTreeMap<i64, NovelRecord>| {
+                let id = if let Some(eid) = existing_id {
+                    if let Some(existing) = records.get(&eid) {
                     let mut updated = existing.clone();
                     if !record.author.is_empty() {
                         updated.author = record.author.clone();
                     }
                     if !record.title.is_empty() {
                         updated.title = record.title.clone();
+                    }
+                    if record.has_raw_title() {
+                        updated.set_raw_title(record.raw_title().to_string());
                     }
                     updated.file_title = record.file_title.clone();
                     updated.toc_url = record.toc_url.clone();
@@ -1628,29 +1704,31 @@ impl Downloader {
                     updated.domain = record.domain.clone();
                     updated.suspend = false;
                     updated.is_narou = record.is_narou;
-                    if !merged_tags.is_empty() {
-                        updated.tags = merged_tags.clone();
+                    for tag in &auto_tags {
+                        if !updated.tags.contains(tag) {
+                            updated.tags.push(tag.clone());
+                        }
                     }
-                    db.insert(updated);
+                    records.insert(eid, updated);
                     eid
                 } else {
                     let new_id = provisional_id;
-                    let mut rec = record;
+                    let mut rec = record.clone();
                     rec.id = new_id;
-                    rec.tags = merged_tags.clone();
-                    db.insert(rec);
+                    rec.tags = auto_tags.clone();
+                    records.insert(new_id, rec);
                     new_id
                 }
             } else {
-                let new_id = db.create_new_id();
-                let mut rec = record;
+                let new_id = records.keys().copied().max().map(|id| id + 1).unwrap_or(0);
+                let mut rec = record.clone();
                 rec.id = new_id;
-                rec.tags = merged_tags.clone();
-                db.insert(rec);
+                rec.tags = auto_tags.clone();
+                records.insert(new_id, rec);
                 new_id
             };
-            db.save()?;
-            Ok::<i64, NarouError>(id)
+                Ok((records, id))
+            })
         })?;
 
         self.remove_migrated_novel_dir(previous_novel_dir.as_deref(), &novel_dir);
@@ -2096,11 +2174,13 @@ impl Downloader {
 #[cfg(test)]
 mod tests {
     use super::{
-        Downloader, Over18AccessDecision, over18_access_decision,
+        Downloader, Over18AccessDecision, illustration_sources, over18_access_decision,
         requires_over18_confirmation, resolve_novel_type, resolve_user_agent,
     };
     use super::novel_info::NovelInfo;
     use super::site_setting::SiteSetting;
+    use super::types::SectionElement;
+    use super::util::compile_html_pattern;
     use crate::db::{self, Database};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -2112,6 +2192,36 @@ mod tests {
         fn drop(&mut self) {
             *db::DATABASE.lock() = self.0.take();
         }
+    }
+
+    #[test]
+    fn syosetu_org_illustration_pattern_uses_new_raw_html_without_crossing_links() {
+        let setting: SiteSetting =
+            serde_yaml::from_str(include_str!("../../webnovel/syosetu.org.yaml")).unwrap();
+        let re = compile_html_pattern(setting.illust_grep_pattern.as_deref().unwrap()).unwrap();
+        let section = SectionElement {
+            data_type: "html".to_string(),
+            body: "本文".to_string(),
+            introduction: String::new(),
+            postscript: String::new(),
+        };
+        let raw_html = r#"<a href="https://syosetu.org/?mode=url_jump&amp;url=https%3A%2F%2Fexample.com">通販サイト</a>
+<span>後書き</span>
+<a href="http://syosetu.org/img/user/10193/110088.jpg" alt="挿絵" name='img'>【挿絵表示】</a>"#;
+
+        assert!(!illustration_sources(&section, None).any(|source| re.is_match(source)));
+        let mut urls = Vec::new();
+        for source in illustration_sources(&section, Some(raw_html)) {
+            for caps in re.captures_iter(source) {
+                if let Some(url_match) = caps.get(1) {
+                    urls.push(url_match.as_str());
+                }
+            }
+        }
+        assert_eq!(
+            urls,
+            vec!["http://syosetu.org/img/user/10193/110088.jpg"]
+        );
     }
 
     #[test]
@@ -2587,13 +2697,81 @@ mod tests {
         let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
         let html = r#"
 <tr><td class="label">タグ</td><td colspan=3 ><a href="https://syosetu.org/search/?mode=search&word=和風ファンタジー">和風ファンタジー</a> <a href="https://syosetu.org/search/?mode=search&word=妖">妖</a> <a href="https://syosetu.org/search/?mode=search&word=ヤンデレ">ヤンデレ</a> <a href="https://syosetu.org/search/?mode=search&word=闇夜の蛍">闇夜の蛍</a> </td></tr>
+<tr><td class="label">必須タグ</td><td colspan=3 ><a href="https://syosetu.org/search/?mode=search&word=残酷な描写" class="alert_color">残酷な描写</a> </td></tr>
+<tr><td class="label">掲載開始</td><td>2020年08月01日(土) 00:33</td></tr>
 "#;
 
         let tags = setting.resolve_info_pattern("tags", html).unwrap();
 
         assert_eq!(
             super::sanitize_site_tags(&tags),
-            vec!["和風ファンタジー", "妖", "ヤンデレ", "闇夜の蛍"]
+            vec!["和風ファンタジー", "妖", "ヤンデレ", "闇夜の蛍", "残酷な描写"]
+        );
+    }
+
+    #[test]
+    fn syosetu_org_toc_tag_pattern_supports_series_and_stops_before_short_story_body() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+        let short_story_html = r#"
+<br>タグ：<span itemprop="keywords"><a href="/search/?word=tag1">タグ1</a></span> <span itemprop="keywords"><a href="/search/?word=tag2">タグ2</a></span>
+<hr style="margin:20px 0px;"></div>
+<div class="ss">本文に含めてはいけないあらすじ<hr style="margin:20px 0px;">
+<div id="honbun">本文に含めてはいけない本文</div>
+<br>
+"#;
+        let series_html = r##"
+<BR>タグ：<a href="/search/?word=R-15" class="alert_color">R-15</a> <span itemprop="keywords"><a href="/search/?word=tag3">タグ3</a></span>
+<br /><a href="#fmenu">▼下部メニューに飛ぶ</a>
+<hr style="margin:20px 0px;"></div>
+<div class="ss">本文に含めてはいけないあらすじ</div>
+"##;
+
+        let short_story_tags = setting
+            .resolve_info_pattern("tags", short_story_html)
+            .unwrap();
+        let series_tags = setting.resolve_info_pattern("tags", series_html).unwrap();
+
+        assert_eq!(
+            super::sanitize_site_tags(&short_story_tags),
+            vec!["タグ1", "タグ2"]
+        );
+        assert_eq!(
+            super::sanitize_site_tags(&series_tags),
+            vec!["R-15", "タグ3"]
+        );
+    }
+
+    #[test]
+    fn syosetu_org_accepts_h_domain_and_keeps_domain_in_toc_url() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+
+        // R18 は h.syosetu.org に分離されたが同一サイト扱い(単一定義):
+        // どちらのドメインの URL も受け付け、toc_url は実際に取得可能な
+        // ドメインを保持する(フェッチ層はリダイレクトを追わないため)。
+        assert!(setting.matches_url("https://h.syosetu.org/novel/412369/"));
+        assert!(setting.matches_url("https://syosetu.org/novel/405366/"));
+        assert!(!setting.matches_url("https://hsyosetu.org/novel/1/"));
+
+        assert_eq!(
+            setting
+                .toc_url_with_url_captures("https://h.syosetu.org/novel/412369/")
+                .as_deref(),
+            Some("https://h.syosetu.org/novel/412369/")
+        );
+        assert_eq!(
+            setting
+                .toc_url_with_url_captures("https://syosetu.org/novel/405366/")
+                .as_deref(),
+            Some("https://syosetu.org/novel/405366/")
+        );
+        // ドメインをキャプチャしない旧 novel.syosetu.org 形式はフィールド既定値に落ちる
+        assert_eq!(
+            setting
+                .toc_url_with_url_captures("https://novel.syosetu.org/12345")
+                .as_deref(),
+            Some("https://syosetu.org/novel/12345/")
         );
     }
 
@@ -2650,10 +2828,26 @@ mod tests {
         let toc_source = r##"
 <div class="ss">
 <span style="font-size:150%" itemprop="name">一次創作キャットファイトとかレズバトルもの</span>
-<table width=100%>
-<tr bgcolor="#FFFFFF" class="bgcolor3"><td width=60%><span id="1">　</span> <a href=./1.html style="text-decoration:none;">ソープランドがレズバトルで抗争するようです</a></td><td><NOBR>2020年05月31日(日) 20:38</NOBR></td></tr>
-<tr bgcolor="#F5F5F5" class="bgcolor2"><td width=60%><span id="2">　</span> <a href=./2.html style="text-decoration:none;">北の王女と西の王女</a></td><td><NOBR>2021年02月21日(日) 09:31</NOBR></td></tr>
-</table>
+<section class="episode-list" aria-label="話一覧">
+<ul class="episode-list__items">
+<li class="episode-list__item">
+<a href="./1.html" class="episode-list__link">
+<span class="episode-list__mark"></span>
+<span class="episode-list__title" >ソープランドがレズバトルで抗争するようです</span>
+<time class="episode-list__date">2020/05/31 20:38</time>
+<span class="episode-list__revision"></span>
+</a>
+</li>
+<li class="episode-list__item">
+<a href="./2.html" class="episode-list__link">
+<span class="episode-list__mark"></span>
+<span class="episode-list__title" >北の王女と西の王女</span>
+<time class="episode-list__date">2021/02/21 09:31</time>
+<span class="episode-list__revision"></span>
+</a>
+</li>
+</ul>
+</section>
 </div>
 "##;
         let info = NovelInfo {

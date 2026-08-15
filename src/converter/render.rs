@@ -1,9 +1,12 @@
+use std::sync::LazyLock;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::db::NovelRecord;
 use crate::downloader::TocObject;
 
+use super::device::Device;
 use super::settings::NovelSettings;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,20 +25,17 @@ pub(crate) fn render_novel_text(
     story: &str,
     sections: &[ConvertedSection],
     record: Option<&NovelRecord>,
+    device: Option<Device>,
 ) -> String {
     let mut output = String::new();
 
-    let title = if settings.novel_title.is_empty() {
-        &toc.title
-    } else {
-        &settings.novel_title
-    };
+    let title = settings.title_for_output(&toc.title);
     let author = if settings.novel_author.is_empty() {
         &toc.author
     } else {
         &settings.novel_author
     };
-    let processed_title = decorate_title(settings, title, record);
+    let processed_title = decorate_title(settings, &title, record);
 
     output.push_str(&processed_title);
     output.push('\n');
@@ -77,6 +77,9 @@ pub(crate) fn render_novel_text(
                 "\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{67F1}\u{FF3D}{}\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{67F1}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
                 title
             ));
+            if device == Some(Device::Ibooks) {
+                output.push_str("\n\n\n\n\n\n");
+            }
             output.push_str(&format!(
                 "\u{FF3B}\u{FF03}\u{FF13}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\u{FF3B}\u{FF03}\u{5927}\u{898B}\u{51FA}\u{3057}\u{FF3D}{}\u{FF3B}\u{FF03}\u{5927}\u{898B}\u{51FA}\u{3057}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
                 section.chapter
@@ -107,21 +110,23 @@ pub(crate) fn render_novel_text(
 
         output.push_str("\n\n");
 
-        let trimmed_intro = section.introduction.trim_end_matches('\n');
+        let (trimmed_intro, intro_illustrations) =
+            extract_illustration_annotations(section.introduction.trim_end_matches('\n'));
         let trimmed_body = section.body.trim_end_matches('\n');
-        let trimmed_post = trim_author_comment_text(&section.postscript);
+        let (trimmed_post, post_illustrations) =
+            extract_illustration_annotations(&trim_author_comment_text(&section.postscript));
 
         if !section.introduction.is_empty() {
             let style = &settings.author_comment_style;
             if style == "simple" {
                 output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF18}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\n");
                 output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF12}\u{6BB5}\u{968E}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{FF3D}\n");
-                output.push_str(trimmed_intro);
+                output.push_str(&trimmed_intro);
                 output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
                 output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5B57}\u{4E0B}\u{3052}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
             } else if style == "plain" {
                 output.push_str("\n\n");
-                output.push_str(trimmed_intro);
+                output.push_str(&trimmed_intro);
                 output.push_str("\n\n\u{FF3B}\u{FF03}\u{533A}\u{5207}\u{308A}\u{7DDA}\u{FF3D}\n\n");
             } else {
                 output.push_str(&format!(
@@ -129,6 +134,8 @@ pub(crate) fn render_novel_text(
                     trimmed_intro
                 ));
             }
+
+            append_illustration_annotations(&mut output, &intro_illustrations);
         }
 
         if !section.introduction.is_empty() {
@@ -155,6 +162,8 @@ pub(crate) fn render_novel_text(
                     trimmed_post
                 ));
             }
+
+            append_illustration_annotations(&mut output, &post_illustrations);
         }
 
         if !output.ends_with('\n') {
@@ -167,6 +176,29 @@ pub(crate) fn render_novel_text(
     }
 
     output
+}
+
+fn extract_illustration_annotations(text: &str) -> (String, Vec<String>) {
+    static ILLUSTRATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"[ 　\t]*?(［＃挿絵（.+?）入る］)\n?").expect("valid illustration regex")
+    });
+
+    let mut illustrations = Vec::new();
+    let text = ILLUSTRATION_RE
+        .replace_all(text, |captures: &regex::Captures| {
+            illustrations.push(captures[1].to_string());
+            ""
+        })
+        .into_owned();
+    (text, illustrations)
+}
+
+fn append_illustration_annotations(output: &mut String, illustrations: &[String]) {
+    if illustrations.is_empty() {
+        return;
+    }
+    output.push_str(&illustrations.join("\n"));
+    output.push('\n');
 }
 
 fn decorate_title(settings: &NovelSettings, title: &str, record: Option<&NovelRecord>) -> String {
@@ -402,8 +434,10 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        decorate_title, normalize_story_markup, normalize_subtitle_markup, render_novel_text,
+        ConvertedSection, decorate_title, normalize_story_markup, normalize_subtitle_markup,
+        render_novel_text,
     };
+    use crate::converter::device::Device;
     use crate::db::NovelRecord;
     use crate::{converter::settings::NovelSettings, downloader::TocObject};
 
@@ -451,7 +485,7 @@ mod tests {
             subtitles: Vec::new(),
             novel_type: Some(1),
         };
-        let text = render_novel_text(&settings, &toc, "", &[], Some(&sample_record()));
+        let text = render_novel_text(&settings, &toc, "", &[], Some(&sample_record()), None);
 
         assert!(
             text.starts_with("作品 (2026-05-16) Example\n作者\n"),
@@ -476,6 +510,70 @@ mod tests {
     }
 
     #[test]
+    fn render_inserts_ibooks_chapter_spacing_like_ruby_template() {
+        let settings = NovelSettings::default();
+        let toc = TocObject {
+            title: "作品".to_string(),
+            author: "作者".to_string(),
+            toc_url: String::new(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let section = ConvertedSection {
+            chapter: "第一章".to_string(),
+            subchapter: String::new(),
+            subtitle: "第一話".to_string(),
+            introduction: String::new(),
+            body: "本文".to_string(),
+            postscript: String::new(),
+        };
+
+        let text = render_novel_text(&settings, &toc, "", &[section], None, Some(Device::Ibooks));
+
+        assert!(
+            text.contains("［＃ここで柱終わり］\n\n\n\n\n\n\n［＃３字下げ］"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_moves_author_comment_illustrations_outside_comment_tags() {
+        let settings = NovelSettings::default();
+        let toc = TocObject {
+            title: "作品".to_string(),
+            author: "作者".to_string(),
+            toc_url: String::new(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let section = ConvertedSection {
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: "第一話".to_string(),
+            introduction: "前書き\n　［＃挿絵（挿絵/intro.jpg）入る］\n続き".to_string(),
+            body: "本文".to_string(),
+            postscript: "後書き\n［＃挿絵（挿絵/post.jpg）入る］\n続き".to_string(),
+        };
+
+        let text = render_novel_text(&settings, &toc, "", &[section], None, None);
+
+        assert!(
+            text.contains(
+                "［＃ここから前書き］\n前書き\n続き\n［＃ここで前書き終わり］\n［＃挿絵（挿絵/intro.jpg）入る］"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "［＃ここから後書き］\n後書き\n続き\n［＃ここで後書き終わり］\n［＃挿絵（挿絵/post.jpg）入る］"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn decorate_title_replaces_all_narou_rb_extended_format_symbols() {
         let mut settings = NovelSettings::default();
         settings.enable_add_date_to_title = true;
@@ -491,6 +589,24 @@ mod tests {
             decorate_title(&settings, "作品", Some(&record)),
             "作品 0000 Site alpha,end 短編"
         );
+    }
+
+    #[test]
+    fn rendered_title_strips_prefix_when_enabled() {
+        let mut settings = NovelSettings::default();
+        settings.enable_strip_title_prefix = true;
+        let toc = TocObject {
+            title: "《コミカライズ企画進行中》マジカル".to_string(),
+            author: "作者".to_string(),
+            toc_url: "https://example.com/works/1".to_string(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+
+        let text = render_novel_text(&settings, &toc, "", &[], None, None);
+
+        assert!(text.starts_with("マジカル\n作者\n"), "{text}");
     }
 
     #[test]

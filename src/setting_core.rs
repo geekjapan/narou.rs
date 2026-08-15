@@ -366,6 +366,9 @@ fn strip_extended_path_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
     #[cfg(windows)]
     {
         let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
         if let Some(rest) = s.strip_prefix(r"\\?\") {
             return std::path::PathBuf::from(rest);
         }
@@ -409,6 +412,9 @@ mod tests {
         assert!(cast_setting_value("webui.table.reload-timing", "every").is_ok());
         assert!(cast_setting_value("webui.theme", "unknown").is_err());
         assert!(cast_setting_value("webui.theme", "Cerulean").is_ok());
+        assert!(cast_setting_value("webui.new-tag-color", "purple").is_err());
+        assert!(cast_setting_value("webui.new-tag-color", "default").is_ok());
+        assert!(cast_setting_value("webui.new-tag-color", "white").is_ok());
         assert!(cast_setting_value("default.title_date_align", "middle").is_err());
         assert!(cast_setting_value("default.title_date_align", "left").is_ok());
     }
@@ -435,6 +441,34 @@ mod tests {
         assert!(
             coerce_json_setting_value("webui.table.reload-timing", &serde_json::json!("invalid"))
                 .is_err()
+        );
+        assert!(
+            coerce_json_setting_value("webui.new-tag-color", &serde_json::json!("purple"))
+                .is_err()
+        );
+        assert!(
+            coerce_json_setting_value("webui.new-tag-color", &serde_json::json!("white"))
+                .is_ok()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_extended_path_prefix_restores_unc_prefix() {
+        assert_eq!(
+            strip_extended_path_prefix(std::path::PathBuf::from(
+                r"\\?\UNC\hostname\path\to\noveldir"
+            )),
+            std::path::PathBuf::from(r"\\hostname\path\to\noveldir")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_extended_path_prefix_restores_drive_path() {
+        assert_eq!(
+            strip_extended_path_prefix(std::path::PathBuf::from(r"\\?\C:\noveldir")),
+            std::path::PathBuf::from(r"C:\noveldir")
         );
     }
 

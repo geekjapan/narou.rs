@@ -38,8 +38,8 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 
 | 完了度 | コマンド数 | 内訳 |
 |:------:|:---------:|------|
-| ✅ 完了 | 18 | init, list, tag, freeze, remove, setting, diff, send, backup, clean, help, version, log, folder, browser, alias, inspect, csv, trace |
-| 🟡 部分 | 5 | download, update, convert, web, mail |
+| ✅ 完了 | 21 | init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, help, version, log, folder, browser, alias, inspect, csv, trace |
+| 🟡 部分 | 4 | download, update, convert, web |
 
 ## Porting Policy
 - 互換性の主対象は外部から観測できる挙動（CLI引数・戻り値・エラー、YAML構文理解、`.narou/` データ、出力ファイル）。

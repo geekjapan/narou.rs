@@ -141,6 +141,28 @@ fn main() {
         .unwrap_or_else(|| install_dir.join("update.log"));
     let mut logger = Logger::open(Some(&log_path));
 
+    // Unix では本体 (親) のセッションが終了すると SIGHUP が届く。
+    // 親が exit するのを待つ間も updater が生き残るよう、デフォルト
+    // の SIGHUP 終了動作を無効化する。spawn される側で setsid が
+    // 効いていれば本来ここでの IGN は不要だが、多重防御として入れる。
+    #[cfg(not(windows))]
+    {
+        let prev = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        logger.log(format!(
+            "session: updater pid={} getsid={} SIGHUP prev_handler={:?}",
+            std::process::id(),
+            unsafe { libc::getsid(0) },
+            prev,
+        ));
+    }
+    #[cfg(windows)]
+    {
+        logger.log(format!(
+            "session: updater pid={} (Windows; no setsid)",
+            std::process::id()
+        ));
+    }
+
     logger.log(format!(
         "updater start: pid={:?} zip={:?} install_dir={:?} restart={:?}",
         args.pid, zip_path, install_dir, args.restart
@@ -153,15 +175,13 @@ fn main() {
     // (Win では rename が使えるので必須ではないが、安全側に倒す)。
     std::thread::sleep(Duration::from_secs(2));
 
-    let backups = match apply_update(&zip_path, &install_dir, &mut logger) {
+    let backups = match apply_update_and_remove_download(&zip_path, &install_dir, &mut logger) {
         Ok(backups) => backups,
         Err(e) => {
             logger.log(format!("update failed: {e}"));
             std::process::exit(1);
         }
     };
-
-    let _ = fs::remove_file(&zip_path);
 
     if !args.restart.is_empty() {
         // updater 自身が exit しきってから新本体が起きるように小休止。
@@ -242,13 +262,16 @@ fn apply_update(
     }
     fs::create_dir_all(&temp_root).map_err(|e| format!("create temp dir: {e}"))?;
 
-    let extract_root = extract_zip(zip_path, &temp_root, logger)?;
-    logger.log(format!("extracted to {extract_root:?}"));
-
     let mut backups: Vec<BackupEntry> = Vec::new();
-    let result = copy_tree_overwrite(&extract_root, install_dir, &mut backups, logger);
+    let result = (|| {
+        let extract_root = extract_zip(zip_path, &temp_root, logger)?;
+        logger.log(format!("extracted to {extract_root:?}"));
+        copy_tree_overwrite(&extract_root, install_dir, &mut backups, logger)
+    })();
 
-    let _ = fs::remove_dir_all(&temp_root);
+    if let Err(err) = fs::remove_dir_all(&temp_root) {
+        logger.log(format!("cleanup: cannot remove {temp_root:?}: {err}"));
+    }
 
     match result {
         Ok(()) => Ok(backups),
@@ -258,6 +281,18 @@ fn apply_update(
             Err(e)
         }
     }
+}
+
+fn apply_update_and_remove_download(
+    zip_path: &Path,
+    install_dir: &Path,
+    logger: &mut Logger,
+) -> Result<Vec<BackupEntry>, String> {
+    let result = apply_update(zip_path, install_dir, logger);
+    if let Err(err) = fs::remove_file(zip_path) {
+        logger.log(format!("cleanup: cannot remove {zip_path:?}: {err}"));
+    }
+    result
 }
 
 /// zip を展開し、`narou/` ディレクトリ (またはトップレベル) を返す。
@@ -409,6 +444,7 @@ fn spawn_restart(
     let child = command
         .spawn()
         .map_err(|e| format!("spawn {program_path:?}: {e}"))?;
+    logger.log(format!("restart pid={}", child.id()));
     drop(child);
     Ok(())
 }
@@ -430,8 +466,22 @@ fn detach_command(command: &mut Command) {
 }
 
 #[cfg(not(windows))]
-fn detach_command(_command: &mut Command) {
-    // Best-effort: rely on the OS to keep the child alive after we exit.
+fn detach_command(command: &mut Command) {
+    // Unix では setsid(2) で新セッションリーダ化して SIGHUP から
+    // 切り離す。stdin/stdout/stderr は呼び出し側で null 化済みの前提。
+    use std::io;
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // 万一 setsid 後に制御端末を獲得しても SIGHUP で死なないよう
+            // 明示的に無視しておく。
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
 }
 
 #[cfg(test)]
@@ -519,5 +569,21 @@ mod tests {
         rollback(&backups, &mut logger);
         assert_eq!(fs::read(&target).unwrap(), b"original");
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn failed_update_removes_download_and_extract_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+        let zip_path = install_dir.join("update_download_test.zip.tmp");
+        fs::write(&zip_path, b"not a zip").unwrap();
+        let mut logger = Logger { file: None };
+
+        let result = apply_update_and_remove_download(&zip_path, &install_dir, &mut logger);
+
+        assert!(result.is_err());
+        assert!(!zip_path.exists());
+        assert!(!install_dir.join("update_extract.tmp").exists());
     }
 }

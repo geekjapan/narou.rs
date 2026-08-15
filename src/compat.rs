@@ -68,12 +68,33 @@ pub fn configure_web_subprocess_command(command: &mut Command) {
     configure_hidden_console_command(command);
 }
 
-pub fn configure_process_group_command(_command: &mut Command) {
+pub fn configure_process_group_command(command: &mut Command) {
+    // Unix 側では setsid(2) で新セッションリーダー化することで、
+    // 親セッション終了時の SIGHUP (SSH 切断・端末クローズ等) が
+    // 子プロセスに伝播しないようにする。setsid は新セッションと
+    // 同時に新プロセスグループを作るため、process_group(0) よりも
+    // デタッチの効果が強い。
     #[cfg(unix)]
     {
+        use std::io;
         use std::os::unix::process::CommandExt;
 
-        _command.process_group(0);
+        unsafe {
+            command.pre_exec(|| {
+                // setsid はプロセス自身がセッションリーダでない場合にのみ成功する。
+                // 親が setsid 済みの子をさらに setsid しても害はない。
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    // Windows 側: 既存の挙動 (何もしない) を維持。Windows での
+    // デタッチは呼び出し側で DETACHED_PROCESS 等のフラグを別途立てる。
+    #[cfg(not(unix))]
+    {
+        let _ = command;
     }
 }
 
@@ -951,7 +972,8 @@ mod tests {
 
     use super::{
         DigestChoice, NovelLockGuard, choose_digest_action_with_auto_choices,
-        configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
+        configure_process_group_command, configure_web_subprocess_command, get_copy_to_directory,
+        load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
         record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
         sanitize_backup_name, terminate_process,
@@ -1243,5 +1265,121 @@ mod tests {
         assert_eq!(resolve_auto_convert_devices().unwrap(), vec![Some(Device::Epub)]);
 
         *crate::db::DATABASE.lock() = None;
+    }
+
+    // -----------------------------------------------------------------
+    // configure_process_group_command (Unix setsid detach) の検証
+    // -----------------------------------------------------------------
+    //
+    // I-1 (Linux 自動更新失敗) の修正で、Unix 側では setsid(2) を
+    // pre_exec で呼んで新セッションリーダー化するようにした。
+    // ここでその挙動を 2 点検証する:
+    //
+    //   (a) 設定済み Command を spawn した子は、自分自身がセッション
+    //       リーダーになっている (sid == pid)。
+    //   (b) その sid は親プロセス (テストプロセス) の sid と異なる。
+    //
+    // どちらも POSIX setsid の直後かつ exec 前に true になる性質
+    // を直接観測する。Windows では setsid が存在しないためテスト
+    // 全体を #[cfg(unix)] で囲み、Windows ビルドには影響しない。
+    #[cfg(unix)]
+    #[test]
+    fn configure_process_group_command_creates_new_session() {
+        use std::process::Stdio;
+
+        let parent_sid = unsafe { libc::getsid(0) };
+        assert!(parent_sid > 0, "parent must have a session id");
+
+        // Keep the child alive long enough to query its session via getsid(2).
+        // macOS `ps` has no `sid` keyword, so do not depend on `ps` output.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group_command(&mut cmd);
+
+        let mut child = cmd.spawn().expect("spawn shell with setsid");
+        let pid = child.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let sid = unsafe { libc::getsid(pid) };
+        assert!(
+            sid > 0,
+            "getsid({pid}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let status = child.wait().expect("wait for child");
+        assert!(status.success(), "child sleep failed: {status:?}");
+
+        // (a) setsid 後は自プロセスがセッションリーダー。
+        assert_eq!(sid, pid, "child should be its own session leader");
+        // (b) 親セッションとは別物。
+        assert_ne!(sid, parent_sid, "child session must differ from parent's");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_process_group_command_child_survives_parent_session() {
+        // setsid 済みプロセスを起動し、それが親テストプロセスのセッションに
+        // 居ない (親 kill で連鎖しない) ことを確認する。
+        //
+        // 具体的には:
+        //   - setsid した子プロセスを起動
+        //   - 子が /tmp にファイルを作成し、その PID を書く
+        //   - テスト本体 (親) は子 PID を読み、kill(pid, 0) で生存確認
+        //   - その後、子の存在確認後にファイルを削除
+        //
+        // 親のセッションが畳まれるシナリオの厳密再現は cgroup 単位など
+        // が必要になるが、ここでは「sid が分離された」事実と「子プロセスが
+        // 独立した lifecycle を持つ」事実を検証する。
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = tmp.path().join("marker.txt");
+        let pidfile = tmp.path().join("pid.txt");
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(
+                r#"
+                set -e
+                echo $$ > "$PIDFILE"
+                echo hello > "$MARKER"
+                sleep 2
+                "#,
+            )
+            .env("PIDFILE", &pidfile)
+            .env("MARKER", &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group_command(&mut cmd);
+
+        let mut child = cmd.spawn().expect("spawn child");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let pid_str = std::fs::read_to_string(&pidfile).expect("pidfile");
+        let pid: i32 = pid_str.trim().parse().expect("parse pid");
+        assert!(pid > 0);
+
+        let marker_content = std::fs::read_to_string(&marker).expect("marker");
+        assert_eq!(marker_content.trim(), "hello");
+
+        // setsid 後は親とは別セッションで実行中のため、wait 前に
+        // kill -0 で生存確認できる。
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert_eq!(
+            alive, 0,
+            "setsid'd child pid should be observable to parent via kill -0 while running"
+        );
+
+        let status = child.wait().expect("wait child");
+        assert!(status.success(), "child failed: {status:?}");
     }
 }

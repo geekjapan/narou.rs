@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::error::Result;
 
@@ -9,12 +9,14 @@ use super::util::{build_section_url, compile_html_pattern, pretreatment_source};
 
 pub struct SectionCache {
     cache: HashMap<String, SectionElement>,
+    order: VecDeque<String>,
 }
 
 impl SectionCache {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 
@@ -23,10 +25,14 @@ impl SectionCache {
     }
 
     pub fn insert(&mut self, key: String, element: SectionElement) {
-        if self.cache.len() >= MAX_SECTION_CACHE {
-            if let Some(oldest_key) = self.cache.keys().next().cloned() {
+        if !self.cache.contains_key(&key) {
+            while self.cache.len() >= MAX_SECTION_CACHE {
+                let Some(oldest_key) = self.order.pop_front() else {
+                    break;
+                };
                 self.cache.remove(&oldest_key);
             }
+            self.order.push_back(key.clone());
         }
         self.cache.insert(key, element);
     }
@@ -136,5 +142,26 @@ mod tests {
             section_cache_key(setting, toc_url, &first),
             section_cache_key(setting, toc_url, &second)
         );
+    }
+
+    #[test]
+    fn hameln_section_patterns_extract_ruby_body_and_author_notes() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "syosetu.org")
+            .unwrap();
+        let html = r#"
+<div id="maegaki">前書き<ruby><rb>漢字</rb><rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby><br><hr><br></div>
+<div id="honbun"><p>本文<ruby><rb>死線</rb><rp>(</rp><rt>デッドライン</rt><rp>)</rp></ruby></p></div>
+<div id="atogaki"><br><hr><br>後書き</div>
+<span id="analytics_end"></span>
+"#;
+
+        let (section, _) = parse_section_html(setting, html.to_string()).unwrap();
+
+        assert_eq!(section.introduction, "前書き<ruby><rb>漢字</rb><rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>");
+        assert_eq!(section.body, "<p>本文<ruby><rb>死線</rb><rp>(</rp><rt>デッドライン</rt><rp>)</rp></ruby></p>");
+        assert_eq!(section.postscript, "後書き");
     }
 }
