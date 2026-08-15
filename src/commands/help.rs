@@ -106,6 +106,10 @@ const COMMANDS: &[CmdInfo] = &[
         name: "init",
         oneline: "現在のフォルダを小説用に初期化します",
     },
+    CmdInfo {
+        name: "illust",
+        oneline: "挿絵ハッシュストアの運用補助 (orphan/migrate/fix-ext/rebuild)",
+    },
 ];
 
 const HEADER: &str = "Narou.rb ― 小説家になろうダウンローダ＆縦書き用整形スクリプト";
@@ -413,6 +417,7 @@ const LIST_HELP: CmdHelp = CmdHelp {
     narou list 5 -l        # 最近更新のあった5件表示
     narou list 10 -rl      # 古い順に10件表示
     narou list -f ss       # 短編小説だけ表示
+    narou list --sort-by length         # 文字数でソート
 
     # 小説家になろうの小説のみを表示
     narou list --site --grep 小説家になろう
@@ -449,6 +454,12 @@ const LIST_HELP: CmdHelp = CmdHelp {
         ),
         opt(Some("-t"), "--tag", Some("[TAGS]"), "タグ表示/フィルタ"),
         opt(Some("-e"), "--echo", None, "パイプ時も人間可読出力"),
+        opt(
+            None,
+            "--sort-by",
+            Some("KEY"),
+            "ソートキーを指定する(id/title/author/last_update/general_lastup/sitename/novel_type/length/last_check_date/tags/general_all_no/status/toc_url/new_arrivals_date)",
+        ),
     ],
 };
 
@@ -704,6 +715,14 @@ const MAIL_HELP: CmdHelp = CmdHelp {
   ・<target>を省略した場合、新着があった小説を全て送信します。
   ・メールの送信設定は、mail_setting.yamlファイルを編集します。
     (初めてコマンドを使うときに自動で作成されます)
+  ・添付ファイル名は mail_setting.yaml の attachment_filename_pattern / attachment_filename_replacement、
+    または narou setting の mail.attachment-filename-pattern / mail.attachment-filename-replacement で正規表現置換できます。
+    置換対象は添付する電子書籍のファイル名だけです。フォルダ名は含みません。
+    mail_setting.yaml 側の設定が narou setting 側より優先されます。
+    置換結果が空文字になる場合は、元のファイル名をそのまま使います。
+    例: [作者名]タイトル.epub -> タイトル.epub
+      narou setting mail.attachment-filename-pattern='^\\[[^\\]]+\\](.*)$'
+      narou setting mail.attachment-filename-replacement='$1'
   ・<target>にhotentryを指定した場合、最新のhotentryを送信します。
 
   Examples:
@@ -846,6 +865,33 @@ const CLEAN_HELP: CmdHelp = CmdHelp {
     ],
 };
 
+const ILLUST_HELP: CmdHelp = CmdHelp {
+    banner: "<sub> [<target> ...] [options]",
+    description: "\
+  ・挿絵ハッシュストア (.illustration_cache.yaml) の運用補助コマンドです。
+  ・<sub> に次のいずれかを指定します。サブコマンド省略時はこの help を表示します。
+      orphan   到達不能な 挿絵/* を列挙する。-f で実際に削除。
+      migrate  legacy なファイル名 (<話数>-<連番>.ext や URL basename) を
+               ハッシュ名 / ソースマップへ一括移行。
+      fix-ext  マジックバイト判定で .jpg/.png 等を実体に合わせて改名。
+      rebuild  挿絵/ と raw/*.html から .illustration_cache.yaml を再構築。
+  ・<target> を省略した場合、直前に変換した小説が対象になります。
+  ・全小説を対象にしたい場合は --all を使います。
+  ・削除・改名・移行はいずれも既定で dry-run (-f を付けると実行)。
+
+  Examples:
+    narou illust orphan
+    narou illust orphan --all
+    narou illust orphan 1 -f       # 実際に削除
+    narou illust migrate 1
+    narou illust fix-ext --all -f
+    narou illust rebuild --all",
+    options: &[
+        opt(Some("-f"), "--force", None, "実際に変更する (削除/改名/移行)"),
+        opt(Some("-a"), "--all", None, "全小説を対象にする"),
+    ],
+};
+
 const LOG_HELP: CmdHelp = CmdHelp {
     banner: "[options] [<path>]",
     description: "\
@@ -979,6 +1025,10 @@ const ALL_COMMAND_HELP: &[CommandHelpEntry] = &[
     CommandHelpEntry {
         name: "clean",
         help: &CLEAN_HELP,
+    },
+    CommandHelpEntry {
+        name: "illust",
+        help: &ILLUST_HELP,
     },
     CommandHelpEntry {
         name: "log",

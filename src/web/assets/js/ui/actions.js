@@ -15,7 +15,7 @@ import {
 import { setShortcutHandlers, initShortcuts } from './shortcuts.js';
 import {
   setContextHandlers, initContextMenu, initTagColorMenu,
-  getStoredMenuStyle, setStoredMenuStyle,
+  getStoredMenuStyle, setStoredMenuStyle, showTagColorMenu,
 } from './context_menu.js';
 
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
@@ -44,6 +44,8 @@ const SORT_STATE_COLUMN_INDEX = {
 
 export function bindActions() {
   applyColumnVisibility();
+  if (El.filterInput) El.filterInput.value = State.filterText || '';
+  El.filterClear?.classList.toggle('hide', !State.filterText);
 
   // --- Navbar toggle (mobile) ---
   El.navbarToggleBtn?.addEventListener('click', () => {
@@ -427,6 +429,31 @@ export function bindActions() {
 
   // --- Confirm modal ---
   on('confirm-cancel', () => El.confirmModal?.classList.add('hide'));
+
+  // --- Bookmarklet register modal ---
+  function clearRegisterUrl() {
+    if (El.registerModal) delete El.registerModal.dataset.registerUrl;
+  }
+  function hideRegisterModal() {
+    clearRegisterUrl();
+    El.registerModal?.classList.add('hide');
+  }
+  on('register-modal-close', hideRegisterModal);
+  on('register-cancel', hideRegisterModal);
+  on('register-ok', (e) => {
+    const triggerEl = e.currentTarget;
+    const url = El.registerModal?.dataset?.registerUrl || '';
+    if (!url) {
+      hideRegisterModal();
+      return;
+    }
+    void runGuardedAction(triggerEl, async () => {
+      const result = await postJson('/api/download', { targets: [url] });
+      assertApiSuccess(result, 'ブックマークレット登録に失敗しました');
+      hideRegisterModal();
+      showNotification('ブックマークレットから登録しました', 'success');
+    }, 'ブックマークレット登録に失敗しました');
+  });
 
   // --- Diff modal ---
   on('diff-close', () => El.diffModal?.classList.add('hide'));
@@ -841,6 +868,7 @@ export function bindActions() {
       if (!popup) window.location.href = '/novels/' + id + '/author_comments';
     },
     refreshTags: () => refreshTags(),
+    tagColorChanged: () => refreshOpenTagEditor(),
     refreshList: () => refreshList(),
   };
 
@@ -861,6 +889,39 @@ export function bindActions() {
     document.documentElement.dataset.theme = State.theme;
     if (El.themeSelect) El.themeSelect.value = State.theme;
   }
+}
+
+/**
+ * Handle `?register=<url>` query parameter for the bookmarklet same-origin flow.
+ *
+ * When the user clicks the bookmarklet on a target site, it opens the WEB UI in a
+ * new window with the URL passed as `?register=...`. We show a confirmation dialog
+ * and, on approval, call the existing same-origin `/api/download` POST endpoint.
+ * The Origin header is then the WEB UI itself, so the CSRF guard permits it.
+ *
+ * Caller (main.js) is expected to strip the `register` param from the URL after
+ * dismissal (cancel or success) so refreshes do not re-prompt.
+ */
+export function handleRegisterParam(url) {
+  if (!url || typeof url !== 'string') return false;
+  if (!El.registerModal || !El.registerUrl) return false;
+  // Defensive: only http(s) schemes are accepted. javascript:/data:/file: would
+  // either be rejected by the API or, worse, trick the user. Reject anything else.
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  if (url.length > 2048) return false;
+
+  // Stash the URL on the modal element so the OK handler (bound in bindActions)
+  // can read it without sharing a closure over module-local state.
+  El.registerModal.dataset.registerUrl = url;
+  El.registerUrl.textContent = url;
+  El.registerModal.classList.remove('hide');
+  return true;
 }
 
 /* ===== Helpers ===== */
@@ -1127,6 +1188,16 @@ function closeTagEditor() {
   El.tagEditModal?.classList.add('hide');
 }
 
+async function refreshOpenTagEditor() {
+  if (!El.tagEditModal || El.tagEditModal.classList.contains('hide')) return;
+  const idsJson = El.tagEditModal.dataset.ids;
+  if (!idsJson) return;
+  const ids = JSON.parse(idsJson);
+  if (Array.isArray(ids) && ids.length > 0) {
+    await refreshTagEditor(ids);
+  }
+}
+
 async function openTagEditor(ids) {
   const targetIds = ids || requireSelectedIds();
   if (!targetIds || targetIds.length === 0) return;
@@ -1360,6 +1431,20 @@ function renderTagEditorTags(ids, taginfo) {
       count.textContent = ` ${presentCount}/${selectionCount}`;
       chip.appendChild(count);
     }
+
+    const colorBtn = document.createElement('button');
+    colorBtn.type = 'button';
+    colorBtn.className = 'tag-color-edit';
+    colorBtn.textContent = '色';
+    colorBtn.title = `「${info.tag}」の色を変更`;
+    colorBtn.setAttribute('aria-label', colorBtn.title);
+    colorBtn.addEventListener('click', (event) => {
+      showTagColorMenu(event, info.tag);
+    });
+    chip.appendChild(colorBtn);
+    chip.addEventListener('contextmenu', (event) => {
+      showTagColorMenu(event, info.tag);
+    });
 
     const removeBtn = document.createElement('span');
     removeBtn.className = 'tag-remove';

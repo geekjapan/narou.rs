@@ -8,7 +8,7 @@
 - 特に `regex::Regex::new(r"...").unwrap()` の直後に `.` で始まる式を書くとコンパイルエラーになる
 - セミコロンで終わらせるか変数に代入すること
 
-## Current Status (2026-05)
+## Current Status (2026-08, synced with upstream v0.3.6)
 
 ### 変換互換性
 - **なろう**: narou.rb参照データと完全互換確認済み
@@ -19,7 +19,7 @@
 ### ダウンロード互換性
 - なろう (n8858hb, 24セクション) DL完走確認済み
 - カクヨム (ID=2, 294セクション) DL完走確認済み
-- syosetu.org（ハーメルン）: UAランダム化、HTTP/1.1/Cookie/圧縮/curl fallback による403回避対応済み。フルDL未検証
+- syosetu.org（ハーメルン）: UAランダム化、HTTP/1.1/Cookie/圧縮/curl fallback による403回避対応済み。R18 分離ドメイン h.syosetu.org も同一サイトとして対応
 - Arcadia: `href` の `&amp;` デコード修正により本文取得修正済み
 
 ### Web UI
@@ -32,8 +32,8 @@
 - Windows タスクトレイ常駐 (`--hide-console`)
 
 ### コマンド実装状況 (詳細は `COMMANDS.md`)
-- ✅ 完了 (18): init, list, tag, freeze, remove, setting, diff, send, backup, clean, help, version, log, folder, browser, alias, inspect, csv, trace
-- 🟡 部分 (5): download, update, convert, web, mail
+- ✅ 完了 (21): init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, help, version, log, folder, browser, alias, inspect, csv, trace
+- 🟡 部分 (4): download, update, convert, web
 - ❌ 未実装 (0): 全コマンド何らかの実装あり
 
 ## 未解決の既知課題
