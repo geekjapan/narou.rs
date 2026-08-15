@@ -84,3 +84,17 @@ cargo local-build        # Release と同構成の narou/ フォルダを生成
 
 ## Dependency Policy
 - `Cargo.toml` は原則として直接編集しない。依存クレートの追加・更新は `cargo add`/`cargo update` 経由で行う。
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this fork's GitHub Issues (`geekjapan/narou.rs`) via `gh`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default role labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` at the repo root and `docs/adr/`. See `docs/agents/domain.md`.
