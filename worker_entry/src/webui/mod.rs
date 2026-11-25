@@ -1,0 +1,172 @@
+//! Web UI の API のうち、native (`src/web/*.rs`) から Worker へ移植したもの。
+//!
+//! 各モジュールは `pub async fn handle(req, env) -> worker::Result<Response>` を
+//! 公開し、`worker_entry/src/lib.rs` のルート表から呼ばれる。JSON の形・キー名・
+//! ステータスコードは native 実装と一致させる（フロントエンドを共有するため）。
+//! Worker で実現できない操作（ローカル FS 前提など）は、成功を偽装せず 501 と
+//! 機械可読な code を返す。
+//!
+//! このファイルにはサブモジュール共通の小さなヘルパを集約する。純粋な入力
+//! バリデーション・ソート状態の正規化・上限値は native と同じ規則を使うため
+//! `narou_rs::application::webui` (可搬層) が唯一の定義であり、ここには Worker
+//! の `Response` / `WorkerRuntime` に依存するラッパだけを置く。
+
+use narou_rs::application::web_payloads::ApiResponse;
+use narou_rs::application::webui::{
+    CURRENT_SORT_KEY, CurrentSortState, MAX_WEB_TARGETS_PER_REQUEST,
+    default_current_sort_state, normalize_current_sort_value,
+};
+use narou_rs::setting_core::SettingScope;
+use worker::Response;
+
+use crate::composition::WorkerRuntime;
+
+pub mod download;
+pub mod external;
+pub mod read_api;
+pub mod job_actions;
+pub mod library_backup;
+pub mod login_actions;
+pub mod novels;
+pub mod pages;
+pub mod queue_actions;
+pub mod read_views;
+pub mod row_actions;
+pub mod settings;
+pub mod tag_actions;
+pub mod native_only;
+pub mod list;
+pub mod ui_prefs;
+pub mod queue;
+pub(crate) mod metadata;
+
+/// 機械可読なエラー応答 (`{error: {code, message?}}`)。
+///
+/// このモジュール群 (および `lib.rs`) で使う唯一の実装。ボディの組み立ては
+/// 可搬層 `narou_rs::application::webui::json_error_body` に委譲するので、
+/// JSON の形はテストで固定されている。
+pub(crate) fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
+    Response::from_json(&narou_rs::application::webui::json_error_body(code, message))
+        .map(|response| response.with_status(status))
+}
+
+/// native `ApiResponse` (`{success, message}`) と同じ形の JSON 値。
+pub(crate) fn api_response(success: bool, message: impl Into<String>) -> serde_json::Value {
+    serde_json::to_value(ApiResponse {
+        success,
+        message: message.into(),
+    })
+    .expect("ApiResponse serialization is infallible")
+}
+
+/// native `map_application_error` (`src/web/novels.rs` / `batch.rs` /
+/// `novel_settings.rs`) と同じステータス対応。
+pub(crate) fn application_error(
+    error: &narou_rs::application::ApplicationError,
+) -> (u16, &'static str, String) {
+    let (status, code) = narou_rs::application::external_api::http_error(error);
+    (status, code, error.message().to_owned())
+}
+
+/// `application_error` をそのまま `json_error` 応答へ変換する。
+pub(crate) fn application_error_response(
+    error: &narou_rs::application::ApplicationError,
+) -> worker::Result<Response> {
+    let (status, code, message) = application_error(error);
+    json_error(status, code, Some(&message))
+}
+
+/// URL のクエリパラメータを 1 件取り出す。
+pub(crate) fn query_param(url: &worker::Url, name: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+/// native `max_web_targets_per_request` (`src/web/mod.rs`) parity:
+/// `server-max-targets-per-request` 設定を読み、無い/不正なら既定上限を返す。
+pub(crate) async fn max_web_targets(runtime: &WorkerRuntime) -> usize {
+    // 一括操作 (タグ/キュー投入) の件数上限は書き込み判断の材料なので、
+    // 更新系サービス (primary + キャッシュ無し) から読む。
+    max_web_targets_for(runtime.write_services()).await
+}
+
+/// `max_web_targets` と同じ設定をフル `WorkerRuntime` 無しで読む版。
+/// `/api/novels/*` の読み書きハンドラは `build_services` (queue 等の
+/// バインディング不要) で組み立てるため、こちらを使う。
+pub(crate) async fn max_web_targets_for(
+    services: &narou_rs::application::AppServices,
+) -> usize {
+    services
+        .settings
+        .web_target_limit(MAX_WEB_TARGETS_PER_REQUEST)
+        .await
+}
+
+/// ソート状態を書き込み判断 (一括操作の対象順) の材料にするハンドラは、
+/// primary + キャッシュ無しの `write_services` 側から読む。
+pub(crate) async fn load_current_sort_state_for_writes(
+    runtime: &WorkerRuntime,
+) -> CurrentSortState {
+    load_current_sort_state_for(&runtime.write_services().settings).await
+}
+
+/// Read `current_sort` from global settings, without composing a WorkerRuntime.
+pub(crate) async fn load_current_sort_state_for(
+    settings: &narou_rs::application::SettingsService,
+) -> CurrentSortState {
+    settings.get_raw(SettingScope::Global, CURRENT_SORT_KEY).await
+        .ok()
+        .flatten()
+        .and_then(|value| normalize_current_sort_value(&value))
+        .unwrap_or_else(default_current_sort_state)
+}
+
+/// native `configured_tag_color` (`src/web/mod.rs`) parity:
+/// `webui.new-tag-color` 設定を読み、小文字化 + 有効色チェックを通す。
+pub(crate) async fn configured_tag_color(runtime: &WorkerRuntime) -> Option<String> {
+    metadata::configured_tag_color(&runtime.services.settings).await
+}
+
+/// Keep the operation's admission attached to the actual HTTP body. Buffered
+/// JSON/HTML still owns the lease until EOF; cancel drops it and relies on the
+/// durable expiry, never on a spawned cleanup task.
+pub(crate) async fn leased_response(
+    response: worker::Result<Response>,
+    scope: narou_rs::application::novel_access::NovelReadScope,
+) -> worker::Result<Response> {
+    use futures::StreamExt;
+    use narou_rs::platform::AssetStream;
+    let response = match response {
+        Ok(response) if response.status_code() >= 400 => {
+            let _ = scope.release_all().await;
+            return Ok(response);
+        }
+        Ok(response) => response,
+        Err(error) => { let _ = scope.release_all().await; return Err(error); }
+    };
+    let (builder, body) = response.into_parts();
+    let stream: AssetStream = match body {
+        worker::ResponseBody::Empty => {
+            scope.release_all().await.map_err(crate::stream_error)?;
+            return Ok(builder.empty());
+        }
+        worker::ResponseBody::Body(bytes) => narou_rs::platform::staging::owned_bytes_stream(bytes),
+        worker::ResponseBody::Stream(body) => {
+            let mut response = Response::from_body(worker::ResponseBody::Stream(body))?;
+            Box::pin(response.stream()?.map(|item| item.map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))))
+        }
+    };
+    let stream = futures::stream::try_unfold((scope, stream), |(mut scope, mut stream)| async move {
+        if let Err(error) = scope.refresh_all().await {
+            let _ = scope.release_all().await;
+            return Err(crate::stream_error(error));
+        }
+        match stream.next().await {
+            Some(Ok(bytes)) => Ok(Some((bytes, (scope, stream)))),
+            Some(Err(error)) => { let _ = scope.release_all().await; Err(crate::stream_error(error)) }
+            None => { scope.release_all().await.map_err(crate::stream_error)?; Ok(None) }
+        }
+    });
+    builder.from_stream(stream)
+}

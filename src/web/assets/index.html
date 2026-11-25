@@ -51,6 +51,7 @@
                 <li class="divider"></li>
                 <li><a href="#" id="action-view-feature-tour"><span class="material-symbols-outlined icon-leading" aria-hidden="true">new_releases</span>新機能ツアーを表示</a></li>
                 <li class="divider"></li>
+                <li><a href="#" id="action-view-reset-console-size" data-i18n="viewResetConsoleSize">コンソールサイズをリセット</a></li>
                 <li><a href="#" id="action-view-reset">表示設定を全てリセット</a></li>
               </ul>
             </li>
@@ -77,9 +78,27 @@
                 <span data-i18n="menuTag">タグ</span> <span class="caret"></span>
               </a>
               <ul class="dropdown-menu dropdown-menu-tags" id="tag-menu">
+                <li>
+                  <div class="tag-sort-order">
+                    <label for="tag-sort-order-select">並び順</label>
+                    <select id="tag-sort-order-select" class="tag-sort-order-select"></select>
+                  </div>
+                </li>
                 <li><div id="tag-list-canvas" class="tag-list-canvas"></div></li>
                 <li class="divider"></li>
                 <li><a href="#" id="action-tag-edit">選択した小説のタグを編集 <span class="shortcut">T</span></a></li>
+                <li>
+                  <div class="tag-sort-order">
+                    <span data-i18n="attributeTagsDisplay">属性タグの表示</span>
+                  </div>
+                  <div class="tag-sort-order">
+                    <label><input type="checkbox" id="enable-attribute-tags"> <span data-i18n="attributeTagsEnabled">属性タグ機能を使う</span></label>
+                  </div>
+                  <div class="tag-sort-order">
+                    <label><input type="checkbox" id="show-novel-attribute"> <span data-i18n="attributeNovel">小説</span></label>
+                    <label><input type="checkbox" id="show-manga-attribute"> <span data-i18n="attributeManga">漫画</span></label>
+                  </div>
+                </li>
               </ul>
             </li>
             <!-- ツール (Tool) -->
@@ -109,6 +128,16 @@
               </a>
               <ul class="dropdown-menu dropdown-menu-right" id="options-menu">
                 <li><a href="#" id="action-option-settings"><span class="material-symbols-outlined icon-leading" aria-hidden="true">build</span>環境設定...</a></li>
+                <li><a href="#" id="action-option-hidden"><span class="material-symbols-outlined icon-leading" aria-hidden="true">visibility_off</span>非表示設定...</a></li>
+                <li><a href="#" id="action-option-export"><span class="material-symbols-outlined icon-leading" aria-hidden="true">archive</span>選択した作品をダウンロード...</a></li>
+                <li><a href="#" id="action-option-import"><span class="material-symbols-outlined icon-leading" aria-hidden="true">unarchive</span>小説データをアップロード...</a></li>
+                <li><a href="#" id="action-option-virtual-add"><span class="material-symbols-outlined icon-leading" aria-hidden="true">library_add</span>選択した作品をバーチャル小説にまとめる...</a></li>
+                <li><a href="#" id="action-option-virtual-attribute"><span class="material-symbols-outlined icon-leading" aria-hidden="true">sell</span>バーチャル小説の属性を変更...</a></li>
+                <li><a href="#" id="action-option-virtual-append"><span class="material-symbols-outlined icon-leading" aria-hidden="true">playlist_add</span>選択した作品をバーチャル小説に追加...</a></li>
+                <li><a href="#" id="action-option-virtual-order"><span class="material-symbols-outlined icon-leading" aria-hidden="true">reorder</span>バーチャル小説の順序を変更...</a></li>
+                <li><a href="#" id="action-option-virtual-convert"><span class="material-symbols-outlined icon-leading" aria-hidden="true">menu_book</span>バーチャル小説を変換...</a></li>
+                <li><a href="#" id="action-option-virtual-remove"><span class="material-symbols-outlined icon-leading" aria-hidden="true">delete</span>バーチャル小説を削除...</a></li>
+                <li hidden><input type="file" id="transfer-import-file" accept=".zip,application/zip" aria-label="取り込む小説 ZIP" hidden></li>
                 <li class="divider"></li>
                 <li><a href="#" id="action-option-help"><span class="material-symbols-outlined icon-leading" aria-hidden="true">help</span>ヘルプ...</a></li>
                 <li><a href="#" id="action-option-about"><span class="material-symbols-outlined icon-leading" aria-hidden="true">info</span>Narou.rs について</a></li>
@@ -175,14 +204,17 @@
             <div id="console-stdout2" class="console"></div>
           </div>
         </div>
+        <div id="console-resize-handle" class="console-resize-handle" role="separator" tabindex="0" aria-orientation="horizontal" aria-controls="console console-stdout2" aria-labelledby="console-resize-label">
+          <span id="console-resize-label" class="console-resize-label" data-i18n="consoleResize">コンソールの高さを調整（ドラッグまたは上下キー）</span>
+        </div>
         <div class="console-buttons" id="console-buttons">
-          <span class="console-btn" id="console-cancel" title="処理を中断"><span class="material-symbols-outlined icon-only" aria-hidden="true">cancel</span></span>
-          <span class="console-btn" id="console-history" title="全ての履歴を取得"><span class="material-symbols-outlined icon-only" aria-hidden="true">history</span></span>
-          <span class="console-btn" id="console-trash" title="表示と履歴を削除"><span class="material-symbols-outlined icon-only" aria-hidden="true">delete</span></span>
-          <span class="console-btn" id="console-expand" title="拡大">
+          <button type="button" class="console-btn" id="console-cancel" title="処理を中断" aria-label="処理を中断"><span class="material-symbols-outlined icon-only" aria-hidden="true">cancel</span></button>
+          <button type="button" class="console-btn" id="console-history" title="全ての履歴を取得" aria-label="履歴を取得"><span class="material-symbols-outlined icon-only" aria-hidden="true">history</span></button>
+          <button type="button" class="console-btn" id="console-trash" title="表示と履歴を削除" aria-label="表示と履歴を削除"><span class="material-symbols-outlined icon-only" aria-hidden="true">delete</span></button>
+          <button type="button" class="console-btn" id="console-expand" title="拡大" aria-label="コンソールを拡大" aria-expanded="false">
             <span class="expand-icon"><span class="material-symbols-outlined icon-only" aria-hidden="true">open_in_full</span></span>
             <span class="collapse-icon hide"><span class="material-symbols-outlined icon-only" aria-hidden="true">close_fullscreen</span></span>
-          </span>
+          </button>
         </div>
       </div>
 
@@ -267,6 +299,9 @@
             </select>
             <label for="novel-list-length"> 件分表示</label>
           </div>
+          <label class="checkbox-inline table-show-hidden" title="narou hidden で非表示にした作品・タグ・作者・サイトも表示します">
+            <input type="checkbox" id="novel-list-show-hidden"> 非表示も表示
+          </label>
           <div id="novel-list-info" class="table-page-info"></div>
           <div id="novel-list-pagination-top" class="table-pagination table-pagination-top"></div>
         </div>
@@ -326,14 +361,60 @@
           <div class="modal-body">
             <p id="tag-editor-summary" class="tag-editor-summary">タグ情報を読み込み中です...</p>
             <div id="tag-editor-current" class="tag-editor-current"></div>
+            <div id="tag-favorites" class="tag-favorites">
+              <h5 class="tag-favorites-title">お気に入りタグ</h5>
+              <p class="tag-editor-empty">タグをドラッグし、移動先の左半分または右半分で離すと、縦線の位置に入ります。</p>
+              <p id="tag-favorites-empty" class="tag-editor-empty">お気に入りに登録したタグはありません。下の入力欄から追加すると、ここに常設表示されます。</p>
+              <div id="tag-favorites-list" class="tag-favorites-list"></div>
+            </div>
             <div class="tag-editor-input">
               <input type="text" id="new-tag-input" class="new-tag-input" placeholder="新しいタグを入力...">
               <button class="btn btn-primary btn-sm" id="add-tag-button" type="button">追加</button>
+              <button class="btn btn-default btn-sm" id="favorite-tag-button" type="button" title="入力したタグをお気に入りに登録する">★</button>
             </div>
             <div id="tag-suggestions" class="tag-suggestions hide" role="listbox" aria-label="既存タグ候補"></div>
           </div>
           <div class="modal-footer">
             <button class="btn btn-default" id="tag-edit-cancel" type="button">閉じる</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Hidden settings Modal -->
+    <div class="modal-overlay hide" id="hidden-modal">
+      <div class="modal-dialog modal-dialog-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="hidden-close" type="button">&times;</button>
+            <h4 class="modal-title">非表示設定</h4>
+          </div>
+          <div class="modal-body">
+            <p class="hidden-help">非表示にした作品・タグ・作者・サイトは一覧から隠れます。更新・変換などの内部処理は対象のままです。</p>
+            <div class="hidden-section">
+              <h5>作品 (ID)</h5>
+              <div class="hidden-add-row"><input type="text" id="hidden-novel-input" inputmode="numeric" placeholder="作品ID"><button class="btn btn-primary btn-sm" id="hidden-novel-add" type="button">非表示にする</button></div>
+              <div id="hidden-novel-list" class="hidden-list"></div>
+            </div>
+            <div class="hidden-section">
+              <h5>タグ</h5>
+              <div class="hidden-add-row"><div class="hidden-input"><input type="text" id="hidden-tag-input" placeholder="タグ名"></div><button class="btn btn-primary btn-sm" id="hidden-tag-add" type="button">非表示にする</button></div>
+              <div id="hidden-tag-list" class="hidden-list"></div>
+            </div>
+            <div class="hidden-section">
+              <h5>作者</h5>
+              <div class="hidden-add-row"><div class="hidden-input"><input type="text" id="hidden-author-input" placeholder="作者名"></div><button class="btn btn-primary btn-sm" id="hidden-author-add" type="button">非表示にする</button></div>
+              <div id="hidden-author-list" class="hidden-list"></div>
+            </div>
+            <div class="hidden-section">
+              <h5>サイト</h5>
+              <div class="hidden-add-row"><div class="hidden-input"><input type="text" id="hidden-site-input" placeholder="ドメインまたはサイト名"></div><button class="btn btn-primary btn-sm" id="hidden-site-add" type="button">非表示にする</button></div>
+              <div id="hidden-site-list" class="hidden-list"></div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="hidden-all-clear" type="button">すべて解除</button>
+            <button class="btn btn-default" id="hidden-cancel" type="button">閉じる</button>
           </div>
         </div>
       </div>
@@ -359,6 +440,54 @@
             <button class="btn btn-primary hide" id="about-update" type="button">最新バージョンへ更新</button>
             <button class="btn btn-default" id="about-check-latest" type="button">最新バージョンを確認</button>
             <button class="btn btn-default" id="about-ok" type="button">OK</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Update Variant Choice Modal -->
+    <div class="modal-overlay hide" id="update-variant-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="update-variant-close" type="button">&times;</button>
+            <h4 class="modal-title">アップデート版の選択</h4>
+          </div>
+          <div class="modal-body">
+            <p>0.4.1 以降、リリースは2種類に分かれています。どちらで更新しますか？</p>
+            <p><strong>GPL版</strong>: AozoraEpub3_Lite 組込み。外部の AozoraEpub3 (Java) なしで EPUB を生成できます (GPL-3.0)。</p>
+            <p><strong>通常版</strong>: 従来どおり外部の AozoraEpub3 を利用します (BSD-2-Clause)。</p>
+            <p>選択は <code>narou setting self-update.variant</code> で後から変更できます。</p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="update-variant-cancel" type="button">キャンセル</button>
+            <button class="btn btn-default" id="update-variant-standard" type="button">通常版で更新</button>
+            <button class="btn btn-primary" id="update-variant-gpl" type="button">GPL版で更新</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Library Backup Offer Modal -->
+    <div class="modal-overlay hide" id="library-backup-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="library-backup-close" type="button">&times;</button>
+            <h4 class="modal-title">小説データのバックアップ</h4>
+          </div>
+          <div class="modal-body">
+            <p>0.4.0 では管理データの保存形式に破壊的な変更が加わっています。データ消失に備え、小説データのバックアップを推奨します。</p>
+            <p id="library-backup-size"></p>
+            <p id="library-backup-space-warning" class="hide" style="color: var(--danger-color, #c00);">保存先ドライブの空き容量が不足している可能性があります。</p>
+            <div class="form-group">
+              <label for="library-backup-output">保存先フォルダ</label>
+              <input type="text" id="library-backup-output" class="form-control">
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="library-backup-dismiss" type="button">作成しない</button>
+            <button class="btn btn-primary" id="library-backup-create" type="button">バックアップを作成</button>
           </div>
         </div>
       </div>
@@ -486,7 +615,8 @@
             <div class="queue-hint" id="queue-result-summary"></div>
             <div class="queue-actions">
               <button class="btn btn-default btn-sm" id="queue-reload-button" type="button">再読み込み</button>
-              <button class="btn btn-default btn-sm" id="queue-clear-button" type="button">キュー消去</button>
+              <button class="btn btn-default btn-sm" id="queue-clear-button" type="button">待機中をクリア</button>
+              <button class="btn btn-danger btn-sm" id="queue-clear-all-button" type="button">すべてクリア</button>
             </div>
           </div>
         </div>
@@ -506,24 +636,6 @@
           <div class="modal-footer">
             <button class="btn btn-default" id="queue-restore-no" type="button">破棄</button>
             <button class="btn btn-primary" id="queue-restore-yes" type="button">復元</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Confirm Modal (for server-driven confirm dialogs) -->
-    <div class="modal-overlay hide" id="confirm-modal">
-      <div class="modal-dialog modal-dialog-sm">
-        <div class="modal-content">
-          <div class="modal-header">
-            <h4 class="modal-title" id="confirm-title">確認</h4>
-          </div>
-          <div class="modal-body">
-            <p id="confirm-message"></p>
-          </div>
-          <div class="modal-footer">
-            <button class="btn btn-default" id="confirm-cancel" type="button">キャンセル</button>
-            <button class="btn btn-primary" id="confirm-ok" type="button">OK</button>
           </div>
         </div>
       </div>
@@ -659,6 +771,26 @@
               <input type="checkbox" id="feature-tour-disable-auto"> 以降新機能ツアーは表示しない
             </label>
             <button class="btn btn-primary" id="feature-tour-ok" type="button"><span class="material-symbols-outlined icon-leading" aria-hidden="true">done</span>確認した</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Virtual Novel Order Modal -->
+    <div class="modal-overlay hide" id="virtual-order-modal">
+      <div class="modal-dialog modal-dialog-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="virtual-order-close" type="button">&times;</button>
+            <h4 class="modal-title">バーチャル小説の登録順</h4>
+          </div>
+          <div class="modal-body">
+            <p class="hidden-help" id="virtual-order-help">メンバーを上から順に EPUB へ結合します。↑ / ↓ ボタンで入れ替えてください。</p>
+            <div id="virtual-order-list" class="hidden-list"></div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="virtual-order-cancel" type="button">キャンセル</button>
+            <button class="btn btn-primary" id="virtual-order-save" type="button">保存</button>
           </div>
         </div>
       </div>

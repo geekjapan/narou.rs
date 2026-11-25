@@ -108,7 +108,19 @@ const COMMANDS: &[CmdInfo] = &[
     },
     CmdInfo {
         name: "illust",
-        oneline: "挿絵ハッシュストアの運用補助 (orphan/migrate/fix-ext/rebuild)",
+        oneline: "挿絵ハッシュストアの運用補助 (orphan/migrate/fix-ext/rebuild/s3-push/s3-verify)",
+    },
+    CmdInfo {
+        name: "author",
+        oneline: "追跡する作者の管理と確認 (add/list/remove/check)",
+    },
+    CmdInfo {
+        name: "login",
+        oneline: "ログイン情報の取り込み・書き出し・管理 (import/export/list/set/add/order/clear)",
+    },
+    CmdInfo {
+        name: "api",
+        oneline: "外部公開 API の Bearer トークン管理 (create/list/delete/info)",
     },
 ];
 
@@ -875,6 +887,13 @@ const ILLUST_HELP: CmdHelp = CmdHelp {
                ハッシュ名 / ソースマップへ一括移行。
       fix-ext  マジックバイト判定で .jpg/.png 等を実体に合わせて改名。
       rebuild  挿絵/ と raw/*.html から .illustration_cache.yaml を再構築。
+      s3-push  挿絵を S3 互換ストレージ (Wasabi など) へ写す。既定は件数と
+               容量を数えるだけで、-f で実行。
+      s3-verify ローカルの挿絵と S3 の内容をバイト単位で突き合わせる。
+      s3-dedup  旧 挿絵/ 配置の S3 オブジェクトを dedup プールへ移し、
+               残ったものを消す。既定は件数だけ数える dry-run。
+  ・s3-push / s3-verify / s3-dedup はライブラリ全体が対象です (s3.asset-backend=s3 と
+    S3 の接続情報が必要。<target> は使いません)。
   ・<target> を省略した場合、直前に変換した小説が対象になります。
   ・全小説を対象にしたい場合は --all を使います。
   ・削除・改名・移行はいずれも既定で dry-run (-f を付けると実行)。
@@ -885,11 +904,112 @@ const ILLUST_HELP: CmdHelp = CmdHelp {
     narou illust orphan 1 -f       # 実際に削除
     narou illust migrate 1
     narou illust fix-ext --all -f
-    narou illust rebuild --all",
+    narou illust rebuild --all
+    narou illust s3-push              # 移行対象の件数と容量を確認
+    narou illust s3-push -f           # S3 へ写す
+    narou illust s3-verify            # 突き合わせ
+    narou illust s3-dedup             # プール移行対象の件数を確認
+    narou illust s3-dedup -f          # 移行して旧 挿絵/ を掃除",
     options: &[
-        opt(Some("-f"), "--force", None, "実際に変更する (削除/改名/移行)"),
+        opt(
+            Some("-f"),
+            "--force",
+            None,
+            "実際に変更する (削除/改名/移行)",
+        ),
         opt(Some("-a"), "--all", None, "全小説を対象にする"),
     ],
+};
+
+const LOGIN_HELP: CmdHelp = CmdHelp {
+    banner: "<sub> [options]",
+    description: "\
+  ・ログインが必要なサイトの Cookie を、ブラウザのある端末から受け取ります。
+  ・Cookie の取得は別実行ファイル narou_rs_login が担当します。
+      narou_rs_login <サイト>                # ブラウザを開いてログインし保存
+      narou_rs_login <サイト> --list         # 保存済みの確認
+      narou_rs_login <サイト> --export FILE  # 別端末へ持ち込む書き出し (YAML)
+      narou_rs_login <サイト> --clear        # 削除
+  ・このコマンドは取得済みの Cookie を本ライブラリへ取り込みます。
+      保存は暗号化され (.narou/login.key または NAROU_RS_LOGIN_KEY の鍵)、
+      取り込みファイルも --passphrase 指定時は暗号化されます。
+  ・<sub> に次のいずれかを指定します。
+      list     保存済みのサイト一覧 (値は伏せて表示)
+      import   書き出しファイル (YAML) を取り込む
+      export   保存済みの情報を書き出しファイルへ出力
+      set      1 サイト分の Cookie を置き換える (--cookie 省略時は標準入力)
+      add      1 サイト分の Cookie を末尾に追加する (--cookie 省略時は標準入力)
+      order    1 サイト分の試行順を変更する (現在の位置を 1 始まりでカンマ区切り)
+      clear    1 サイト分、--index で 1 件だけ、引数なしですべて削除
+
+  Examples:
+    narou login import login.yaml --passphrase correct-horse-battery
+    narou login import login.yaml --replace
+    narou login export login.yaml --passphrase correct-horse-battery
+
+  Notes:
+    書き出し時の --passphrase は 8 文字以上 (空文字・短い値は拒否)。
+    narou login list
+    narou login set ncode.syosetu.com --cookie \"over18=yes; ses=...\"
+    narou login add ncode.syosetu.com --cookie \"over18=yes; ses=...\" --label R18用
+    narou login order ncode.syosetu.com 2,1
+    narou login clear ncode.syosetu.com --index 2
+    narou login clear ncode.syosetu.com
+    narou login clear",
+    options: &[
+        opt(
+            None,
+            "--passphrase",
+            Some("<pass>"),
+            "書き出し/取り込みの暗号化パスフレーズ",
+        ),
+        opt(
+            None,
+            "--replace",
+            None,
+            "取り込みに含まれないサイトの情報を削除する",
+        ),
+        opt(
+            None,
+            "--clear-text",
+            None,
+            "パスフレーズ指定時でも平文で書き出す",
+        ),
+        opt(
+            None,
+            "--cookie",
+            Some("<value>"),
+            "set / add で保存する Cookie 文字列",
+        ),
+        opt(
+            None,
+            "--label",
+            Some("<name>"),
+            "set / add で一覧に表示するラベル",
+        ),
+        opt(
+            None,
+            "--index",
+            Some("<n>"),
+            "clear で削除する 1 始まりの位置",
+        ),
+    ],
+};
+
+const API_HELP: CmdHelp = CmdHelp {
+    banner: "<sub> [options]",
+    description: "\
+  ・外部公開 API (/api/v1) に入るための Bearer トークンを管理します
+  ・トークンは「Authorization: Bearer <トークン>」または「x-narou-api-token」ヘッダで送ります
+  ・作成・確認・削除は設定ページの「外部API」タブからも行えます
+  ・仕様は docs/external-api.md を参照してください
+
+  Examples:
+    narou api create 表生成
+    narou api list
+    narou api delete <ID>
+    narou api info",
+    options: &[],
 };
 
 const LOG_HELP: CmdHelp = CmdHelp {
@@ -1029,6 +1149,14 @@ const ALL_COMMAND_HELP: &[CommandHelpEntry] = &[
     CommandHelpEntry {
         name: "illust",
         help: &ILLUST_HELP,
+    },
+    CommandHelpEntry {
+        name: "login",
+        help: &LOGIN_HELP,
+    },
+    CommandHelpEntry {
+        name: "api",
+        help: &API_HELP,
     },
     CommandHelpEntry {
         name: "log",

@@ -11,6 +11,8 @@ use std::sync::{
 use chrono::Local;
 use regex::Regex;
 
+use narou_rs::setting_core::SettingScope;
+
 const DEFAULT_LOG_FORMAT_FILENAME: &str = "%Y%m%d.txt";
 const DEFAULT_LOG_FORMAT_TIMESTAMP: &str = "[%H:%M:%S]";
 
@@ -48,12 +50,18 @@ impl LoggerState {
             return Self::disabled();
         };
 
-        let local_setting_path = root_dir.join(".narou").join("local_setting.yaml");
-        let settings = read_yaml_map(&local_setting_path);
-        let logging_enabled = yaml_bool(settings.get("logging"));
+        let settings = narou_rs::db::settings::load_for_root(&root_dir, SettingScope::Local)
+            .unwrap_or_default();
+        let logging_enabled = settings
+            .get("logging")
+            .and_then(narou_rs::setting_core::setting_bool_value)
+            .unwrap_or(false);
         let logging_enabled =
             logging_enabled && std::env::var("NAROU_ENV").ok().as_deref() != Some("test");
-        let split_convert_logs = yaml_bool(settings.get("concurrency"));
+        let split_convert_logs = settings
+            .get("concurrency")
+            .and_then(narou_rs::setting_core::setting_bool_value)
+            .unwrap_or(false);
 
         let log_dir = root_dir.join("log");
         if logging_enabled {
@@ -88,8 +96,8 @@ impl LoggerState {
 }
 
 pub fn init() {
-    let mut state = state().lock().expect("logger state lock poisoned");
-    *state = LoggerState::load();
+    let loaded = LoggerState::load();
+    *state().lock().expect("logger state lock poisoned") = loaded;
 }
 
 pub fn init_tracing(no_color: bool) {
@@ -143,7 +151,7 @@ pub fn latest_log_path(source_convert: bool) -> Option<PathBuf> {
     latest_log_path_in(&dir, source_convert)
 }
 
-pub(crate) fn latest_log_path_in(dir: &Path, source_convert: bool) -> Option<PathBuf> {
+pub fn latest_log_path_in(dir: &Path, source_convert: bool) -> Option<PathBuf> {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)
         .ok()?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -321,7 +329,7 @@ fn modified_time(path: &Path) -> std::time::SystemTime {
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
 }
 
-pub(crate) fn find_narou_root() -> Option<PathBuf> {
+pub fn find_narou_root() -> Option<PathBuf> {
     let mut current = std::env::current_dir().ok()?;
     loop {
         if current.join(".narou").is_dir() {
@@ -330,22 +338,6 @@ pub(crate) fn find_narou_root() -> Option<PathBuf> {
         if !current.pop() {
             return None;
         }
-    }
-}
-
-fn read_yaml_map(path: &Path) -> HashMap<String, serde_yaml::Value> {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    serde_yaml::from_str(&raw).unwrap_or_default()
-}
-
-fn yaml_bool(value: Option<&serde_yaml::Value>) -> bool {
-    match value {
-        Some(serde_yaml::Value::Bool(v)) => *v,
-        Some(serde_yaml::Value::Number(n)) => n.as_i64().map(|v| v != 0).unwrap_or(false),
-        Some(serde_yaml::Value::String(v)) => matches!(v.as_str(), "true" | "yes" | "on" | "1"),
-        _ => false,
     }
 }
 
@@ -362,21 +354,17 @@ fn yaml_string(value: Option<&serde_yaml::Value>) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("narou_rs_{}_{}", prefix, nanos));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Temporary directory that cleans itself up, so a failing test does not
+    /// leave `narou_rs_*` directories behind in the system temp directory.
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
     fn latest_log_path_filters_convert_logs() {
-        let dir = temp_dir("logger_latest");
+        let dir = temp_dir();
+        let dir = dir.path();
         let log_dir = dir.join("log");
         fs::create_dir_all(&log_dir).unwrap();
 
@@ -406,7 +394,8 @@ mod tests {
 
     #[test]
     fn convert_commands_use_convert_log_postfix_when_concurrency_is_enabled() {
-        let dir = temp_dir("logger_convert_postfix");
+        let dir = temp_dir();
+        let dir = dir.path();
         let narou_dir = dir.join(".narou");
         fs::create_dir_all(&narou_dir).unwrap();
         fs::write(
@@ -416,13 +405,11 @@ mod tests {
         .unwrap();
 
         let path = {
-            let _guard = crate::test_support::set_current_dir_for_test(&dir);
+            let _guard = crate::test_support::set_current_dir_for_test(dir);
             init();
             use_convert_log_postfix(true);
             state().lock().unwrap().current_log_path().unwrap()
         };
-
-        let _ = fs::remove_dir_all(dir);
 
         assert!(path.file_name().unwrap().to_string_lossy().contains("_convert"));
     }

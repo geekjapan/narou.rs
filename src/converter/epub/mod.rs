@@ -263,10 +263,10 @@ fn safe_asset_path(output_dir: &Path, rel: &str) -> Option<PathBuf> {
 
 /// `dc:identifier` 用の決定論シード。掲載ページ URL があればそれを、無ければ題名+著者。
 fn identifier_seed(text: &str, title: &str, author: &str) -> String {
-    if let Some(re) = Regex::new(r#"<a href="([^"]+)">"#).ok() {
-        if let Some(caps) = re.captures(text) {
-            return caps[1].to_string();
-        }
+    if let Ok(re) = Regex::new(r#"<a href="([^"]+)">"#)
+        && let Some(caps) = re.captures(text)
+    {
+        return caps[1].to_string();
     }
     format!("{title}\n{author}")
 }
@@ -313,7 +313,7 @@ mod tests {
         let mut zip = zip::ZipArchive::new(file).unwrap();
         {
             let first = zip.by_index(0).unwrap();
-            assert_eq!(first.name(), "mimetype");
+            assert_eq!(first.name().unwrap(), "mimetype");
             assert_eq!(first.compression(), zip::CompressionMethod::Stored);
         }
 

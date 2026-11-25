@@ -1,0 +1,3222 @@
+//! Job planning service: deterministic job plans, no execution.
+//!
+//! The web UI's queue page and the auto-update scheduler need to describe
+//! work (download, update, convert, send, mail, backup) as data before it is
+//! handed to the queue. This service owns that planning logic: target
+//! normalization, deduplication, and validation. It deliberately contains
+//! no queue, process, or async-execution APIs — the queue layer consumes
+//! [`JobPlan`] values and does the actual work. The one exception is
+//! [`download_result_line`]: the per-novel console report both the
+//! native commands and the worker executor must print identically, so the
+//! wording dispatch lives here next to [`JobKind`].
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+use chrono::DateTime;
+
+use crate::application::error::ApplicationError;
+use crate::application::messages;
+use crate::downloader::{DownloadResult, UpdateStatus};
+use crate::error::NarouError;
+use crate::platform::{NovelId, PlatformFuture};
+
+/// The kind of work a job performs. Mirrors the queue's `JobType` set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum JobKind {
+    Download,
+    Update,
+    AuthorCheck,
+    Convert,
+    AutoUpdate,
+    Send,
+    Mail,
+    Backup,
+}
+
+impl JobKind {
+    /// The canonical string form used in dedupe keys and ledger rows.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::Update => "update",
+            Self::AuthorCheck => "author_check",
+            Self::Convert => "convert",
+            Self::AutoUpdate => "auto_update",
+            Self::Send => "send",
+            Self::Mail => "mail",
+            Self::Backup => "backup",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; `None` for unknown ledger values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "download" => Some(Self::Download),
+            "update" => Some(Self::Update),
+            "author_check" => Some(Self::AuthorCheck),
+            "convert" => Some(Self::Convert),
+            "auto_update" => Some(Self::AutoUpdate),
+            "send" => Some(Self::Send),
+            "mail" => Some(Self::Mail),
+            "backup" => Some(Self::Backup),
+            _ => None,
+        }
+    }
+
+    /// Kinds the Worker queue consumer can execute with the shared portable
+    /// capabilities (`Downloader` / `ConvertService`). Anything else is routed
+    /// to a durable blocked state.
+    /// is ported; download-time EPUB already reads the `novel.txt` object
+    /// ([`crate::platform::NovelObjectKeys::converted_text`]) instead.
+    pub fn is_worker_executable(self) -> bool {
+        // Convert は保存済みの TOC と本文から変換テキストを組むだけで、
+        // 外部プロセスを使わない (`ConvertService`)。
+        matches!(self, Self::Download | Self::Update | Self::Convert | Self::AuthorCheck)
+    }
+}
+
+/// A normalized job target.
+///
+/// Numeric ids are used directly; ncodes are normalized to lowercase, and
+/// HTTP(S) URLs are normalized before they enter the durable queue. Auto-update
+/// is a targetless job and uses [`JobTarget::All`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum JobTarget {
+    Id(NovelId),
+    Ncode(String),
+    Url(String),
+    All,
+}
+
+impl JobTarget {
+    /// The canonical string form used for deduplication and display.
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::Id(id) => id.0.to_string(),
+            Self::Ncode(ncode) => ncode.clone(),
+            Self::Url(url) => url.clone(),
+            Self::All => "*".to_string(),
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; `None` for values a ledger could not
+    /// have produced. Numeric strings are ids, `n…` strings are ncodes,
+    /// HTTP(S) URLs are URL targets, and `*` is the auto-update marker.
+    pub fn parse(value: &str) -> Option<Self> {
+        if value == "*" {
+            return Some(Self::All);
+        }
+        if is_valid_ncode(value) {
+            return Some(Self::Ncode(value.to_string()));
+        }
+        if let Ok(id) = value.parse::<i64>() {
+            return Some(Self::Id(NovelId(id)));
+        }
+        normalize_url_target(value).map(Self::Url)
+    }
+}
+
+/// A request to plan one or more jobs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JobRequest {
+    pub kind: JobKind,
+    /// Target novels. Each target is a numeric id, an ncode (`n1234ab`), or
+    /// an HTTP(S) novel URL. Mixed forms are normalized and deduplicated.
+    /// Auto-update accepts an empty list because it operates on the library.
+    pub targets: Vec<String>,
+    /// Extra kind-specific options (e.g. `--force` for update).
+    pub options: Vec<String>,
+}
+
+/// A planned job: one kind, one normalized target, and its options.
+///
+/// This is the unit the queue layer enqueues; it is deterministic — the same
+/// request always produces the same plans in the same order. It is fully
+/// serializable so it can travel through the queue as a compact payload
+/// (never a `NovelRecord`, body, or TOC).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JobPlan {
+    pub kind: JobKind,
+    pub target: JobTarget,
+    pub options: Vec<String>,
+}
+
+impl JobPlan {
+    /// The canonical deduplication key: `kind:target:options`.
+    ///
+    /// Options are trimmed, sorted, and deduplicated so `--force --verbose`
+    /// and `--verbose --force` are the same effective options. The ledger
+    /// keeps at most one *active* job per key and clears the key on terminal
+    /// states, so a later identical request re-enqueues instead of stacking.
+    pub fn dedupe_key(&self) -> String {
+        let mut options: Vec<String> = self
+            .options
+            .iter()
+            .map(|option| option.trim().to_string())
+            .filter(|option| !option.is_empty())
+            .collect();
+        options.sort();
+        options.dedup();
+        format!(
+            "{}:{}:{}",
+            self.kind.as_str(),
+            self.target.as_str(),
+            options.join(",")
+        )
+    }
+}
+
+/// Extract the set of numeric novel IDs from a job target string.
+///
+/// Shared by the native queue (`crate::queue`) and the Worker ledger
+/// (`worker_jobs`) so both backends apply the same per-novel exclusion rule:
+/// a claim must not start while another job that touches the same novel is
+/// running. Native targets are tab-separated token lists (e.g.
+/// `"12\tkindle"`, `"--force\t12"`) while Worker ledger `target` values are
+/// canonical [`JobTarget::as_str`] strings; in both shapes only tokens that
+/// parse as `i64` count, so flag tokens, `tag:…` selectors and ncode/URL
+/// targets never trigger the lock. An empty result means the job is not
+/// tied to a specific novel id (e.g. `AutoUpdate` broadcasts).
+pub fn extract_novel_ids(target: &str) -> HashSet<i64> {
+    target
+        .split('\t')
+        .filter_map(|part| part.parse::<i64>().ok())
+        .collect()
+}
+
+/// Worker ledger (`worker_jobs` on D1) claim statements.
+///
+/// The claim UPDATEs are defined here — not inside the D1 adapter — so the
+/// host-side tests can execute the *same* SQL against rusqlite and pin the
+/// semantics that D1 cannot exercise locally: per-novel exclusion
+/// ([`extract_novel_ids`]) and the retry backoff hold (`resume_after`
+/// becomes `lease_until`, and a `retryable` row is not claimable until it
+/// elapses).
+///
+/// Conventions mirror `worker_entry/src/ledger.rs`: timestamps are
+/// canonical UTC RFC3339 strings so lexicographic comparison is sound, and
+/// novel ids are bound as canonical decimal `target` strings (worker
+/// targets are single normalized tokens, so an `i64` id and its decimal
+/// string are the same value — the same scope as the native
+/// `job_conflicts_with_running` check).
+pub mod worker_ledger {
+    use super::extract_novel_ids;
+    use std::collections::HashSet;
+
+    /// A fully-formed statement: SQL text plus bind values in order.
+    /// Every bind is a `TEXT` string (RFC3339 timestamps, job id, canonical
+    /// target strings), matching the `BindValue::Text` usage in the D1
+    /// adapter. Integer predicates (LIMIT, attempts) are inlined by the
+    /// builders — they are always internal constants or validated counts.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Statement {
+        pub sql: String,
+        pub binds: Vec<String>,
+    }
+
+    /// Lost deliveries/executions may recover three times without progress.
+    /// This is deliberately independent of provider/business retry attempts.
+    pub const MAX_RECOVERY_ATTEMPTS: u32 = 3;
+
+    /// Claim due work under both per-novel exclusion and optional canonical-site
+    /// exclusion. `site_key` is resolved from effective YAML, never an input host.
+    pub fn claim_fresh(
+        now: &str,
+        lease_until: &str,
+        execution_token: &str,
+        job_id: &str,
+        target: &str,
+        site_key: Option<&str>,
+    ) -> Statement {
+        let (clause, conflict) = conflict_clause(target, now, site_key);
+        let mut binds = vec![
+            now.to_string(),
+            lease_until.to_string(),
+            execution_token.to_string(),
+            site_key.unwrap_or_default().to_string(),
+            target.to_string(),
+            job_id.to_string(),
+            now.to_string(),
+        ];
+        binds.extend(conflict);
+        Statement {
+            sql: format!(
+                "UPDATE worker_jobs \
+                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ?, \
+                     site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 0 \
+                 WHERE job_id = ? AND status IN ('pending', 'retryable') \
+                   AND (lease_until IS NULL OR lease_until <= ?) AND recovery_attempts <= {MAX_RECOVERY_ATTEMPTS} \
+                 {clause}"
+            ),
+            binds,
+        }
+    }
+
+    /// Recover an expired execution under the same admission rules.
+    pub fn claim_reclaim(
+        now: &str,
+        lease_until: &str,
+        execution_token: &str,
+        job_id: &str,
+        target: &str,
+        site_key: Option<&str>,
+    ) -> Statement {
+        let (clause, conflict) = conflict_clause(target, now, site_key);
+        let mut binds = vec![
+            now.to_string(),
+            lease_until.to_string(),
+            execution_token.to_string(),
+            site_key.unwrap_or_default().to_string(),
+            target.to_string(),
+            job_id.to_string(),
+            now.to_string(),
+        ];
+        binds.extend(conflict);
+        Statement {
+            sql: format!(
+                "UPDATE worker_jobs \
+                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ?, \
+                     site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 0, \
+                     recovery_attempts = recovery_attempts + 1 \
+                 WHERE job_id = ? AND status = 'running' \
+                   AND (lease_until IS NULL OR lease_until <= ?) AND recovery_attempts < {MAX_RECOVERY_ATTEMPTS} \
+                 {clause}"
+            ),
+            binds,
+        }
+    }
+
+    /// Select at most `limit` active rows whose scheduled progress point has
+    /// passed `stuck_before`: `pending` rows whose `updated_at` is old
+    /// (their envelope was never delivered or `queue.send` failed),
+    /// `retryable` rows whose backoff hold (`lease_until`) already elapsed
+    /// (their redelivery was lost to the DLQ or a consumer error), and
+    /// `running` rows whose execution lease expired (the claiming
+    /// invocation died). These are exactly the rows the cron reaper must
+    /// either re-enqueue or finalize — without it they would stay active
+    /// (UI「待機中」) forever.
+    ///
+    /// Bind order: `stuck_before`.
+    pub fn select_stuck(stuck_before: &str, limit: usize) -> Statement {
+        Statement {
+            sql: format!(
+                "SELECT job_id, status, attempts, recovery_attempts, last_error FROM worker_jobs \
+                 WHERE status IN ('pending', 'running', 'retryable') AND admission_waiting = 0 \
+                   AND COALESCE(lease_until, updated_at) <= ? \
+                 ORDER BY COALESCE(lease_until, updated_at) ASC, job_id ASC \
+                 LIMIT {limit}"
+            ),
+            binds: vec![stuck_before.to_string()],
+        }
+    }
+
+    /// Keyset pages remain bounded while earlier rows are cancelled or retired.
+    pub fn select_running(after: &str, before: &str) -> Statement {
+        Statement {
+            sql: "SELECT job_id FROM worker_jobs \
+                  WHERE status = 'running' AND job_id > ? AND created_at <= ? \
+                  ORDER BY job_id LIMIT 50".to_string(),
+            binds: vec![after.to_string(), before.to_string()],
+        }
+    }
+
+    pub fn select_stale_running(after: &str, before: &str) -> Statement {
+        Statement {
+            sql: "SELECT job_id, kind FROM worker_jobs \
+                  WHERE status = 'running' AND job_id > ? AND created_at <= ? \
+                    AND (lease_until IS NULL OR lease_until <= ?) \
+                  ORDER BY job_id LIMIT 50".to_string(),
+            binds: vec![after.to_string(), before.to_string(), before.to_string()],
+        }
+    }
+
+    /// Reserve a recovery delivery and retire an expired running token. Keeping
+    /// it `running` would keep its old site locked while the new envelope waits.
+    /// Conversions return to durable admission waiting; cron dispatches them
+    /// only after releasing its own heavy-memory permit.
+    ///
+    /// Bind order: `now`, `now`, `job_id`, `stuck_before`.
+    pub fn mark_reenqueue(now: &str, job_id: &str, stuck_before: &str) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs SET updated_at = ?, lease_until = ?, \
+                      status = CASE WHEN status = 'running' THEN 'pending' ELSE status END, \
+                      execution_token = NULL, recovery_attempts = recovery_attempts + 1, \
+                      admission_waiting = CASE WHEN kind = 'convert' THEN 1 ELSE admission_waiting END \
+                  WHERE job_id = ? \
+                    AND status IN ('pending', 'running', 'retryable') \
+                    AND COALESCE(lease_until, updated_at) <= ?"
+                .to_string(),
+            binds: vec![
+                now.to_string(),
+                now.to_string(),
+                job_id.to_string(),
+                stuck_before.to_string(),
+            ],
+        }
+    }
+
+    /// CAS used by the reaper to close a `retryable` row that has already
+    /// spent its retry budget (`attempts > max_retries`) but whose scheduled
+    /// redelivery never arrived. `attempts` counts failures, including the
+    /// initial execution; equality still leaves the final retry eligible.
+    /// The terminal state is `permanent` with the delivery-loss reason
+    /// recorded in `last_error`.
+    ///
+    /// Bind order: `reason`, `now`, `job_id`, `stuck_before`.
+    pub fn finalize_stuck(
+        reason: &str,
+        now: &str,
+        job_id: &str,
+        stuck_before: &str,
+        max_retries: u32,
+    ) -> Statement {
+        Statement {
+            sql: format!(
+                "UPDATE worker_jobs \
+                 SET status = 'permanent', last_error = ?, updated_at = ?, \
+                     lease_until = NULL, execution_token = NULL, \
+                     checkpoint_json = CASE WHEN json_extract(checkpoint_json, '$.creation_reservation') IS NOT NULL THEN checkpoint_json ELSE NULL END, admission_waiting = 0 \
+                 WHERE job_id = ? AND status IN ('pending', 'running', 'retryable') \
+                   AND ((status = 'retryable' AND attempts > {max_retries}) OR recovery_attempts >= {MAX_RECOVERY_ATTEMPTS}) \
+                   AND COALESCE(lease_until, updated_at) <= ?"
+            ),
+            binds: vec![
+                reason.to_string(),
+                now.to_string(),
+                job_id.to_string(),
+                stuck_before.to_string(),
+            ],
+        }
+    }
+
+    /// Persist admission waiting before acknowledging its physical envelope.
+    /// Neither budget continuations nor contention consume failure attempts.
+    pub fn park_admission(now: &str, job_id: &str, target: &str, site_key: Option<&str>) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs \
+                  SET status = 'pending', site_key = NULLIF(?, ''), normalized_target = ?, admission_waiting = 1, \
+                      updated_at = ?, lease_until = NULL, execution_token = NULL, \
+                      recovery_attempts = recovery_attempts + CASE WHEN status = 'running' THEN 1 ELSE 0 END \
+                  WHERE job_id = ? AND admission_waiting = 0 \
+                    AND ((status IN ('pending', 'retryable') AND (lease_until IS NULL OR lease_until <= ?)) \
+                         OR (status = 'running' AND (lease_until IS NULL OR lease_until <= ?)))"
+                .to_string(),
+            binds: vec![site_key.unwrap_or_default().to_string(), target.to_string(), now.to_string(),
+                job_id.to_string(), now.to_string(), now.to_string()],
+        }
+    }
+
+    /// Isolate capacity has no relationship to business failures or site leases.
+    pub fn park_capacity(now: &str, job_id: &str) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs SET admission_waiting = 1, updated_at = ? \
+                  WHERE job_id = ? AND status IN ('pending', 'retryable')".to_string(),
+            binds: vec![now.to_string(), job_id.to_string()],
+        }
+    }
+
+    /// Publish the durable high watermark and retire the old execution token.
+    pub fn yield_execution(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+        checkpoint_statement(now, job_id, execution_token, checkpoint_json, true)
+    }
+
+    /// Publish the same high watermark without releasing execution ownership.
+    pub fn save_checkpoint(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+        checkpoint_statement(now, job_id, execution_token, checkpoint_json, false)
+    }
+
+    /// Restart a corrupt section under the same durable ownership, without
+    /// earning a new delivery-recovery budget or changing reservations.
+    pub fn restart_checkpoint(now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs SET checkpoint_json=?1, updated_at=?2 \
+                  WHERE job_id=?3 AND status='running' AND execution_token=?4 \
+                    AND json_extract(checkpoint_json,'$.job_id')=?3 \
+                    AND json_extract(?1,'$.job_id')=?3 \
+                    AND json_extract(?1,'$.phase')='fetching' AND json_extract(?1,'$.next_section_index')=0 \
+                    AND json_extract(?1,'$.write_origin.prefix') IS NOT NULL \
+                    AND json_extract(checkpoint_json,'$.write_origin.prefix') IS json_extract(?1,'$.write_origin.prefix') \
+                    AND json_extract(checkpoint_json,'$.write_origin.epoch') IS json_extract(?1,'$.write_origin.epoch') \
+                    AND json_extract(checkpoint_json,'$.creation_reservation[0]') IS json_extract(?1,'$.creation_reservation[0]') \
+                    AND json_extract(checkpoint_json,'$.creation_reservation[1]') IS json_extract(?1,'$.creation_reservation[1]')".into(),
+            binds: vec![checkpoint_json.to_owned(), now.to_owned(), job_id.to_owned(), execution_token.to_owned()],
+        }
+    }
+
+    fn checkpoint_statement(
+        now: &str, job_id: &str, execution_token: &str, checkpoint_json: &str, release: bool,
+    ) -> Statement {
+        // The checkpoint itself is the high watermark: replay cannot replace it
+        // with a lower cursor and then earn a fresh recovery budget by catching up.
+        // A job id identifies one generation; a new token is not a new generation.
+        // Resolving an unknown novel id is allowed, but changing a known target is
+        // not. Fetching/persisting share the same section coordinate, so changing
+        // phase/metadata alone is not progress; finishing is a one-way advance.
+        let release = if release {
+            "status = 'pending', last_error = NULL, lease_until = NULL, \
+             execution_token = NULL, admission_waiting = 0,"
+        } else { "" };
+        Statement {
+            sql: format!(
+                "WITH positions AS ( \
+                   SELECT checkpoint_json IS NULL AS initial, \
+                     json_extract(checkpoint_json, '$.job_id') AS old_job, \
+                     json_extract(checkpoint_json, '$.novel_id') AS old_novel, \
+                     json_extract(checkpoint_json, '$.phase') AS old_phase, \
+                     json_extract(checkpoint_json, '$.next_section_index') AS old_cursor, \
+                     json_extract(checkpoint_json, '$.write_origin.prefix') AS old_prefix, \
+                     json_extract(checkpoint_json, '$.write_origin.epoch') AS old_epoch, \
+                     json_extract(checkpoint_json, '$.creation_reservation[0]') AS old_create_id, \
+                     json_extract(checkpoint_json, '$.creation_reservation[1]') AS old_create_generation, \
+                     json_extract(?1, '$.job_id') AS new_job, \
+                     json_extract(?1, '$.novel_id') AS new_novel, \
+                     json_extract(?1, '$.phase') AS new_phase, \
+                     json_extract(?1, '$.next_section_index') AS new_cursor, \
+                     json_extract(?1, '$.write_origin.prefix') AS new_prefix, \
+                     json_extract(?1, '$.write_origin.epoch') AS new_epoch, \
+                     json_extract(?1, '$.creation_reservation[0]') AS new_create_id, \
+                     json_extract(?1, '$.creation_reservation[1]') AS new_create_generation \
+                   FROM worker_jobs WHERE job_id = ?3 AND status = 'running' AND execution_token = ?4 \
+                 ), compatible AS ( \
+                   SELECT *, new_job = ?3 \
+                     AND (new_novel IS NULL OR typeof(new_novel) = 'integer') \
+                     AND ((new_phase IN ('planned', 'finished') AND new_cursor IS NULL) \
+                       OR (new_phase IN ('fetching', 'persisting', 'finished') \
+                         AND typeof(new_cursor) = 'integer' AND new_cursor >= 0)) \
+                     AND ((new_prefix IS NULL AND new_epoch IS NULL) \
+                       OR (typeof(new_prefix) = 'text' AND typeof(new_epoch) = 'integer' AND new_epoch >= 0)) \
+                     AND ((new_create_id IS NULL AND new_create_generation IS NULL) \
+                       OR (typeof(new_create_id) = 'integer' AND typeof(new_create_generation) = 'integer' \
+                         AND (new_prefix IS NOT NULL OR (new_phase = 'planned' AND new_cursor IS NULL)))) \
+                     AND (initial OR (old_job = ?3 \
+                       AND (old_novel IS NULL OR old_novel IS new_novel) \
+                       AND (old_prefix IS NULL OR (old_prefix IS new_prefix AND old_epoch IS new_epoch)) \
+                       AND (old_create_id IS NULL OR (old_create_id IS new_create_id AND old_create_generation IS new_create_generation)) \
+                       AND (old_prefix IS NULL OR old_create_id IS NOT NULL OR new_create_id IS NULL) \
+                       AND ((old_phase = 'planned' AND old_cursor IS NULL) \
+                         OR (old_phase IN ('fetching', 'persisting') \
+                           AND typeof(old_cursor) = 'integer' AND old_cursor >= 0)))) AS valid \
+                   FROM positions \
+                 ), progress AS MATERIALIZED ( \
+                   SELECT valid AND (initial OR (old_prefix IS NULL AND new_prefix IS NOT NULL) \
+                     OR (old_create_id IS NULL AND new_create_id IS NOT NULL AND new_phase = 'planned' AND new_cursor IS NULL) \
+                     OR (old_phase = 'planned' AND old_cursor IS NULL AND new_phase IN ('fetching','persisting') AND new_cursor = 0)) AS initialize, \
+                     valid AND (new_phase = 'finished' \
+                     OR (new_phase IN ('fetching', 'persisting') \
+                       AND new_cursor > COALESCE(old_cursor, 0))) AS advanced FROM compatible \
+                 ) UPDATE worker_jobs SET {release} \
+                   recovery_attempts = CASE WHEN (SELECT advanced FROM progress) THEN 0 ELSE recovery_attempts END, \
+                   checkpoint_json = CASE WHEN (SELECT initialize OR advanced FROM progress) THEN ?1 ELSE checkpoint_json END, \
+                   updated_at = ?2 \
+                 WHERE job_id = ?3 AND status = 'running' AND execution_token = ?4 AND (SELECT valid FROM compatible)"
+            ),
+            binds: vec![checkpoint_json.to_string(), now.to_string(), job_id.to_string(), execution_token.to_string()],
+        }
+    }
+
+    // Cancelled invocations cannot be killed by the queue API. Their token and
+    // lease continue excluding successors until the invocation drains or expires.
+    const OWNER: &str = "(other.lease_until > ? AND (other.status = 'running' \
+        OR (other.status = 'permanent' AND other.execution_token IS NOT NULL)))";
+
+    pub(crate) fn novel_id_expression(target: &str) -> String {
+        format!("CASE WHEN {target} = CAST(CAST({target} AS INTEGER) AS TEXT) \
+            THEN CAST({target} AS INTEGER) ELSE (SELECT MIN(novel_id) FROM novel_target_aliases \
+            WHERE target = lower({target})) END")
+    }
+
+    /// Wake at most one acquisition per free site, plus independently eligible
+    /// converts. The cron also uses this query after a lost completion/dispatch.
+    /// Physical owners are materialized once; URL/ncode/suffix identities use
+    /// the transactionally maintained alias index, not a per-wakeup library scan.
+    pub fn select_waiting(now: &str, limit: usize) -> Statement {
+        select_waiting_filtered(now, limit, "")
+    }
+
+    /// Acquisition work is dispatched through its independently fenced lanes.
+    pub fn select_waiting_converts(now: &str, limit: usize) -> Statement {
+        select_waiting_filtered(now, limit, "candidate.kind = 'convert' AND ")
+    }
+
+    fn select_waiting_filtered(now: &str, limit: usize, filter: &str) -> Statement {
+        let candidate_target = "COALESCE(candidate.normalized_target, candidate.target)";
+        let other_target = "COALESCE(other.normalized_target, other.target)";
+        let candidate_id = novel_id_expression(candidate_target);
+        let other_id = novel_id_expression(other_target);
+        Statement {
+            sql: format!(
+                "WITH owners AS MATERIALIZED ( \
+                   SELECT other.job_id, other.kind, other.site_key, other.target, other.normalized_target \
+                   FROM worker_jobs AS other WHERE {OWNER} \
+                 ) SELECT job_id, kind FROM ( \
+                   SELECT candidate.job_id, candidate.kind, candidate.created_at, \
+                     ROW_NUMBER() OVER (PARTITION BY candidate.site_key, \
+                       CASE WHEN candidate.site_key IS NULL THEN candidate.job_id ELSE '' END \
+                       ORDER BY candidate.created_at, candidate.job_id) AS site_rank \
+                   FROM worker_jobs AS candidate \
+                   WHERE {filter}candidate.admission_waiting = 1 \
+                     AND candidate.status IN ('pending', 'retryable') \
+                     AND (candidate.lease_until IS NULL OR candidate.lease_until <= ?) \
+                     AND NOT EXISTS (SELECT 1 FROM owners AS other \
+                       WHERE other.job_id != candidate.job_id AND ( \
+                         (candidate.site_key IS NOT NULL AND other.kind IN ('download', 'update', 'author_check') \
+                           AND (other.site_key IS NULL OR other.site_key = candidate.site_key)) \
+                         OR other.normalized_target IS NULL \
+                         OR {other_target} = {candidate_target} OR ({candidate_id}) = ({other_id}))) \
+                 ) WHERE site_rank = 1 ORDER BY created_at, job_id LIMIT {limit}"
+            ),
+            binds: vec![now.to_string(), now.to_string()],
+        }
+    }
+
+    /// One waker reserves the delivery; send failure is recovered by select_stuck.
+    /// Clear only a due hold, so the reaper grants this dispatch a fresh grace
+    /// period without shortening backoff or overwriting a concurrent claim.
+    pub fn mark_waiting_dispatched(now: &str, job_id: &str) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs SET admission_waiting = 0, updated_at = ?, lease_until = NULL \
+                  WHERE job_id = ? AND admission_waiting = 1 AND status IN ('pending', 'retryable') \
+                    AND (lease_until IS NULL OR lease_until <= ?)"
+                .to_string(),
+            binds: vec![now.to_string(), job_id.to_string(), now.to_string()],
+        }
+    }
+
+    /// Resolve both spellings inside the atomic claim, using the repository's
+    /// id / ncode / TOC URL rules. Identical new targets also exclude one
+    /// another before a novel record exists.
+    fn conflict_clause(target: &str, now: &str, site_key: Option<&str>) -> (String, Vec<String>) {
+        let novel_ids: HashSet<i64> = extract_novel_ids(target);
+        let mut ids: Vec<i64> = novel_ids.into_iter().collect();
+        ids.sort_unstable();
+        let other_target = "COALESCE(other.normalized_target, other.target)";
+        let mut binds = vec![now.to_string(), target.to_string()];
+        let candidate = if ids.is_empty() {
+            let folded = crate::db::novel_codec::fold(target);
+            binds.push(folded);
+            "n.id = (SELECT MIN(novel_id) FROM novel_target_aliases WHERE target = ?)".to_string()
+        } else {
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            binds.extend(ids.iter().map(i64::to_string));
+            format!("n.id IN ({placeholders})")
+        };
+        let site_clause = if let Some(site_key) = site_key {
+            binds.push(site_key.to_string());
+            " OR (other.kind IN ('download', 'update', 'author_check') AND (other.site_key IS NULL OR other.site_key = ?))"
+        } else { "" };
+        let clause = format!(
+            " AND NOT EXISTS (SELECT 1 FROM worker_jobs AS other \
+             WHERE {OWNER} AND other.job_id != worker_jobs.job_id \
+               AND (other.normalized_target IS NULL OR {other_target} = ? OR EXISTS (SELECT 1 FROM novels AS n \
+                 WHERE {candidate} AND (CAST(n.id AS TEXT) = {other_target} \
+                   OR n.id = (SELECT MIN(novel_id) FROM novel_target_aliases \
+                     WHERE target = lower({other_target})))) {site_clause}))"
+        );
+        (clause, binds)
+    }
+}
+
+/// The result of planning a request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobPlanResult {
+    /// The deduplicated, normalized plans in input order.
+    pub plans: Vec<JobPlan>,
+    /// Targets that are neither a valid id, ncode, nor HTTP(S) URL.
+    pub invalid: Vec<String>,
+    /// Duplicate targets that were dropped (kept for reporting).
+    pub duplicates: Vec<String>,
+}
+
+/// Concrete job planning service.
+///
+/// Pure and deterministic: no clock, no repository, no queue. Target
+/// normalization accepts numeric ids, ncodes, and HTTP(S) URLs; anything else
+/// is reported as invalid.
+pub struct JobService;
+impl JobService {
+    /// Plan a request into deduplicated [`JobPlan`]s.
+    pub fn plan(&self, request: &JobRequest) -> JobPlanResult {
+        if request.kind == JobKind::AutoUpdate && request.targets.is_empty() {
+            return JobPlanResult {
+                plans: vec![JobPlan {
+                    kind: request.kind,
+                    target: JobTarget::All,
+                    options: request.options.clone(),
+                }],
+                invalid: Vec::new(),
+                duplicates: Vec::new(),
+            };
+        }
+
+        let mut plans = Vec::new();
+        let mut invalid = Vec::new();
+        let mut duplicates = Vec::new();
+        let mut seen: HashSet<JobTarget> = HashSet::new();
+
+        for raw in &request.targets {
+            let target = raw.trim();
+            if target.is_empty() {
+                continue;
+            }
+            match normalize_target(target) {
+                Some(normalized) => {
+                    if seen.insert(normalized.clone()) {
+                        plans.push(JobPlan {
+                            kind: request.kind,
+                            target: normalized,
+                            options: request.options.clone(),
+                        });
+                    } else {
+                        duplicates.push(target.to_string());
+                    }
+                }
+                None => invalid.push(target.to_string()),
+            }
+        }
+
+        JobPlanResult {
+            plans,
+            invalid,
+            duplicates,
+        }
+    }
+
+    /// Validate a single target string without planning.
+    pub fn validate_target(&self, target: &str) -> Result<JobTarget, ApplicationError> {
+        normalize_target(target).ok_or_else(|| {
+            ApplicationError::InvalidRequest(format!("invalid job target: {target:?}"))
+        })
+    }
+
+    /// Plan one bounded auto-update scan page: one discrete `Update` job per
+    /// novel id, all sharing the same effective options.
+    ///
+    /// `page_size` bounds the number of ids the caller may scan per D1 round
+    /// trip; a page that returns fewer than `page_size` ids is the final
+    /// page (`done == true`, `next_cursor == None`).
+    pub fn plan_auto_update_page(
+        &self,
+        ids: &[NovelId],
+        options: &[String],
+        page_size: usize,
+    ) -> UpdateScanPage {
+        let plans = ids
+            .iter()
+            .map(|id| JobPlan {
+                kind: JobKind::Update,
+                target: JobTarget::Id(*id),
+                options: options.to_vec(),
+            })
+            .collect();
+        let done = ids.len() < page_size;
+        let next_cursor = if done { None } else { ids.last().map(|id| id.0) };
+        UpdateScanPage {
+            plans,
+            next_cursor,
+            done,
+        }
+    }
+}
+
+/// Normalize a target string to a [`JobTarget`].
+///
+/// Accepts a plain numeric id (`123`), an ncode (`n1234ab`, case-insensitive),
+/// or an absolute HTTP(S) URL. URL fragments are removed because they are not
+/// sent in HTTP requests and must not create distinct queue jobs.
+fn normalize_target(target: &str) -> Option<JobTarget> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(id) = trimmed.parse::<i64>() {
+        return Some(JobTarget::Id(NovelId(id)));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if is_valid_ncode(&lower) {
+        return Some(JobTarget::Ncode(lower));
+    }
+    normalize_url_target(trimmed).map(JobTarget::Url)
+}
+
+fn normalize_url_target(value: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+/// True for a well-formed ncode: `n` followed by 4–8 alphanumerics
+/// (narou ncodes are `n` + 4–8 chars).
+fn is_valid_ncode(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('n') else {
+        return false;
+    };
+    (4..=8).contains(&rest.len()) && rest.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+/// Normalize the Web UI's update targets: `--tag=<name>` / `--tag <name>`
+/// become `tag:<name>`, everything else goes through the shared target
+/// validation (`application::webui`). The error strings are the ones the
+/// native handler surfaces, so both runtimes answer identically.
+pub fn normalize_update_targets(
+    targets: &[String],
+    max_targets: usize,
+) -> Result<Vec<String>, String> {
+    if targets.len() > max_targets {
+        return Err("too many targets".to_string());
+    }
+    let mut normalized = Vec::with_capacity(targets.len());
+    let mut i = 0usize;
+    while i < targets.len() {
+        let target = &targets[i];
+        if let Some(tag) = target.strip_prefix("--tag=") {
+            let tag = crate::application::webui::validate_web_tag_name(tag)
+                .map_err(|_| "--tag requires a tag name".to_string())?;
+            normalized.push(format!("tag:{}", tag));
+            i += 1;
+            continue;
+        }
+        if target == "--tag" {
+            let Some(tag) = targets.get(i + 1) else {
+                return Err("--tag requires a tag name".to_string());
+            };
+            let tag = crate::application::webui::validate_web_tag_name(tag)
+                .map_err(|_| "--tag requires a tag name".to_string())?;
+            normalized.push(format!("tag:{}", tag));
+            i += 2;
+            continue;
+        }
+        normalized.push(
+            crate::application::webui::validate_web_target_value(target)
+                .map_err(|_| "invalid target".to_string())?,
+        );
+        i += 1;
+    }
+    Ok(normalized)
+}
+
+// ---------------------------------------------------------------------------
+// Queue protocol types (Phase 8)
+//
+// These types are the platform-neutral contract between the planner and the
+// queue layer, mirroring the application-owned ports in `events.rs`: no
+// Cloudflare (or any other platform) type appears here. The Worker adapter
+// implements [`JobQueue`] over D1 + the Queue binding; the native side keeps
+// its `PersistentQueue`/`queue.yaml` untouched.
+// ---------------------------------------------------------------------------
+
+/// Current envelope version carried by [`WorkerJobEnvelope`].
+pub const WORKER_JOB_ENVELOPE_VERSION: u32 = 2;
+
+/// A job identifier in the ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct JobId(pub String);
+
+impl JobId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for JobId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Display for JobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// One discrete queued job: one id, one plan.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueuedJob {
+    pub job_id: JobId,
+    pub job: JobPlan,
+}
+
+/// Ledger lifecycle states for one job row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobLedgerStatus {
+    /// Enqueued, not yet claimed.
+    Pending,
+    /// Claimed and executing.
+    Running,
+    /// Finished successfully.
+    Succeeded,
+    /// Finished with a partial/yielded result at a safe section boundary
+    /// (or the bounded request/time guard tripped and partial state was
+    /// recorded explicitly rather than running unbounded).
+    Partial,
+    /// Failed transiently; an attempt was recorded and a queue retry was
+    /// scheduled. Still active until it resolves.
+    Retryable,
+    /// Cannot proceed without operator action (interactive auth/adult/digest
+    /// decisions, unsupported job kinds, missing site definitions). Terminal.
+    Blocked,
+    /// Fatal failure (novel gone, invalid target, ...). Terminal.
+    Permanent,
+}
+
+impl JobLedgerStatus {
+    /// Active states participate in the dedupe index and can be claimed.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Running | Self::Retryable
+        )
+    }
+
+    /// Terminal states are durably recorded before the queue message is acked.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Partial | Self::Blocked | Self::Permanent
+        )
+    }
+
+    /// Parse the canonical ledger string form.
+    pub fn parse(value: &str) -> crate::error::Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "partial" => Ok(Self::Partial),
+            "retryable" => Ok(Self::Retryable),
+            "blocked" => Ok(Self::Blocked),
+            "permanent" => Ok(Self::Permanent),
+            other => Err(NarouError::Platform(format!(
+                "unknown job ledger status: {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Why a job failed, used by the consumer to pick the next transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobFailureClass {
+    /// Transient (network, transport, site rate limit): record an attempt and
+    /// schedule a bounded queue retry.
+    Retryable,
+    /// Fatal: record the error and ack. Never retried.
+    Permanent,
+    /// Requires operator action (interactive decision on the Worker has no
+    /// stdin; unsupported kind; missing site definition): record and ack.
+    Blocked,
+}
+
+/// Classify a domain error into the worker's failure vocabulary.
+///
+/// This is deliberately conservative: anything unrecognized is terminal
+/// (`Permanent`), never silently retried to success.
+pub fn classify_failure(error: &NarouError) -> JobFailureClass {
+    match error {
+        NarouError::Shared(error) => classify_failure(error),
+        NarouError::Http(_)
+        | NarouError::Io(_)
+        | NarouError::ObjectIo { .. }
+        | NarouError::Platform(_)
+        | NarouError::SuspendDownload(_)
+        | NarouError::DownloadBudgetExpired { .. } => JobFailureClass::Retryable,
+        // A drained creator's cleanup is still competing with admitted
+        // readers/file handles; recovery itself is transient, never terminal.
+        NarouError::CreationCleanupPending => JobFailureClass::Retryable,
+        NarouError::DownloadResumeCorrupt(_)
+        | NarouError::SiteSetting(_)
+        | NarouError::Yaml(_)
+        | NarouError::Regex(_) => JobFailureClass::Blocked,
+        // A credential that cannot be decrypted (wrong key, missing
+        // passphrase) needs the operator to import it again.
+        NarouError::Login(_) => JobFailureClass::Blocked,
+        // Interactive decisions (age verification, digest choice) have no
+        // terminal on the Worker; the downloader reports them explicitly.
+        NarouError::Unsupported(_) => JobFailureClass::Blocked,
+        NarouError::NotFound(_)
+        | NarouError::InvalidTarget(_)
+        | NarouError::Conversion(_)
+        | NarouError::Database(_) => JobFailureClass::Permanent,
+    }
+}
+
+/// Emit the per-novel result lines of `narou download` / `narou update` for one
+/// [`DownloadResult`]. Shared by the native CLI (`commands::download` /
+/// `commands::update`) and the worker executor so both surfaces print the
+/// same wording in the same order on `Stream::Stdout`.
+///
+/// `narou download` と `narou update` は同じ `DownloadResult` に対して別の
+/// 文言を出す (`update_completed` の件数の有無、update だけの
+/// `sections_deleted`、全角/半角空白の差)。ここでは両コマンドが
+/// `UpdateStatus` で分岐するのと同じ形を 1 箇所に集約し、文言差は
+/// `kind` で切り替える。`UpdateStatus::Failed` は downloader 自体が
+/// `novel_unavailable` を済ませているので両コマンドとも無出力。
+///
+/// `canceled_title` は `narou update` がキャンセルされた小説に使うタイトル。
+/// native は `DownloadResult.title` が空のとき (新規対象を中断した場合など)
+/// レコードから引き直すので、呼び出し側で同じ解決を済ませて渡す。
+/// `Download` やタイトルが空にならない呼び出しでは `None` でよい
+/// (`result.title` が使われる)。
+pub fn download_result_line(
+    kind: JobKind,
+    result: &DownloadResult,
+    canceled_title: Option<&str>,
+) -> Option<String> {
+    match result.status {
+        UpdateStatus::Ok if result.new_novel => Some(messages::dl_completed_new(&result.title, result.id, result.total_count)),
+        UpdateStatus::Ok if kind == JobKind::Update => {
+            if result.sections_deleted { Some(messages::update::sections_deleted(result.id, &result.title)) }
+            else if result.updated_count > 0 { Some(messages::update::update_completed(&result.title)) }
+            else if result.title_changed { Some(messages::update::title_changed(result.id, &result.title)) }
+            else if result.story_changed { Some(messages::update::story_changed(result.id, &result.title)) }
+            else if result.author_changed { Some(messages::update::author_changed(result.id, &result.title)) }
+            else { None }
+        }
+        UpdateStatus::Ok => {
+            if result.updated_count > 0 {
+                Some(messages::download::update_completed(&result.title, result.id, result.updated_count, result.total_count))
+            } else if result.title_changed { Some(messages::download::title_changed(result.id, &result.title)) }
+            else if result.story_changed { Some(messages::download::story_changed(result.id, &result.title)) }
+            else if result.author_changed { Some(messages::download::author_changed(result.id, &result.title)) }
+            else { None }
+        }
+        UpdateStatus::None => Some(messages::no_update(&result.title)),
+        UpdateStatus::Canceled => {
+            let title = if result.title.is_empty() { canceled_title.unwrap_or_default() } else { &result.title };
+            Some(match kind {
+                JobKind::Update => messages::update::update_canceled(result.id, title),
+                _ => messages::download::update_canceled(result.id, title),
+            })
+        }
+        UpdateStatus::Failed => None,
+    }
+}
+
+/// A queued job together with its ledger state (for `GET /api/jobs/:id`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueuedJobView {
+    pub job_id: JobId,
+    pub job: JobPlan,
+    pub status: JobLedgerStatus,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The version-2 worker queue envelope: one discrete job per message.
+///
+/// Version 1 carried a [`JobRequest`] (which plans *many* jobs); version 2
+/// carries exactly one already-planned [`JobPlan`] plus its ledger id, so the
+/// consumer never has to re-plan or split a message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerJobEnvelope {
+    pub version: u32,
+    pub job_id: JobId,
+    /// 計画本体。**キューには載せない**（D1 台帳が唯一の権威）。
+    /// 旧バージョンが積んだメッセージを読むためだけに残す。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobPlan>,
+}
+
+impl WorkerJobEnvelope {
+    /// Build a version-2 envelope: the id only.
+    ///
+    /// 台帳 (D1) に計画があるので、メッセージは id だけを運ぶ。メッセージが
+    /// 小さくなり、計画の書き換え・回復が台帳側だけで完結する。
+    pub fn v2(job_id: JobId) -> Self {
+        Self {
+            version: WORKER_JOB_ENVELOPE_VERSION,
+            job_id,
+            job: None,
+        }
+    }
+}
+
+/// Result of decoding a legacy (version 1) envelope body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyEnvelopeOutcome {
+    /// The request maps to exactly one unambiguous plan; promote it.
+    Plan(JobPlan),
+    /// The request is malformed, multi-target, or unsupported; it must be
+    /// durably ledgered (blocked/permanent) and acked — never silently
+    /// dropped or retried to success.
+    Reject { reason: String },
+}
+
+/// Decode a legacy version-1 `JobRequest` body.
+///
+/// Safe only when the request plans exactly one discrete job with no invalid
+/// targets (single target, or the targetless auto-update). Anything else is
+/// rejected for durable ledgering.
+pub fn decode_legacy_envelope(request: &JobRequest) -> LegacyEnvelopeOutcome {
+    let result = JobService.plan(request);
+    if result.plans.len() == 1 && result.invalid.is_empty() {
+        return LegacyEnvelopeOutcome::Plan(result.plans.into_iter().next().unwrap());
+    }
+    let reason = if !result.invalid.is_empty() {
+        format!(
+            "legacy v1 envelope has invalid targets: {}",
+            result.invalid.join(", ")
+        )
+    } else if result.plans.len() > 1 {
+        "legacy v1 envelope maps to multiple discrete jobs".to_string()
+    } else {
+        "legacy v1 envelope plans no jobs".to_string()
+    };
+    LegacyEnvelopeOutcome::Reject { reason }
+}
+
+/// Bounded-payload limits for job requests and queue envelopes (Phase 8).
+///
+/// The Queue has its own message size cap, but sending an oversized payload
+/// must never happen by accident: the API validates requests before
+/// planning and re-checks the serialized envelope before the producer send.
+pub mod job_limits {
+    /// Maximum discrete targets accepted in one job request.
+    pub const MAX_TARGETS_PER_REQUEST: usize = 100;
+    /// Maximum characters per target string.
+    pub const MAX_TARGET_CHARS: usize = 256;
+    /// Maximum effective options per plan.
+    pub const MAX_OPTIONS_PER_PLAN: usize = 16;
+    /// Maximum characters per option string.
+    pub const MAX_OPTION_CHARS: usize = 256;
+    /// Maximum serialized envelope bytes sent to / accepted from the queue.
+    pub const MAX_ENVELOPE_BYTES: usize = 4096;
+}
+
+/// Validate a job request against the bounded-payload limits.
+///
+/// Returns `None` when the request is within limits, else a reason.
+pub fn validate_request_limits(request: &JobRequest) -> Option<String> {
+    if request.targets.len() > job_limits::MAX_TARGETS_PER_REQUEST {
+        return Some(format!(
+            "too many targets: {} (max {})",
+            request.targets.len(),
+            job_limits::MAX_TARGETS_PER_REQUEST
+        ));
+    }
+    for target in &request.targets {
+        // 定数名・doc・エラー文言が揃って「文字数」を指すので chars() で数える。
+        // バイト長は `envelope_bytes` が別途直列化後に検査する。
+        let chars = target.chars().count();
+        if chars > job_limits::MAX_TARGET_CHARS {
+            return Some(format!(
+                "target too long: {} chars (max {})",
+                chars,
+                job_limits::MAX_TARGET_CHARS
+            ));
+        }
+    }
+    if request.options.len() > job_limits::MAX_OPTIONS_PER_PLAN {
+        return Some(format!(
+            "too many options: {} (max {})",
+            request.options.len(),
+            job_limits::MAX_OPTIONS_PER_PLAN
+        ));
+    }
+    for option in &request.options {
+        let chars = option.chars().count();
+        if chars > job_limits::MAX_OPTION_CHARS {
+            return Some(format!(
+                "option too long: {} chars (max {})",
+                chars,
+                job_limits::MAX_OPTION_CHARS
+            ));
+        }
+    }
+    None
+}
+
+/// Serialized size (in bytes) of an envelope as it would cross the queue.
+pub fn envelope_bytes(envelope: &WorkerJobEnvelope) -> crate::error::Result<usize> {
+    serde_json::to_vec(envelope)
+        .map(|bytes| bytes.len())
+        .map_err(|error| {
+            NarouError::Platform(format!("envelope serialization: {error}"))
+        })
+}
+
+/// Execution phase of a worker job for soft-budget checkpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    /// Not started.
+    Planned,
+    /// Fetching TOC / sections from the site.
+    Fetching,
+    /// Persisting fetched content (object store / repository).
+    Persisting,
+    /// Completed.
+    Finished,
+}
+
+/// Worker execution soft-budget / checkpoint shape (Phase 8).
+///
+/// Describes how far a job got: which novel, which phase, and the next section
+/// index when the downloader yielded at a safe boundary. It deliberately
+/// contains no Downloader state; persisted section data plus this cursor make
+/// continuation idempotent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerExecutionCheckpoint {
+    pub job_id: JobId,
+    pub novel_id: Option<NovelId>,
+    pub phase: ExecutionPhase,
+    /// `Some` when the downloader yielded before starting this section.
+    pub next_section_index: Option<u64>,
+    /// Original open epoch: continuation never adopts a later publication.
+    #[serde(default)]
+    pub write_origin: Option<super::novel_access::AccessOrigin>,
+    /// Exact creation ID and generation retained through publication and release.
+    #[serde(default)]
+    pub creation_reservation: Option<(NovelId, i64)>,
+}
+
+impl WorkerExecutionCheckpoint {
+    /// Start a checkpoint for a job (phase `Planned`, no section position).
+    pub fn planned(job_id: JobId, novel_id: Option<NovelId>) -> Self {
+        Self {
+            job_id,
+            novel_id,
+            phase: ExecutionPhase::Planned,
+            next_section_index: None,
+            write_origin: None,
+            creation_reservation: None,
+        }
+    }
+
+    pub fn with_write_origin(mut self, origin: super::novel_access::AccessOrigin) -> Self {
+        self.write_origin = Some(origin);
+        self
+    }
+
+    /// Advance to a later phase, optionally recording the next section index.
+    pub fn advance(&self, phase: ExecutionPhase, next_section_index: Option<u64>) -> Self {
+        Self {
+            job_id: self.job_id.clone(),
+            novel_id: self.novel_id,
+            phase,
+            next_section_index,
+            write_origin: self.write_origin.clone(),
+            creation_reservation: self.creation_reservation,
+        }
+    }
+}
+
+/// One bounded auto-update scan page: the plans to enqueue plus the next
+/// keyset cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateScanPage {
+    pub plans: Vec<JobPlan>,
+    /// Keyset cursor for the next page: the last id enqueued when the page
+    /// was full; `None` when the scan is exhausted.
+    pub next_cursor: Option<i64>,
+    pub done: bool,
+}
+
+/// Planner checkpoint state, durably stored in D1 `app_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointState {
+    Done,
+    Running,
+}
+
+/// The auto-update planner checkpoint: generation + keyset cursor + run
+/// timestamps. Pure transition logic, so the duplicate-cron rule is testable
+/// on the host.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerCheckpoint {
+    /// Monotonic logical run generation. Cron probe timestamps are not
+    /// generations; a generation changes only when a due run starts.
+    pub generation: u64,
+    pub state: CheckpointState,
+    /// Last novel id already enqueued by the current generation. When
+    /// `scan_sort_key` is set this is instead the *offset* into the sorted
+    /// scan (the Worker planner pages `novels.query` instead of `scan_ids`).
+    pub cursor: Option<i64>,
+    /// Sort key (`update.sort-by` / `NovelSortKey::as_db_key`) the running
+    /// generation is paging by, or `None` for the default `id` keyset scan.
+    /// A configured sort is not id-keyset-paginable, so the cursor becomes
+    /// an offset and this key guards against mid-run setting changes.
+    #[serde(default)]
+    pub scan_sort_key: Option<String>,
+    /// When the current logical generation was claimed.
+    pub started_at: Option<String>,
+    /// When the last completed generation finished (drives catch-up).
+    pub last_run: Option<String>,
+    /// Lease held by the planner that owns the current page.
+    #[serde(default)]
+    pub planner_lease_until: Option<String>,
+    /// Ownership token for the current planner lease.
+    #[serde(default)]
+    pub planner_token: Option<String>,
+}
+
+impl Default for SchedulerCheckpoint {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            state: CheckpointState::Done,
+            cursor: None,
+            scan_sort_key: None,
+            started_at: None,
+            last_run: None,
+            planner_lease_until: None,
+            planner_token: None,
+        }
+    }
+}
+
+/// Outcome of trying to claim a planner generation or probe lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointClaim {
+    /// Another planner currently owns the lease.
+    Busy,
+    /// The probe or generation was already handled.
+    Duplicate,
+    /// The planner may proceed with the returned checkpoint.
+    Claimed(SchedulerCheckpoint),
+}
+
+/// Outcome of trying to claim a queued job for execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobClaim {
+    /// The caller owns this execution token until it expires or is completed.
+    Claimed {
+        execution_token: String,
+        checkpoint: Option<WorkerExecutionCheckpoint>,
+    },
+    /// The row is terminal and a redelivered message can be acknowledged.
+    AlreadyTerminal,
+    /// Contention or an unexpired execution/backoff. Persist admission waiting
+    /// (or retain its existing live owner/recovery hold) before acknowledging.
+    Busy,
+    /// No ledger row exists for the id carried by the envelope. The adapter
+    /// durably records a blocked rejection before returning this outcome.
+    Unknown,
+}
+
+impl SchedulerCheckpoint {
+    /// Claim a logical generation without a planner lease.
+    ///
+    /// This compatibility helper is used by pure host tests. Worker
+    /// scheduling uses [`Self::begin_with_lease`] so a minute probe cannot
+    /// create a new generation while a page is still running.
+    pub fn begin(&self, generation: u64, started_at: &str) -> CheckpointClaim {
+        if self.generation >= generation {
+            CheckpointClaim::Duplicate
+        } else {
+            CheckpointClaim::Claimed(Self {
+                generation,
+                state: CheckpointState::Running,
+                cursor: None,
+                scan_sort_key: None,
+                started_at: Some(started_at.to_string()),
+                last_run: self.last_run.clone(),
+                planner_lease_until: None,
+                planner_token: None,
+            })
+        }
+    }
+
+    /// Claim either a new logical generation or the existing running
+    /// generation. An active planner lease returns `Busy`; an expired lease
+    /// preserves the generation and cursor while replacing its owner token.
+    pub fn begin_with_lease(
+        &self,
+        generation: u64,
+        now: &str,
+        planner_token: String,
+        planner_lease_until: String,
+    ) -> CheckpointClaim {
+        if self.state == CheckpointState::Running {
+            if self.planner_lease_active(now) {
+                return CheckpointClaim::Busy;
+            }
+            return CheckpointClaim::Claimed(Self {
+                generation: self.generation,
+                state: CheckpointState::Running,
+                cursor: self.cursor,
+                scan_sort_key: self.scan_sort_key.clone(),
+                started_at: self.started_at.clone().or_else(|| Some(now.to_string())),
+                last_run: self.last_run.clone(),
+                planner_lease_until: Some(planner_lease_until),
+                planner_token: Some(planner_token),
+            });
+        }
+        if self.generation >= generation {
+            return CheckpointClaim::Duplicate;
+        }
+        CheckpointClaim::Claimed(Self {
+            generation,
+            state: CheckpointState::Running,
+            cursor: None,
+            scan_sort_key: None,
+            started_at: Some(now.to_string()),
+            last_run: self.last_run.clone(),
+            planner_lease_until: Some(planner_lease_until),
+            planner_token: Some(planner_token),
+        })
+    }
+
+    /// Whether the planner lease is still valid at `now`.
+    pub fn planner_lease_active(&self, now: &str) -> bool {
+        let Some(lease_until) = self.planner_lease_until.as_deref() else {
+            return false;
+        };
+        let Ok(now) = DateTime::parse_from_rfc3339(now) else {
+            return false;
+        };
+        let Ok(lease_until) = DateTime::parse_from_rfc3339(lease_until) else {
+            return false;
+        };
+        lease_until > now
+    }
+
+    /// Advance the keyset cursor after enqueueing a full page.
+    pub fn advance(&self, cursor: i64) -> Self {
+        Self {
+            generation: self.generation,
+            state: self.state,
+            cursor: Some(cursor),
+            scan_sort_key: self.scan_sort_key.clone(),
+            started_at: self.started_at.clone(),
+            last_run: self.last_run.clone(),
+            planner_lease_until: self.planner_lease_until.clone(),
+            planner_token: self.planner_token.clone(),
+        }
+    }
+
+    /// Complete the generation: record the finish time and release the run
+    /// and its planner ownership.
+    pub fn finish(&self, finished_at: &str) -> Self {
+        Self {
+            generation: self.generation,
+            state: CheckpointState::Done,
+            cursor: None,
+            scan_sort_key: None,
+            started_at: None,
+            last_run: Some(finished_at.to_string()),
+            planner_lease_until: None,
+            planner_token: None,
+        }
+    }
+}
+
+/// Platform-neutral job queue port (Phase 8).
+///
+/// The queue layer consumes [`JobPlan`] values and reports discrete job
+/// outcomes; the implementation owns durability (D1 on the Worker) and the
+/// transport (Queue binding). The native desktop keeps its
+/// `PersistentQueue`/`queue.yaml` unchanged and does not implement this
+/// port.
+pub trait JobQueue: Send + Sync {
+    /// Enqueue one discrete job. When an *active* job with the same dedupe
+    /// key already exists, returns that job's id instead of inserting a
+    /// duplicate (idempotent enqueue).
+    fn enqueue<'a>(&'a self, job: JobPlan) -> PlatformFuture<'a, crate::error::Result<QueuedJob>>;
+
+    /// Read a queued job and its ledger state.
+    fn get<'a>(
+        &'a self,
+        job_id: &'a JobId,
+    ) -> PlatformFuture<'a, crate::error::Result<Option<QueuedJobView>>>;
+
+    /// Atomically claim using the YAML-resolved target and optional acquisition
+    /// site, without rewriting the stored plan. Contention must be durably
+    /// parked/recoverable, not spent as a provider retry.
+    fn claim<'a>(
+        &'a self, job_id: &'a JobId, normalized_target: &'a str, site_key: Option<&'a str>,
+    ) -> PlatformFuture<'a, crate::error::Result<JobClaim>>;
+
+    /// Persist a budget-yielded checkpoint and release the execution claim.
+    ///
+    /// The next queue envelope is a continuation, not a failed attempt, so
+    /// implementations must not increment `attempts`.
+    fn yield_for_continuation<'a>(
+        &'a self,
+        job_id: &'a JobId,
+        execution_token: &'a str,
+        checkpoint: &'a WorkerExecutionCheckpoint,
+    ) -> PlatformFuture<'a, crate::error::Result<()>>;
+    /// Persist a mid-execution progress checkpoint without releasing the
+    /// claim or changing the job status. Used so a crashed invocation resumes
+    /// near the last completed section instead of restarting the download.
+    /// Default is a no-op for backends without durable checkpoints.
+    fn save_checkpoint<'a>(
+        &'a self,
+        _job_id: &'a JobId,
+        _execution_token: &'a str,
+        _checkpoint: &'a WorkerExecutionCheckpoint,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+
+    /// Durably record one retryable attempt for the current execution token;
+    /// returns the new attempt count. A stale token is an error.
+    ///
+    /// `resume_after` is the scheduled queue backoff for this attempt: the
+    /// ledger keeps the row unclaimable until then, so a redelivery that
+    /// arrives before the delay fires cannot short-circuit the backoff.
+    /// Passing `Duration::ZERO` (or an already-elapsed duration) makes the
+    /// row immediately claimable.
+    fn record_attempt<'a>(
+        &'a self,
+        job_id: &'a JobId,
+        execution_token: &'a str,
+        error: &'a str,
+        resume_after: Duration,
+    ) -> PlatformFuture<'a, crate::error::Result<u32>>;
+
+    /// Durably record a terminal state for the current execution token.
+    /// The queue message is acked only after this succeeds.
+    fn mark_terminal<'a>(
+        &'a self,
+        job_id: &'a JobId,
+        execution_token: &'a str,
+        status: JobLedgerStatus,
+        error: Option<&'a str>,
+    ) -> PlatformFuture<'a, crate::error::Result<()>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service() -> JobService {
+        JobService
+    }
+
+    #[test]
+    fn plan_deduplicates_and_normalizes_ids() {
+        let result = service().plan(&JobRequest {
+            kind: JobKind::Update,
+            targets: vec!["3".into(), "1".into(), "3".into(), " 2 ".into()],
+            options: vec!["--force".into()],
+        });
+        assert_eq!(
+            result.plans,
+            vec![
+                JobPlan {
+                    kind: JobKind::Update,
+                    target: JobTarget::Id(NovelId(3)),
+                    options: vec!["--force".into()],
+                },
+                JobPlan {
+                    kind: JobKind::Update,
+                    target: JobTarget::Id(NovelId(1)),
+                    options: vec!["--force".into()],
+                },
+                JobPlan {
+                    kind: JobKind::Update,
+                    target: JobTarget::Id(NovelId(2)),
+                    options: vec!["--force".into()],
+                },
+            ]
+        );
+        assert_eq!(result.duplicates, vec!["3".to_string()]);
+        assert!(result.invalid.is_empty());
+    }
+
+    #[test]
+    fn plan_normalizes_ncodes_and_deduplicates_case_insensitively() {
+        let result = service().plan(&JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["N1234AB".into(), "n1234ab".into(), "n1234ab".into()],
+            options: Vec::new(),
+        });
+        assert_eq!(
+            result.plans,
+            vec![JobPlan {
+                kind: JobKind::Download,
+                target: JobTarget::Ncode("n1234ab".into()),
+                options: Vec::new(),
+            }]
+        );
+        assert_eq!(result.duplicates, vec!["n1234ab".to_string(), "n1234ab".to_string()]);
+    }
+
+    #[test]
+    fn plan_normalizes_urls_and_deduplicates_fragments() {
+        let result = service().plan(&JobRequest {
+            kind: JobKind::Download,
+            targets: vec![
+                " https://EXAMPLE.com/novel/42#chapter-1 ".into(),
+                "https://example.com/novel/42#chapter-2".into(),
+            ],
+            options: Vec::new(),
+        });
+        assert_eq!(
+            result.plans,
+            vec![JobPlan {
+                kind: JobKind::Download,
+                target: JobTarget::Url("https://example.com/novel/42".into()),
+                options: Vec::new(),
+            }]
+        );
+        assert_eq!(
+            result.duplicates,
+            vec!["https://example.com/novel/42#chapter-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn plan_reports_invalid_targets() {
+        let result = service().plan(&JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["1".into(), "not-a-target".into(), "".into()],
+            options: Vec::new(),
+        });
+        assert_eq!(result.plans.len(), 1);
+        assert_eq!(result.invalid, vec!["not-a-target".to_string()]);
+    }
+
+    #[test]
+    fn validate_target_accepts_ids_ncodes_and_urls() {
+        assert_eq!(
+            service().validate_target("42").unwrap(),
+            JobTarget::Id(NovelId(42))
+        );
+        assert_eq!(
+            service().validate_target("N1234AB").unwrap(),
+            JobTarget::Ncode("n1234ab".into())
+        );
+        assert_eq!(
+            service()
+                .validate_target("https://Example.com/work/1#fragment")
+                .unwrap(),
+            JobTarget::Url("https://example.com/work/1".into())
+        );
+        assert_eq!(
+            JobTarget::parse("https://example.com/work/1"),
+            Some(JobTarget::Url("https://example.com/work/1".into()))
+        );
+        assert!(service().validate_target("").is_err());
+        assert!(service().validate_target("n12").is_err());
+        assert!(service().validate_target("file:///tmp/novel").is_err());
+        assert!(service().validate_target("https://user:pass@example.com/novel").is_err());
+    }
+
+    #[test]
+    fn plan_allows_targetless_auto_update() {
+        let result = service().plan(&JobRequest {
+            kind: JobKind::AutoUpdate,
+            targets: Vec::new(),
+            options: Vec::new(),
+        });
+        assert_eq!(
+            result.plans,
+            vec![JobPlan {
+                kind: JobKind::AutoUpdate,
+                target: JobTarget::All,
+                options: Vec::new(),
+            }]
+        );
+        assert!(result.invalid.is_empty());
+        assert!(result.duplicates.is_empty());
+    }
+
+    #[test]
+    fn empty_request_plans_nothing() {
+        let result = service().plan(&JobRequest {
+            kind: JobKind::Backup,
+            targets: Vec::new(),
+            options: Vec::new(),
+        });
+        assert!(result.plans.is_empty());
+        assert!(result.invalid.is_empty());
+        assert!(result.duplicates.is_empty());
+    }
+
+    // --- Phase 8: queue protocol ---
+
+    fn plan(kind: JobKind, target: JobTarget, options: &[&str]) -> JobPlan {
+        JobPlan {
+            kind,
+            target,
+            options: options.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn dedupe_key_is_canonical_and_option_order_independent() {
+        let a = plan(JobKind::Update, JobTarget::Id(NovelId(7)), &["--force", "--verbose"]);
+        let b = plan(JobKind::Update, JobTarget::Id(NovelId(7)), &["--verbose", " --force "]);
+        assert_eq!(a.dedupe_key(), b.dedupe_key());
+        assert_eq!(a.dedupe_key(), "update:7:--force,--verbose");
+        assert_ne!(
+            a.dedupe_key(),
+            plan(JobKind::Download, JobTarget::Id(NovelId(7)), &["--force"]).dedupe_key()
+        );
+        assert_ne!(
+            a.dedupe_key(),
+            plan(JobKind::Update, JobTarget::Id(NovelId(8)), &["--force"]).dedupe_key()
+        );
+        assert_ne!(
+            a.dedupe_key(),
+            plan(JobKind::Update, JobTarget::Ncode("n1234ab".into()), &["--force"]).dedupe_key()
+        );
+        assert_ne!(
+            a.dedupe_key(),
+            plan(
+                JobKind::Update,
+                JobTarget::Url("https://example.com/novel/7".into()),
+                &["--force"],
+            )
+            .dedupe_key()
+        );
+    }
+
+    #[test]
+    fn job_plan_round_trips_through_json() {
+        let job = plan(JobKind::Update, JobTarget::Id(NovelId(42)), &["--force"]);
+        let json = serde_json::to_string(&job).unwrap();
+        let back: JobPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, job);
+        assert!(json.contains("42"), "target id should be inline: {json}");
+
+        let envelope = WorkerJobEnvelope::v2(JobId("job_1".into()));
+        let json = serde_json::to_string(&envelope).unwrap();
+        let back: WorkerJobEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, envelope);
+        assert_eq!(back.version, WORKER_JOB_ENVELOPE_VERSION);
+
+        let url_job = plan(
+            JobKind::Download,
+            JobTarget::Url("https://example.com/novel/42".into()),
+            &[],
+        );
+        let json = serde_json::to_string(&url_job).unwrap();
+        let back: JobPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, url_job);
+    }
+
+    #[test]
+    fn legacy_envelope_decodes_only_single_unambiguous_requests() {
+        let request = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["123".into()],
+            options: vec!["--force".into()],
+        };
+        match decode_legacy_envelope(&request) {
+            LegacyEnvelopeOutcome::Plan(job) => {
+                assert_eq!(job, plan(JobKind::Download, JobTarget::Id(NovelId(123)), &["--force"]));
+            }
+            LegacyEnvelopeOutcome::Reject { reason } => panic!("expected plan, got reject: {reason}"),
+        }
+
+        let request = JobRequest {
+            kind: JobKind::AutoUpdate,
+            targets: Vec::new(),
+            options: Vec::new(),
+        };
+        assert!(matches!(
+            decode_legacy_envelope(&request),
+            LegacyEnvelopeOutcome::Plan(_)
+        ));
+
+        let request = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["1".into(), "2".into()],
+            options: Vec::new(),
+        };
+        assert!(matches!(
+            decode_legacy_envelope(&request),
+            LegacyEnvelopeOutcome::Reject { .. }
+        ));
+
+        let request = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["not-a-target".into()],
+            options: Vec::new(),
+        };
+        assert!(matches!(
+            decode_legacy_envelope(&request),
+            LegacyEnvelopeOutcome::Reject { .. }
+        ));
+
+        let request = JobRequest {
+            kind: JobKind::Backup,
+            targets: Vec::new(),
+            options: Vec::new(),
+        };
+        assert!(matches!(
+            decode_legacy_envelope(&request),
+            LegacyEnvelopeOutcome::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn failure_classification_is_conservative() {
+        use crate::error::NarouError;
+        assert_eq!(
+            classify_failure(&NarouError::Http("timeout".into())),
+            JobFailureClass::Retryable
+        );
+        assert_eq!(
+            classify_failure(&NarouError::SuspendDownload("slow down".into())),
+            JobFailureClass::Retryable
+        );
+        assert_eq!(
+            classify_failure(&NarouError::DownloadBudgetExpired {
+                next_section_index: 4,
+            }),
+            JobFailureClass::Retryable
+        );
+        assert_eq!(
+            classify_failure(&NarouError::CreationCleanupPending),
+            JobFailureClass::Retryable
+        );
+        assert_eq!(
+            classify_failure(&NarouError::NotFound("gone".into())),
+            JobFailureClass::Permanent
+        );
+        assert_eq!(
+            classify_failure(&NarouError::InvalidTarget("bad".into())),
+            JobFailureClass::Permanent
+        );
+        assert_eq!(
+            classify_failure(&NarouError::SiteSetting("no definition".into())),
+            JobFailureClass::Blocked
+        );
+        assert_eq!(
+            classify_failure(&NarouError::Unsupported(
+                "interactive confirmation is not supported".into()
+            )),
+            JobFailureClass::Blocked
+        );
+        assert_eq!(
+            classify_failure(&NarouError::DownloadResumeCorrupt("missing section".into())),
+            JobFailureClass::Blocked
+        );
+    }
+
+    #[test]
+    fn ledger_status_active_terminal_partition() {
+        for status in [
+            JobLedgerStatus::Pending,
+            JobLedgerStatus::Running,
+            JobLedgerStatus::Retryable,
+        ] {
+            assert!(status.is_active());
+            assert!(!status.is_terminal());
+        }
+        for status in [
+            JobLedgerStatus::Succeeded,
+            JobLedgerStatus::Partial,
+            JobLedgerStatus::Blocked,
+            JobLedgerStatus::Permanent,
+        ] {
+            assert!(!status.is_active());
+            assert!(status.is_terminal());
+        }
+    }
+
+    #[test]
+    fn checkpoint_duplicate_generation_never_enqueues_twice() {
+        let start = SchedulerCheckpoint::default();
+        let claimed = match start.begin(7, "2026-08-10T00:00:00Z") {
+            CheckpointClaim::Claimed(checkpoint) => checkpoint,
+            CheckpointClaim::Duplicate => panic!("fresh checkpoint must claim"),
+            CheckpointClaim::Busy => panic!("compatibility begin cannot be busy"),
+        };
+        assert_eq!(claimed.state, CheckpointState::Running);
+        assert_eq!(claimed.generation, 7);
+        assert_eq!(claimed.begin(7, "2026-08-10T00:00:01Z"), CheckpointClaim::Duplicate);
+        let finished = claimed.finish("2026-08-10T00:05:00Z");
+        assert_eq!(finished.begin(7, "2026-08-10T00:06:00Z"), CheckpointClaim::Duplicate);
+        let next = match claimed.begin(8, "2026-08-10T00:30:00Z") {
+            CheckpointClaim::Claimed(checkpoint) => checkpoint,
+            CheckpointClaim::Duplicate => panic!("new generation must claim"),
+            CheckpointClaim::Busy => panic!("compatibility begin cannot be busy"),
+        };
+        assert_eq!(next.generation, 8);
+        assert_eq!(next.cursor, None);
+        assert_eq!(next.last_run, claimed.last_run);
+    }
+
+    #[test]
+    fn planner_lease_blocks_duplicate_probe_and_preserves_cursor_on_reclaim() {
+        let checkpoint = SchedulerCheckpoint::default();
+        let claimed = match checkpoint.begin_with_lease(
+            1,
+            "2026-08-10T00:00:00Z",
+            "planner-a".into(),
+            "2026-08-10T00:02:00Z".into(),
+        ) {
+            CheckpointClaim::Claimed(value) => value,
+            CheckpointClaim::Duplicate | CheckpointClaim::Busy => {
+                panic!("initial planner claim must succeed")
+            }
+        };
+        let advanced = claimed.advance(42);
+        assert_eq!(
+            advanced.begin_with_lease(
+                1,
+                "2026-08-10T00:01:00Z",
+                "planner-b".into(),
+                "2026-08-10T00:03:00Z".into(),
+            ),
+            CheckpointClaim::Busy
+        );
+
+        let reclaimed = match advanced.begin_with_lease(
+            1,
+            "2026-08-10T00:03:00Z",
+            "planner-b".into(),
+            "2026-08-10T00:05:00Z".into(),
+        ) {
+            CheckpointClaim::Claimed(value) => value,
+            CheckpointClaim::Duplicate | CheckpointClaim::Busy => {
+                panic!("expired planner lease must be reclaimable")
+            }
+        };
+        assert_eq!(reclaimed.generation, 1);
+        assert_eq!(reclaimed.cursor, Some(42));
+        assert_eq!(reclaimed.planner_token.as_deref(), Some("planner-b"));
+    }
+
+    #[test]
+    fn checkpoint_cursor_and_finish() {
+        let checkpoint = SchedulerCheckpoint::default();
+        let claimed = match checkpoint.begin(1, "2026-08-10T00:00:00Z") {
+            CheckpointClaim::Claimed(value) => value,
+            CheckpointClaim::Duplicate => unreachable!(),
+            CheckpointClaim::Busy => unreachable!(),
+        };
+        let advanced = claimed.advance(500);
+        assert_eq!(advanced.cursor, Some(500));
+        let finished = advanced.finish("2026-08-10T00:05:00Z");
+        assert_eq!(finished.state, CheckpointState::Done);
+        assert_eq!(finished.cursor, None);
+        assert_eq!(finished.last_run.as_deref(), Some("2026-08-10T00:05:00Z"));
+    }
+
+    #[test]
+    fn request_and_envelope_payload_limits_are_bounded() {
+        use crate::application::job_limits;
+
+        let ok = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["123".into(), "n1234ab".into(), "https://example.com/novel/1".into()],
+            options: vec!["--force".into()],
+        };
+        assert_eq!(validate_request_limits(&ok), None);
+
+        let many_targets = JobRequest {
+            kind: JobKind::Download,
+            targets: (0..job_limits::MAX_TARGETS_PER_REQUEST + 1)
+                .map(|id| id.to_string())
+                .collect(),
+            options: Vec::new(),
+        };
+        assert!(validate_request_limits(&many_targets).is_some());
+
+        let long_target = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["x".repeat(job_limits::MAX_TARGET_CHARS + 1)],
+            options: Vec::new(),
+        };
+        assert!(validate_request_limits(&long_target).is_some());
+
+        let too_many_options = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["1".into()],
+            options: (0..job_limits::MAX_OPTIONS_PER_PLAN + 1)
+                .map(|i| format!("--opt-{i}"))
+                .collect(),
+        };
+        assert!(validate_request_limits(&too_many_options).is_some());
+
+        let long_option = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["1".into()],
+            options: vec!["o".repeat(job_limits::MAX_OPTION_CHARS + 1)],
+        };
+        assert!(validate_request_limits(&long_option).is_some());
+
+        // 上限は「文字数」: 日本語 90 文字 (=270 bytes) は受理、257 文字は拒否。
+        let multibyte_ok = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["あ".repeat(job_limits::MAX_TARGET_CHARS)],
+            options: Vec::new(),
+        };
+        assert_eq!(validate_request_limits(&multibyte_ok), None);
+        let multibyte_ng = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["あ".repeat(job_limits::MAX_TARGET_CHARS + 1)],
+            options: Vec::new(),
+        };
+        let reason = validate_request_limits(&multibyte_ng).unwrap();
+        assert_eq!(
+            reason,
+            format!(
+                "target too long: {} chars (max {})",
+                job_limits::MAX_TARGET_CHARS + 1,
+                job_limits::MAX_TARGET_CHARS
+            )
+        );
+
+        // メッセージは id だけを運ぶ (計画は台帳側)。
+        let envelope = WorkerJobEnvelope::v2(JobId("j1".into()));
+        let size = envelope_bytes(&envelope).unwrap();
+        assert!(size <= job_limits::MAX_ENVELOPE_BYTES);
+    }
+
+    #[test]
+    fn execution_checkpoint_shape_round_trips_and_advances() {
+        let checkpoint = WorkerExecutionCheckpoint::planned(
+            JobId("j1".into()),
+            Some(NovelId(42)),
+        );
+        assert_eq!(checkpoint.phase, ExecutionPhase::Planned);
+        assert_eq!(checkpoint.next_section_index, None);
+
+        let advanced = checkpoint.advance(ExecutionPhase::Fetching, Some(3));
+        assert_eq!(advanced.phase, ExecutionPhase::Fetching);
+        assert_eq!(advanced.next_section_index, Some(3));
+        assert_eq!(advanced.job_id, checkpoint.job_id);
+        assert_eq!(advanced.novel_id, checkpoint.novel_id);
+
+        let json = serde_json::to_string(&advanced).unwrap();
+        let back: WorkerExecutionCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, advanced);
+        assert!(json.contains("fetching"));
+        assert!(json.contains("next_section_index"));
+    }
+
+    #[test]
+    fn serialized_continuation_cannot_replace_later_published_bytes() {
+        use std::sync::Arc;
+        use crate::application::novel_access::NovelWriteGuard;
+        use crate::platform::{AssetStore, ObjectStore, ObjectPrefix, NovelObjectKeys};
+        use crate::platform::mocks::MemoryObjectStore;
+        futures::executor::block_on(async {
+            let backend = Arc::new(MemoryObjectStore::new());
+            let objects: Arc<dyn ObjectStore> = backend.clone();
+            let keys = NovelObjectKeys::new("site", "continued", false).unwrap();
+            let prefix = ObjectPrefix::from(keys.prefix().clone());
+            let key = keys.section("1", "body");
+            let writer = NovelWriteGuard::capture_for(&objects, None, &keys).await.unwrap();
+            writer.write_small(&key, b"job's completed section".to_vec()).await.unwrap();
+            let checkpoint = WorkerExecutionCheckpoint::planned(JobId("continued".into()), Some(NovelId(1)))
+                .with_write_origin(writer.origin()).advance(ExecutionPhase::Fetching, Some(1));
+            let durable = serde_json::to_vec(&checkpoint).unwrap();
+            let gate = objects.access_fence().unwrap();
+            let epoch = gate.close_gate(&prefix, "replacement").await.unwrap();
+            let stage = backend.stage_stream(crate::platform::staging::owned_bytes_stream(b"published replacement".to_vec())).await.unwrap();
+            gate.commit_staged(&prefix, "replacement", epoch, &stage.key, &key).await.unwrap();
+            gate.open_gate(&prefix, "replacement", epoch).await.unwrap();
+
+            let resumed: WorkerExecutionCheckpoint = serde_json::from_slice(&durable).unwrap();
+            let advanced = resumed.advance(ExecutionPhase::Persisting, Some(2));
+            let origin = advanced.write_origin.as_ref().unwrap();
+            assert_eq!(origin, &writer.origin(), "every checkpoint transition retains the same origin");
+            assert!(NovelWriteGuard::resume(objects.clone(), None, origin).await.is_err(), "a durable continuation must reject its superseded epoch before source I/O");
+            assert_eq!(objects.read_small(&key).await.unwrap().unwrap(), b"published replacement");
+        });
+    }
+
+    #[test]
+    fn bounded_auto_update_page_plans_one_job_per_novel() {
+        let page = service().plan_auto_update_page(
+            &[NovelId(1), NovelId(2), NovelId(3)],
+            &["--force".into()],
+            3,
+        );
+        assert!(!page.done);
+        assert_eq!(page.next_cursor, Some(3));
+        assert_eq!(
+            page.plans,
+            vec![
+                plan(JobKind::Update, JobTarget::Id(NovelId(1)), &["--force"]),
+                plan(JobKind::Update, JobTarget::Id(NovelId(2)), &["--force"]),
+                plan(JobKind::Update, JobTarget::Id(NovelId(3)), &["--force"]),
+            ]
+        );
+
+        let page = service().plan_auto_update_page(&[NovelId(9)], &[], 3);
+        assert!(page.done);
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(page.plans.len(), 1);
+
+        let page = service().plan_auto_update_page(&[], &[], 3);
+        assert!(page.done);
+        assert_eq!(page.next_cursor, None);
+        assert!(page.plans.is_empty());
+    }
+
+    #[test]
+    fn bounded_auto_update_page_walks_300_novels_without_resetting_cursor() {
+        let ids: Vec<_> = (1..=300).map(NovelId).collect();
+        let mut after = 0usize;
+        let mut seen = Vec::new();
+
+        for expected_cursor in [100usize, 200, 300] {
+            let start = after;
+            let end = start + 100;
+            let page = service().plan_auto_update_page(
+                &ids[start..end],
+                &[],
+                100,
+            );
+            assert!(!page.done);
+            assert_eq!(page.next_cursor, Some(expected_cursor as i64));
+            seen.extend(page.plans.into_iter().map(|job| match job.target {
+                JobTarget::Id(id) => id.0,
+                _ => panic!("scheduler emitted a non-novel target"),
+            }));
+            after = end;
+        }
+
+        let final_page = service().plan_auto_update_page(&[], &[], 100);
+        assert!(final_page.done);
+        assert_eq!(final_page.next_cursor, None);
+        assert_eq!(seen, ids.iter().map(|id| id.0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn scheduler_checkpoint_keeps_scan_sort_key_across_transitions() {
+        // 既存の JSON (フィールド無し) も読める (`#[serde(default)]`)。
+        let legacy: SchedulerCheckpoint = serde_json::from_str(
+            r#"{"generation":3,"state":"running","cursor":42,"started_at":null,"last_run":null}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.scan_sort_key, None);
+
+        // 実行中世代のリース引き継ぎとカーソル前進はソートキーを保持する。
+        let mut running = legacy.clone();
+        running.scan_sort_key = Some("title".to_string());
+        let CheckpointClaim::Claimed(claimed) = running.begin_with_lease(
+            running.generation,
+            "2026-09-27T00:00:00Z",
+            "token".to_string(),
+            "2026-09-27T00:02:00Z".to_string(),
+        ) else {
+            panic!("running generation should be reclaimable")
+        };
+        assert_eq!(claimed.scan_sort_key.as_deref(), Some("title"));
+        assert_eq!(claimed.advance(7).scan_sort_key.as_deref(), Some("title"));
+        // 完了・新規世代では消える。
+        assert_eq!(claimed.finish("2026-09-27T00:03:00Z").scan_sort_key, None);
+    }
+
+    #[test]
+    fn extract_novel_ids_matches_native_token_rule() {
+        // Same rule the native queue applies (`crate::queue::extract_novel_ids`
+        // delegates here): only bare i64 tokens count.
+        assert!(extract_novel_ids("").is_empty());
+        assert!(extract_novel_ids("tag:modified").is_empty());
+        assert!(extract_novel_ids("*").is_empty());
+        assert!(extract_novel_ids("n1234ab").is_empty());
+        assert!(extract_novel_ids("https://example.com/n/1").is_empty());
+        assert_eq!(extract_novel_ids("12"), HashSet::from([12]));
+        assert_eq!(extract_novel_ids("12\tkindle"), HashSet::from([12]));
+        assert_eq!(extract_novel_ids("1\t2\t3"), HashSet::from([1, 2, 3]));
+        assert_eq!(extract_novel_ids("--force\t12\ttag:modified"), HashSet::from([12]));
+        assert_eq!(extract_novel_ids("12\t\t34\tabc\t1.5"), HashSet::from([12, 34]));
+        assert_eq!(extract_novel_ids("-7"), HashSet::from([-7]));
+    }
+
+    /// The ledger claim statements run verbatim against rusqlite: two
+    /// envelopes for the same novel must never both become `running`, a
+    /// `retryable` row inside its backoff hold is not claimable, and the
+    /// exclusion never blocks unrelated novels or non-novel targets.
+    #[cfg(feature = "native-runtime")]
+    mod claim_sql {
+        use super::super::worker_ledger::{self, Statement, claim_fresh, claim_reclaim};
+        use super::super::{ExecutionPhase, JobId, WorkerExecutionCheckpoint};
+        use crate::platform::NovelId;
+        use rusqlite::Connection;
+
+        fn db() -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE worker_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    options TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    dedupe_key TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    recovery_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    lease_until TEXT,
+                    execution_token TEXT,
+                    checkpoint_json TEXT,
+                    site_key TEXT,
+                    normalized_target TEXT,
+                    admission_waiting INTEGER NOT NULL DEFAULT 0
+                ) STRICT;
+                CREATE TABLE novels (id INTEGER PRIMARY KEY, ncode_fold TEXT, toc_url_fold TEXT NOT NULL);
+                INSERT INTO novels VALUES (42, 'n1234ab', 'https://example.com/n1234ab/');",
+            )
+            .unwrap();
+            conn.execute_batch(include_str!("../../worker_entry/migrations/0018_novel_target_aliases.sql")).unwrap();
+            conn
+        }
+
+        fn insert(conn: &Connection, job_id: &str, target: &str, status: &str, lease: Option<&str>) {
+            conn.execute(
+                "INSERT INTO worker_jobs (job_id, kind, target, normalized_target, status, dedupe_key, created_at, updated_at, lease_until)
+                 VALUES (?, 'update', ?, ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?)",
+                rusqlite::params![job_id, target, target, status, format!("{status}:{job_id}"), lease],
+            )
+            .unwrap();
+        }
+
+        fn status_of(conn: &Connection, job_id: &str) -> String {
+            conn.query_row(
+                "SELECT status FROM worker_jobs WHERE job_id = ?",
+                [job_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+
+        fn apply(conn: &Connection, statement: Statement) -> usize {
+            conn.execute(&statement.sql, rusqlite::params_from_iter(statement.binds.iter())).unwrap()
+        }
+
+        fn waiting(conn: &Connection) -> Vec<String> {
+            let statement = worker_ledger::select_waiting(NOW, 8);
+            conn.prepare(&statement.sql).unwrap()
+                .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| row.get(0))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        }
+
+        const NOW: &str = "2026-01-01T00:10:00Z";
+        const LEASE: &str = "2026-01-01T00:25:00Z";
+
+        #[test]
+        fn same_novel_cannot_run_twice_across_kinds() {
+            let conn = db();
+            // A running update for novel 42 (as produced by `update:42:`).
+            insert(&conn, "j-upd", "42", "running", Some(LEASE));
+            // A pending convert (`convert:42:`) — a different dedupe key and
+            // kind, but the same novel.
+            insert(&conn, "j-conv", "42", "pending", None);
+            // An unrelated pending update for novel 99.
+            insert(&conn, "j-99", "99", "pending", None);
+
+            // The conflicting claim must not flip j-conv to running.
+            let stmt = claim_fresh(NOW, LEASE, "tok-b", "j-conv", "42", None);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0, "conflicting claim must not run");
+            assert_eq!(status_of(&conn, "j-conv"), "pending");
+
+            // The unrelated novel claims normally.
+            let stmt = claim_fresh(NOW, LEASE, "tok-c", "j-99", "99", None);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+            assert_eq!(status_of(&conn, "j-99"), "running");
+        }
+
+        #[test]
+        fn conflicting_reclaim_is_blocked_and_self_row_is_not_a_conflict() {
+            let conn = db();
+            // j-stale is running with an expired lease for novel 7.
+            insert(&conn, "j-stale", "7", "running", Some("2026-01-01T00:01:00Z"));
+            // Another running job holds novel 7? Impossible in practice —
+            // the exclusion made it so — but a *different* novel running
+            // must not block the reclaim.
+            insert(&conn, "j-other", "8", "running", Some(LEASE));
+
+            // Reclaiming j-stale must succeed (its own running row is not a
+            // self-conflict).
+            let stmt = claim_reclaim(NOW, LEASE, "tok-r", "j-stale", "7", None);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1, "expired lease is reclaimable");
+
+            // But a pending job for novel 8 is blocked by j-other.
+            insert(&conn, "j-blocked", "8", "pending", None);
+            let stmt = claim_fresh(NOW, LEASE, "tok-x", "j-blocked", "8", None);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0);
+        }
+
+        #[test]
+        fn backoff_hold_keeps_retryable_unclaimable_until_due() {
+            let conn = db();
+            // record_attempt wrote lease_until = now + backoff.
+            insert(&conn, "j-retry", "42", "retryable", Some("2026-01-01T00:11:00Z"));
+
+            // Before the hold elapses the row is not claimable even though
+            // no conflicting job runs.
+            let stmt = claim_fresh(NOW, LEASE, "tok-e", "j-retry", "42", None);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0, "backoff hold must block the claim");
+            assert_eq!(status_of(&conn, "j-retry"), "retryable");
+
+            // At/after the hold the same row claims normally.
+            let stmt = claim_fresh("2026-01-01T00:11:00Z", LEASE, "tok-f", "j-retry", "42", None);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+
+            // Legacy retryable rows without a hold remain claimable.
+            insert(&conn, "j-legacy", "55", "retryable", None);
+            let stmt = claim_fresh(NOW, LEASE, "tok-g", "j-legacy", "55", None);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+        }
+
+
+        /// The same novel spelled as `42`, `n1234ab`, and its toc URL must
+        /// serialize: a bookmarklet / drag&drop / `/api/download` request
+        /// carries the URL while `update` carries the id, and both write the
+        /// same object keys and the same `.illustration_cache.yaml`.
+        #[test]
+        fn claim_exclusion_covers_cross_spelling_targets_for_the_same_novel() {
+            for running_target in ["42", "n1234ab", "https://example.com/n1234ab/"] {
+                for target in ["42", "N1234AB", "https://example.com/n1234ab/", "99"] {
+                    for reclaim in [false, true] {
+                        let conn = db();
+                        insert(&conn, "running", running_target, "running", Some(LEASE));
+                        let status = if reclaim { "running" } else { "pending" };
+                        insert(&conn, "candidate", target, status, Some("2026-01-01T00:01:00Z"));
+                        let claim = if reclaim { claim_reclaim } else { claim_fresh };
+                        let stmt = claim(NOW, LEASE, "token", "candidate", target, None);
+                        let changed = conn.execute(&stmt.sql,
+                            rusqlite::params_from_iter(stmt.binds.iter())).unwrap();
+                        assert_eq!(changed, i64::from(target == "99") as usize,
+                            "running={running_target}, candidate={target}, reclaim={reclaim}");
+                        assert_eq!(status_of(&conn, "candidate"),
+                            if target == "99" { "running" } else { status });
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn yaml_resolved_aliases_exclude_both_directions_without_rewriting_plans() {
+            let canonical = "https://example.com/n1234ab/";
+            let alias = "https://alias.example/book/1234";
+            for (owner_target, owner_key, owner_kind, candidate_target, candidate_key, candidate_kind) in [
+                (alias, canonical, "download", "42", "42", "convert"),
+                ("42", "42", "convert", alias, canonical, "download"),
+            ] {
+                for reclaim in [false, true] {
+                    let conn = db();
+                    insert(&conn, "owner", owner_target, "pending", None);
+                    conn.execute("UPDATE worker_jobs SET kind = ? WHERE job_id = 'owner'", [owner_kind]).unwrap();
+                    let owner_site = (owner_kind == "download").then_some("example.com");
+                    let candidate_site = (candidate_kind == "download").then_some("example.com");
+                    assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", owner_key, owner_site)), 1);
+                    let state = if reclaim { "running" } else { "pending" };
+                    insert(&conn, "candidate", candidate_target, state, Some("2026-01-01T00:01:00Z"));
+                    conn.execute("UPDATE worker_jobs SET kind = ? WHERE job_id = 'candidate'", [candidate_kind]).unwrap();
+                    let claim = if reclaim { claim_reclaim } else { claim_fresh };
+                    assert_eq!(apply(&conn, claim(NOW, LEASE, "candidate-token", "candidate", candidate_key, candidate_site)), 0);
+                    apply(&conn, worker_ledger::park_admission(NOW, "candidate", candidate_key, candidate_site));
+                    assert!(waiting(&conn).is_empty());
+                    let original: String = conn.query_row("SELECT target FROM worker_jobs WHERE job_id = 'owner'", [], |row| row.get(0)).unwrap();
+                    assert_eq!(original, owner_target);
+                    conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'owner'", []).unwrap();
+                    assert_eq!(waiting(&conn), vec!["candidate"]);
+                    assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "candidate-token", "candidate", candidate_key, candidate_site)), 1);
+                    let original: String = conn.query_row("SELECT target FROM worker_jobs WHERE job_id = 'candidate'", [], |row| row.get(0)).unwrap();
+                    assert_eq!(original, candidate_target);
+                }
+            }
+        }
+
+        #[test]
+        fn canonical_target_exclusion_survives_novel_registration_during_download() {
+            let conn = db();
+            let canonical = "https://example.com/new/";
+            insert(&conn, "download", "https://alias.example/new/", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "download-token", "download", canonical, Some("example.com"))), 1);
+            conn.execute("INSERT INTO novels VALUES (99, 'new', ?)", [canonical]).unwrap();
+            insert(&conn, "convert", "99", "pending", None);
+            conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = 'convert'", []).unwrap();
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "99", None)), 0);
+            apply(&conn, worker_ledger::park_admission(NOW, "convert", "99", None));
+            assert!(waiting(&conn).is_empty());
+            conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'download'", []).unwrap();
+            assert_eq!(waiting(&conn), vec!["convert"]);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "99", None)), 1);
+        }
+
+        #[test]
+        fn legacy_owner_without_resolved_identity_drains_before_new_conversion() {
+            let conn = db();
+            insert(&conn, "legacy", "https://alias.example/unknown/", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET normalized_target = NULL WHERE job_id = 'legacy'", []).unwrap();
+            insert(&conn, "convert", "99", "pending", None);
+            conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = 'convert'", []).unwrap();
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "99", None)), 0);
+            apply(&conn, worker_ledger::park_admission(NOW, "convert", "99", None));
+            assert!(waiting(&conn).is_empty());
+            conn.execute("UPDATE worker_jobs SET status = 'succeeded', lease_until = NULL WHERE job_id = 'legacy'", []).unwrap();
+            assert_eq!(waiting(&conn), vec!["convert"]);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "99", None)), 1);
+        }
+
+        #[test]
+        fn unregistered_urls_exclude_identical_targets_but_not_other_novels() {
+            let conn = db();
+            insert(&conn, "new", "https://example.com/new/", "running", Some(LEASE));
+            for (job_id, target, expected) in [
+                ("duplicate", "https://example.com/new/", 0),
+                ("unrelated", "https://example.com/other/", 1),
+            ] {
+                insert(&conn, job_id, target, "pending", None);
+                let stmt = claim_fresh(NOW, LEASE, "token", job_id, target, None);
+                assert_eq!(conn.execute(&stmt.sql,
+                    rusqlite::params_from_iter(stmt.binds.iter())).unwrap(), expected);
+            }
+        }
+
+        #[test]
+        fn site_admission_serializes_acquisitions_without_blocking_other_sites_or_conversion() {
+            for reclaim in [false, true] {
+                let conn = db();
+                insert(&conn, "owner", "42", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", "42", Some("shared.example"))), 1);
+                let state = if reclaim { "running" } else { "pending" };
+                insert(&conn, "alias", "https://alias.example/new/", state, Some("2026-01-01T00:01:00Z"));
+                conn.execute("UPDATE worker_jobs SET site_key = 'shared.example' WHERE job_id = 'alias'", []).unwrap();
+                let claim = if reclaim { claim_reclaim } else { claim_fresh };
+                assert_eq!(apply(&conn, claim(NOW, LEASE, "alias-token", "alias", "https://alias.example/new/", Some("shared.example"))), 0);
+                insert(&conn, "other-site", "https://other.example/book/", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "other-token", "other-site", "https://other.example/book/", Some("other.example"))), 1);
+                insert(&conn, "convert-other", "99", "pending", None);
+                conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = 'convert-other'", []).unwrap();
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert-other", "99", None)), 1);
+                insert(&conn, "convert-same", "n1234ab", "pending", None);
+                conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = 'convert-same'", []).unwrap();
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "same-token", "convert-same", "n1234ab", None)), 0);
+            }
+        }
+
+        #[test]
+        fn admission_waiting_preserves_attempts_checkpoint_and_lost_dispatch_recovery() {
+            let conn = db();
+            insert(&conn, "owner", "42", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", "42", Some("shared.example"))), 1);
+            insert(&conn, "waiting", "99", "pending", None);
+            let checkpoint = super::super::WorkerExecutionCheckpoint::planned(
+                super::super::JobId("waiting".into()), Some(crate::platform::NovelId(99)),
+            ).advance(super::super::ExecutionPhase::Fetching, Some(19));
+            let encoded = serde_json::to_string(&checkpoint).unwrap();
+            conn.execute("UPDATE worker_jobs SET attempts = 2, checkpoint_json = ? WHERE job_id = 'waiting'", [&encoded]).unwrap();
+            for _ in 0..5 {
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "waiting-token", "waiting", "99", Some("shared.example"))), 0);
+                apply(&conn, worker_ledger::park_admission(NOW, "waiting", "99", Some("shared.example")));
+                let saved: (i64, String, String) = conn.query_row(
+                    "SELECT attempts, checkpoint_json, status FROM worker_jobs WHERE job_id = 'waiting'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(saved, (2, encoded.clone(), "pending".into()));
+                assert!(waiting(&conn).is_empty());
+            }
+            conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'owner'", []).unwrap();
+            assert_eq!(waiting(&conn), vec!["waiting"]);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "waiting")), 1);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "waiting")), 0);
+            assert!(waiting(&conn).is_empty());
+            // Simulate a lost Queue send after the durable waker reservation.
+            let recovered_at = "2026-01-01T00:14:00Z";
+            assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(recovered_at, "waiting", "2026-01-01T00:12:00Z")), 1);
+            assert_eq!(apply(&conn, claim_fresh(recovered_at, LEASE, "resumed", "waiting", "99", Some("shared.example"))), 1);
+            let saved: (i64, String) = conn.query_row(
+                "SELECT attempts, checkpoint_json FROM worker_jobs WHERE job_id = 'waiting'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(saved, (2, encoded));
+        }
+
+        #[test]
+        fn waker_selects_one_acquisition_per_site_and_respects_cross_lane_novels() {
+            let conn = db();
+            insert(&conn, "owner", "42", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", "42", Some("a.example"))), 1);
+            for (id, target, site) in [
+                ("a1", "7", Some("a.example")), ("a2", "8", Some("a.example")),
+                ("b1", "9", Some("b.example")), ("b2", "10", Some("b.example")),
+                ("c1", "n1234ab", None), ("c2", "99", None),
+            ] {
+                insert(&conn, id, target, "pending", None);
+                if site.is_none() {
+                    conn.execute("UPDATE worker_jobs SET kind = 'convert' WHERE job_id = ?", [id]).unwrap();
+                }
+                assert_eq!(apply(&conn, worker_ledger::park_admission(NOW, id, target, site)), 1);
+            }
+            assert_eq!(waiting(&conn), vec!["b1", "c2"]);
+            conn.execute("UPDATE worker_jobs SET status = 'succeeded', execution_token = NULL, lease_until = NULL WHERE job_id = 'owner'", []).unwrap();
+            assert_eq!(waiting(&conn), vec!["a1", "b1", "c1", "c2"]);
+        }
+
+        #[test]
+        fn waiting_dispatch_does_not_rescan_terminal_history_for_every_candidate() {
+            let conn = db();
+            conn.execute_batch(
+                "CREATE INDEX worker_jobs_status_idx ON worker_jobs(status, created_at);
+                 CREATE INDEX worker_jobs_admission_wait_idx ON worker_jobs(site_key, created_at, job_id)
+                     WHERE admission_waiting = 1;
+                 CREATE INDEX worker_jobs_site_owner_idx ON worker_jobs(site_key, kind, status)
+                     WHERE status = 'running' OR (status = 'permanent' AND execution_token IS NOT NULL);
+                 CREATE INDEX worker_jobs_execution_owner_idx ON worker_jobs(status, execution_token, lease_until);
+                 WITH RECURSIVE ids(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<30000)
+                 INSERT INTO worker_jobs(job_id,kind,target,status,dedupe_key,created_at,updated_at)
+                 SELECT 'history-'||i,'update','42','permanent','history-'||i,'old','old' FROM ids;
+                 WITH RECURSIVE ids(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<1000)
+                 INSERT INTO worker_jobs(job_id,kind,target,normalized_target,status,dedupe_key,
+                     created_at,updated_at,site_key,admission_waiting)
+                 SELECT printf('waiting-%04d',i),'update',CAST(i AS TEXT),CAST(i AS TEXT),
+                     'pending','waiting-'||i,'now','now','shared.example',1 FROM ids;",
+            ).unwrap();
+            let query = worker_ledger::select_waiting(NOW, 8);
+            let mut statement = conn.prepare(&query.sql).unwrap();
+            let jobs = statement.query_map(rusqlite::params_from_iter(query.binds.iter()),
+                |row| row.get::<_, String>(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(jobs, vec!["waiting-0001"]);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 100_000, "waiting dispatch used {steps} VM steps");
+        }
+
+        #[test]
+        fn waiting_url_targets_resolve_once_instead_of_scanning_novels_per_candidate() {
+            let conn = db();
+            conn.execute_batch(
+                "CREATE INDEX worker_jobs_status_idx ON worker_jobs(status, created_at);
+                 CREATE INDEX worker_jobs_execution_owner_idx ON worker_jobs(status, execution_token, lease_until);
+                 WITH RECURSIVE ids(i) AS (VALUES(1000) UNION ALL SELECT i+1 FROM ids WHERE i<2999)
+                 INSERT INTO novels SELECT i,NULL,'https://fixture.test/novels/'||i||'/' FROM ids;
+                 INSERT INTO worker_jobs(job_id,kind,target,normalized_target,status,dedupe_key,
+                     created_at,updated_at,site_key,admission_waiting)
+                 SELECT printf('waiting-%04d',id-1000),'update',toc_url_fold,toc_url_fold,
+                     'pending','waiting-'||id,'now','now','fixture.test',1 FROM novels WHERE id>=1000;",
+            ).unwrap();
+            insert(&conn, "owner", "https://fixture.test/novels/1000/", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET kind='convert' WHERE job_id='owner'", []).unwrap();
+            let query = worker_ledger::select_waiting(NOW, 8);
+            let mut statement = conn.prepare(&query.sql).unwrap();
+            let jobs = statement.query_map(rusqlite::params_from_iter(query.binds.iter()),
+                |row| row.get::<_, String>(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(jobs, vec!["waiting-0001"]);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 2_000_000, "URL waiting dispatch used {steps} VM steps");
+        }
+
+        #[test]
+        fn waiting_alias_lookup_preserves_lowest_id_and_arbitrary_url_suffixes() {
+            let conn = db();
+            conn.execute_batch(
+                "INSERT INTO novels VALUES
+                 (6,'https://legacy.test/a/shared///','https://other.test/six/'),
+                 (7,'shared','https://legacy.test/a/shared///'),
+                 (8,'shared','https://legacy.test/other/'),
+                 (9,'https://legacy.test/a/shared///','https://other.test/nine/');",
+            ).unwrap();
+            insert(&conn, "owner", "7", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET kind='convert' WHERE job_id='owner'", []).unwrap();
+            for (id, target) in [
+                ("a-code","SHARED"), ("b-suffix","a/shared"), ("c-id","7"),
+                ("d-other-id","8"), ("e-collision-id","9"),
+                ("f-trimmed","https://legacy.test/a/shared"),
+                ("g-noncanonical-num","0007"), ("h-missing","https://missing.test/book/"),
+                ("i-exact-collision","https://legacy.test/a/shared///"),
+            ] {
+                insert(&conn, id, target, "pending", None);
+                conn.execute("UPDATE worker_jobs SET kind='convert' WHERE job_id=?", [id]).unwrap();
+                apply(&conn, worker_ledger::park_admission(NOW, id, target, None));
+            }
+            assert_eq!(waiting(&conn), vec!["d-other-id","e-collision-id","f-trimmed","g-noncanonical-num","h-missing","i-exact-collision"]);
+            conn.execute("UPDATE worker_jobs SET target=?1,normalized_target=?1 WHERE job_id='owner'", ["https://legacy.test/a/shared///"]).unwrap();
+            assert_eq!(waiting(&conn), vec!["a-code","b-suffix","c-id","d-other-id","e-collision-id","f-trimmed","g-noncanonical-num","h-missing"]);
+        }
+
+        #[test]
+        fn admission_alias_probes_do_not_scan_unrelated_novels() {
+            let conn = db();
+            conn.execute_batch(
+                "WITH RECURSIVE ids(i) AS (VALUES(1000) UNION ALL SELECT i+1 FROM ids WHERE i<30999)
+                 INSERT INTO novels SELECT i,NULL,'https://fixture.test/novels/'||i||'/' FROM ids;"
+            ).unwrap();
+            insert(&conn, "owner", "https://example.com/n1234ab/", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET kind='convert' WHERE job_id='owner'", []).unwrap();
+            insert(&conn, "next", "https://new.test/book/", "pending", None);
+            apply(&conn, worker_ledger::park_admission(NOW, "next", "https://new.test/book/", Some("new.test")));
+            let query = worker_ledger::select_waiting(NOW, 8);
+            let mut statement = conn.prepare(&query.sql).unwrap();
+            let jobs = statement.query_map(rusqlite::params_from_iter(query.binds.iter()),
+                |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            assert_eq!(jobs, vec!["next"]);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 1000, "waiting alias probes used {steps} VM steps");
+
+            let claim = claim_fresh(NOW, LEASE, "next-token", "next", "https://new.test/book/", None);
+            let mut statement = conn.prepare(&claim.sql).unwrap();
+            assert_eq!(statement.execute(rusqlite::params_from_iter(claim.binds.iter())).unwrap(), 1);
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(steps < 1000, "claim alias probes used {steps} VM steps");
+        }
+
+        #[test]
+        fn cancellation_drains_hold_site_and_novel_but_retry_backoff_does_not() {
+            for (status, lease, owns) in [
+                ("running", LEASE, true),
+                ("permanent", LEASE, true),
+                ("permanent", "2026-01-01T00:01:00Z", false),
+                ("retryable", LEASE, false),
+            ] {
+                let conn = db();
+                insert(&conn, "owner", "42", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "owner-token", "owner", "42", Some("shared.example"))), 1);
+                conn.execute("UPDATE worker_jobs SET status = ?, lease_until = ? WHERE job_id = 'owner'", [status, lease]).unwrap();
+                insert(&conn, "next", "99", "pending", None);
+                insert(&conn, "convert", "n1234ab", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "next-token", "next", "99", Some("shared.example"))), usize::from(!owns));
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "convert-token", "convert", "n1234ab", None)), usize::from(!owns));
+            }
+        }
+
+        #[test]
+        fn expired_unscoped_owner_is_retired_without_losing_resume_data() {
+            let conn = db();
+            insert(&conn, "old", "42", "running", Some("2026-01-01T00:01:00Z"));
+            conn.execute("UPDATE worker_jobs SET execution_token = 'old-token', checkpoint_json = 'saved', attempts = 2 WHERE job_id = 'old'", []).unwrap();
+            insert(&conn, "new", "99", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "new-token", "new", "99", Some("other.example"))), 1);
+            assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(NOW, "old", "2026-01-01T00:08:00Z")), 1);
+            let saved: (String, i64, String, Option<String>) = conn.query_row(
+                "SELECT status, attempts, checkpoint_json, execution_token FROM worker_jobs WHERE job_id = 'old'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(saved, ("pending".into(), 2, "saved".into(), None));
+        }
+
+        #[test]
+        fn repeated_budget_yields_keep_failure_count_and_fence_old_tokens() {
+            let conn = db();
+            insert(&conn, "budget", "42", "pending", None);
+            conn.execute("UPDATE worker_jobs SET attempts = 2 WHERE job_id = 'budget'", []).unwrap();
+            let mut checkpoint = super::super::WorkerExecutionCheckpoint::planned(
+                super::super::JobId("budget".into()), Some(crate::platform::NovelId(42)),
+            );
+            for index in [19, 59, 86, 201] {
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "current-token", "budget", "42", Some("shared.example"))), 1);
+                checkpoint = checkpoint.advance(super::super::ExecutionPhase::Fetching, Some(index));
+                let encoded = serde_json::to_string(&checkpoint).unwrap();
+                assert_eq!(apply(&conn, worker_ledger::yield_execution(NOW, "budget", "stale-token", &encoded)), 0);
+                assert_eq!(status_of(&conn, "budget"), "running");
+                assert_eq!(apply(&conn, worker_ledger::yield_execution(NOW, "budget", "current-token", &encoded)), 1);
+                let saved: (String, i64, String, Option<String>, Option<String>) = conn.query_row(
+                    "SELECT status, attempts, checkpoint_json, execution_token, lease_until FROM worker_jobs WHERE job_id = 'budget'",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                ).unwrap();
+                assert_eq!(saved, ("pending".into(), 2, encoded, None, None));
+            }
+        }
+
+        fn checkpoint_json(job_id: &str, novel_id: Option<i64>, phase: ExecutionPhase, cursor: Option<u64>) -> String {
+            serde_json::to_string(
+                &WorkerExecutionCheckpoint::planned(JobId(job_id.into()), novel_id.map(NovelId))
+                    .advance(phase, cursor),
+            ).unwrap()
+        }
+
+        fn recovery_checkpoint(conn: &Connection, job_id: &str) -> (u32, Option<String>) {
+            conn.query_row(
+                "SELECT recovery_attempts, checkpoint_json FROM worker_jobs WHERE job_id = ?",
+                [job_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        }
+
+        #[test]
+        fn creation_checkpoint_binds_origin_and_reservation_atomically_before_progress() {
+            let conn = db();
+            insert(&conn, "creation", "https://example.test/new/", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "creation", "https://example.test/new/", None)), 1);
+            let planned = checkpoint_json("creation", None, ExecutionPhase::Planned, None);
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &planned)), 1);
+            conn.execute("UPDATE worker_jobs SET recovery_attempts=2 WHERE job_id='creation'", []).unwrap();
+            let mut owned: serde_json::Value = serde_json::from_str(&planned).unwrap();
+            owned["creation_reservation"] = serde_json::json!([43,17]);
+            let early = serde_json::to_string(&owned).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &early)), 1);
+            assert_eq!(recovery_checkpoint(&conn, "creation"), (2, Some(early.clone())));
+            let mut unsafe_cursor = owned.clone();
+            unsafe_cursor["phase"] = serde_json::json!("fetching");
+            unsafe_cursor["next_section_index"] = serde_json::json!(0);
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &serde_json::to_string(&unsafe_cursor).unwrap())), 0, "a numeric-only claim cannot authorize even cursor zero before its prefix is known");
+            owned["write_origin"] = serde_json::json!({"prefix":"novels/example/new", "epoch":7});
+            let original = serde_json::to_string(&owned).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "stale-token", &original)), 0);
+            assert_eq!(recovery_checkpoint(&conn, "creation"), (2, Some(early)));
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &original)), 1);
+            assert_eq!(recovery_checkpoint(&conn, "creation"), (2, Some(original.clone())), "claim ownership is durable without laundering a new recovery budget");
+            for (field, value) in [
+                ("creation_reservation", serde_json::json!([44,17])),
+                ("creation_reservation", serde_json::json!([43,18])),
+                ("creation_reservation", serde_json::Value::Null),
+                ("write_origin", serde_json::json!({"prefix":"novels/example/new", "epoch":8})),
+                ("write_origin", serde_json::Value::Null),
+            ] {
+                let mut changed = owned.clone();
+                changed[field] = value;
+                changed["phase"] = serde_json::json!("fetching");
+                changed["next_section_index"] = serde_json::json!(100);
+                let encoded = serde_json::to_string(&changed).unwrap();
+                assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "creation", "token", &encoded)), 0);
+                assert_eq!(recovery_checkpoint(&conn, "creation"), (2, Some(original.clone())));
+            }
+            conn.execute("UPDATE worker_jobs SET recovery_attempts=3,lease_until=? WHERE job_id='creation'", [NOW]).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::finalize_stuck("delivery lost", NOW, "creation", NOW, 0)), 1);
+            assert_eq!(status_of(&conn, "creation"), "permanent");
+            assert_eq!(recovery_checkpoint(&conn, "creation"), (3, Some(original)), "terminal recovery must retain the exact claim proof until release succeeds");
+            let token: Option<String> = conn.query_row("SELECT execution_token FROM worker_jobs WHERE job_id='creation'", [], |row| row.get(0)).unwrap();
+            assert!(token.is_none());
+        }
+
+        #[test]
+        fn corrupt_creation_resume_restarts_only_under_the_same_origin_and_generation() {
+            let conn = db();
+            insert(&conn, "restart", "https://example.test/new/", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "restart", "https://example.test/new/", None)), 1);
+            let mut saved: serde_json::Value = serde_json::from_str(&checkpoint_json("restart", None, ExecutionPhase::Fetching, Some(200))).unwrap();
+            saved["write_origin"] = serde_json::json!({"prefix":"novels/example/new", "epoch":7});
+            saved["creation_reservation"] = serde_json::json!([43,17]);
+            let original = serde_json::to_string(&saved).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "restart", "token", &original)), 1);
+            conn.execute("UPDATE worker_jobs SET recovery_attempts=2 WHERE job_id='restart'", []).unwrap();
+            saved["next_section_index"] = serde_json::json!(0);
+            let restarted = serde_json::to_string(&saved).unwrap();
+            assert_eq!(apply(&conn, worker_ledger::restart_checkpoint(NOW, "restart", "stale-token", &restarted)), 0);
+            let mut foreign = saved.clone();
+            foreign["creation_reservation"] = serde_json::json!([43,18]);
+            assert_eq!(apply(&conn, worker_ledger::restart_checkpoint(NOW, "restart", "token", &serde_json::to_string(&foreign).unwrap())), 0);
+            assert_eq!(recovery_checkpoint(&conn, "restart"), (2, Some(original)));
+            assert_eq!(apply(&conn, worker_ledger::restart_checkpoint(NOW, "restart", "token", &restarted)), 1);
+            assert_eq!(recovery_checkpoint(&conn, "restart"), (2, Some(restarted.clone())));
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "restart", "token", &restarted)), 1);
+            assert_eq!(recovery_checkpoint(&conn, "restart"), (2, Some(restarted)));
+        }
+
+        fn stuck(conn: &Connection, before: &str) -> Vec<String> {
+            let statement = worker_ledger::select_stuck(before, 50);
+            conn.prepare(&statement.sql).unwrap()
+                .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| row.get(0))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        }
+
+        #[test]
+        fn checkpoint_replay_keeps_high_watermark_until_real_progress() {
+            for release in [false, true] {
+                let publish = if release { worker_ledger::yield_execution } else { worker_ledger::save_checkpoint };
+                let conn = db();
+                insert(&conn, "replay", "42", "pending", None);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "replay", "42", None)), 1);
+                let watermark = checkpoint_json("replay", Some(42), ExecutionPhase::Fetching, Some(200));
+                assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "replay", "token", &watermark)), 1);
+                conn.execute("UPDATE worker_jobs SET attempts = 2, recovery_attempts = 2 WHERE job_id = 'replay'", []).unwrap();
+                for cursor in [100, 200, 0, 199, 200, 201] {
+                    let encoded = checkpoint_json("replay", Some(42), ExecutionPhase::Fetching, Some(cursor));
+                    assert_eq!(apply(&conn, publish(NOW, "replay", "stale-token", &encoded)), 0);
+                    assert_eq!(recovery_checkpoint(&conn, "replay"), (2, Some(watermark.clone())));
+                    assert_eq!(apply(&conn, publish(NOW, "replay", "token", &encoded)), 1);
+                    let expected = if cursor > 200 { (0, Some(encoded)) } else { (2, Some(watermark.clone())) };
+                    assert_eq!(recovery_checkpoint(&conn, "replay"), expected);
+                    let ownership: (i64, Option<String>, Option<String>) = conn.query_row(
+                        "SELECT attempts, execution_token, lease_until FROM worker_jobs WHERE job_id = 'replay'",
+                        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    ).unwrap();
+                    if release {
+                        assert_eq!(status_of(&conn, "replay"), "pending");
+                        assert_eq!(ownership, (2, None, None));
+                        assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "replay", "42", None)), 1);
+                    } else {
+                        assert_eq!(status_of(&conn, "replay"), "running");
+                        assert_eq!(ownership, (2, Some("token".into()), Some(LEASE.into())));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn checkpoint_identity_shape_and_phase_changes_do_not_launder_recovery() {
+            for release in [false, true] {
+                let publish = if release { worker_ledger::yield_execution } else { worker_ledger::save_checkpoint };
+                let conn = db();
+                insert(&conn, "progress", "42", "pending", None);
+                conn.execute("UPDATE worker_jobs SET recovery_attempts = 2", []).unwrap();
+                let planned = checkpoint_json("progress", None, ExecutionPhase::Planned, None);
+                let unresolved = checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(200));
+                let resolved = checkpoint_json("progress", Some(42), ExecutionPhase::Fetching, Some(201));
+                let persisted = checkpoint_json("progress", Some(42), ExecutionPhase::Persisting, Some(202));
+                let finished = checkpoint_json("progress", Some(42), ExecutionPhase::Finished, None);
+                let mut metadata: serde_json::Value = serde_json::from_str(&unresolved).unwrap();
+                metadata["novel_id"] = serde_json::json!(42);
+                metadata["phase"] = serde_json::json!("persisting");
+                metadata["annotation"] = serde_json::json!("changed without new durable sections");
+                let malformed_cursor = r#"{"job_id":"progress","novel_id":null,"phase":"fetching","next_section_index":"300"}"#;
+                let unknown_shape = r#"{"job_id":"progress","novel_id":null,"phase":"other","next_section_index":300}"#;
+                let cases = [
+                    (planned.clone(), false, true, planned.clone()),
+                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(0)), false, true, checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(0))),
+                    (unresolved.clone(), true, true, unresolved.clone()),
+                    (serde_json::to_string_pretty(&metadata).unwrap(), false, true, unresolved.clone()),
+                    (checkpoint_json("other-generation", None, ExecutionPhase::Fetching, Some(300)), false, false, unresolved.clone()),
+                    (malformed_cursor.into(), false, false, unresolved.clone()),
+                    (unknown_shape.into(), false, false, unresolved.clone()),
+                    (planned, false, true, unresolved),
+                    (resolved.clone(), true, true, resolved.clone()),
+                    (checkpoint_json("progress", None, ExecutionPhase::Fetching, Some(300)), false, false, resolved.clone()),
+                    (checkpoint_json("progress", Some(99), ExecutionPhase::Fetching, Some(300)), false, false, resolved),
+                    (persisted.clone(), true, true, persisted),
+                    (finished.clone(), true, true, finished.clone()),
+                    (checkpoint_json("progress", Some(42), ExecutionPhase::Fetching, Some(300)), false, false, finished.clone()),
+                    (finished.clone(), false, false, finished),
+                ];
+                for (encoded, advances, accepted, expected) in cases {
+                    if status_of(&conn, "progress") == "pending" {
+                        assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "progress", "42", None)), 1);
+                    }
+                    conn.execute("UPDATE worker_jobs SET recovery_attempts = 2", []).unwrap();
+                    assert_eq!(apply(&conn, publish(NOW, "progress", "token", &encoded)), usize::from(accepted));
+                    assert_eq!(recovery_checkpoint(&conn, "progress"),
+                        (if advances { 0 } else { 2 }, Some(expected)), "release={release}, checkpoint={encoded}");
+                    if !accepted { assert_eq!(status_of(&conn, "progress"), "running", "invalid ownership must not release the actual token"); }
+                }
+            }
+        }
+
+        #[test]
+        fn repeated_crashes_after_replay_exhaust_recovery_and_release_family() {
+            let conn = db();
+            let expired = "2026-01-01T00:01:00Z";
+            insert(&conn, "crash", "42", "pending", None);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+            let watermark = checkpoint_json("crash", Some(42), ExecutionPhase::Fetching, Some(200));
+            assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "crash", "token", &watermark)), 1);
+            insert(&conn, "successor", "99", "pending", None);
+            assert_eq!(apply(&conn, worker_ledger::park_admission(NOW, "successor", "99", Some("shared.example"))), 1);
+            for recovery in 0..=worker_ledger::MAX_RECOVERY_ATTEMPTS {
+                assert!(waiting(&conn).is_empty(), "the live owner still excludes its family");
+                // A fresh WorkerBudget replays both periodic boundaries before
+                // crashing at the same durable section, even after a budget yield.
+                for cursor in [100, 200] {
+                    let replay = checkpoint_json("crash", Some(42), ExecutionPhase::Fetching, Some(cursor));
+                    assert_eq!(apply(&conn, worker_ledger::save_checkpoint(NOW, "crash", "token", &replay)), 1);
+                    assert_eq!(recovery_checkpoint(&conn, "crash"), (recovery, Some(watermark.clone())));
+                }
+                let replay = checkpoint_json("crash", Some(42), ExecutionPhase::Fetching, Some(100));
+                assert_eq!(apply(&conn, worker_ledger::yield_execution(NOW, "crash", "token", &replay)), 1);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+                assert_eq!(recovery_checkpoint(&conn, "crash"), (recovery, Some(watermark.clone())));
+                conn.execute("UPDATE worker_jobs SET lease_until = ? WHERE job_id = 'crash'", [expired]).unwrap();
+                let exhausted = recovery == worker_ledger::MAX_RECOVERY_ATTEMPTS;
+                assert_eq!(apply(&conn, worker_ledger::finalize_stuck("crashed", NOW, "crash", NOW, 0)), usize::from(exhausted));
+                if exhausted { break; }
+                if recovery % 2 == 0 {
+                    assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(NOW, "crash", NOW)), 1);
+                    assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+                } else {
+                    assert_eq!(apply(&conn, claim_reclaim(NOW, LEASE, "token", "crash", "42", Some("shared.example"))), 1);
+                }
+                assert_eq!(recovery_checkpoint(&conn, "crash"), (recovery + 1, Some(watermark.clone())));
+            }
+            assert_eq!(status_of(&conn, "crash"), "permanent");
+            assert_eq!(recovery_checkpoint(&conn, "crash"), (worker_ledger::MAX_RECOVERY_ATTEMPTS, None));
+            let attempts: i64 = conn.query_row("SELECT attempts FROM worker_jobs WHERE job_id = 'crash'", [], |row| row.get(0)).unwrap();
+            assert_eq!(attempts, 0);
+            assert_eq!(waiting(&conn), vec!["successor"]);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "successor")), 1);
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "successor-token", "successor", "99", Some("shared.example"))), 1);
+            assert_eq!(recovery_checkpoint(&conn, "successor"), (0, None));
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "late-token", "crash", "42", Some("shared.example"))), 0);
+        }
+
+        #[test]
+        fn capacity_redispatch_replaces_expired_hold_with_dispatch_grace() {
+            for status in ["pending", "retryable"] {
+                let conn = db();
+                insert(&conn, "capacity", "42", status, Some("2026-01-01T00:01:00Z"));
+                conn.execute("UPDATE worker_jobs SET attempts = 2, recovery_attempts = 3", []).unwrap();
+                assert_eq!(apply(&conn, worker_ledger::park_capacity(NOW, "capacity")), 1);
+                assert_eq!(waiting(&conn), vec!["capacity"]);
+                assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "capacity")), 1);
+                assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "capacity")), 0);
+                let state: (i64, i64, Option<String>, String) = conn.query_row(
+                    "SELECT attempts, recovery_attempts, lease_until, updated_at FROM worker_jobs",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                ).unwrap();
+                assert_eq!(state, (2, 3, None, NOW.into()));
+                // wake_waiting_jobs precedes reaping in the same cron tick.
+                let cutoff = "2026-01-01T00:08:00Z";
+                assert!(stuck(&conn, cutoff).is_empty());
+                assert_eq!(apply(&conn, worker_ledger::mark_reenqueue(NOW, "capacity", cutoff)), 0);
+                assert_eq!(apply(&conn, worker_ledger::finalize_stuck("lost", NOW, "capacity", cutoff, 0)), 0);
+                assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "token", "capacity", "42", None)), 1);
+                assert_eq!(recovery_checkpoint(&conn, "capacity"), (3, None));
+            }
+        }
+
+        #[test]
+        fn capacity_deferral_preserves_retry_budget_backoff_and_live_owners() {
+            let conn = db();
+            insert(&conn, "pending", "42", "pending", None);
+            insert(&conn, "backoff", "99", "retryable", Some(LEASE));
+            insert(&conn, "owner", "8", "running", Some(LEASE));
+            conn.execute("UPDATE worker_jobs SET attempts=2,recovery_attempts=1", []).unwrap();
+            for id in ["pending", "backoff"] {
+                assert_eq!(apply(&conn, worker_ledger::park_capacity(NOW, id)), 1);
+                let state: (i64, i64, i64) = conn.query_row(
+                    "SELECT attempts,recovery_attempts,admission_waiting FROM worker_jobs WHERE job_id=?", [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!(state, (2, 1, 1));
+            }
+            assert_eq!(apply(&conn, worker_ledger::park_capacity(NOW, "owner")), 0);
+            let lease: String = conn.query_row("SELECT lease_until FROM worker_jobs WHERE job_id='backoff'", [], |row| row.get(0)).unwrap();
+            assert_eq!(lease, LEASE);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "backoff")), 0);
+            assert_eq!(waiting(&conn), vec!["pending"]);
+            // A delivery can claim between selection and the waker's CAS.
+            assert_eq!(apply(&conn, claim_fresh(NOW, LEASE, "claimed", "pending", "42", None)), 1);
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(NOW, "pending")), 0);
+            let ownership: (String, String) = conn.query_row(
+                "SELECT execution_token, lease_until FROM worker_jobs WHERE job_id = 'pending'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(ownership, ("claimed".into(), LEASE.into()));
+            let held: (String, i64, i64) = conn.query_row(
+                "SELECT lease_until, recovery_attempts, admission_waiting FROM worker_jobs WHERE job_id = 'backoff'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(held, (LEASE.into(), 1, 1));
+            assert_eq!(apply(&conn, worker_ledger::mark_waiting_dispatched(LEASE, "backoff")), 1);
+            let released: (Option<String>, i64, i64) = conn.query_row(
+                "SELECT lease_until, recovery_attempts, admission_waiting FROM worker_jobs WHERE job_id = 'backoff'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(released, (None, 1, 0));
+            assert_eq!(status_of(&conn, "owner"), "running");
+        }
+
+        #[test]
+        fn running_keyset_pages_preserve_cutoff_while_prior_rows_are_retired() {
+            let conn = db();
+            for index in 0..130 {
+                insert(&conn, &format!("job-{index:03}"), "42", "running", None);
+            }
+            insert(&conn, "live", "99", "running", Some(LEASE));
+            insert(&conn, "new", "8", "running", None);
+            conn.execute("UPDATE worker_jobs SET created_at=? WHERE job_id='new'", [LEASE]).unwrap();
+            let page = |statement: Statement| -> Vec<String> {
+                conn.prepare(&statement.sql).unwrap()
+                    .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| row.get(0))
+                    .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            };
+            let mut after = String::new();
+            let mut seen = 0;
+            loop {
+                let ids = page(worker_ledger::select_running(&after, NOW));
+                if ids.is_empty() { break; }
+                assert!(ids.len() <= 50);
+                after = ids.last().unwrap().clone();
+                seen += ids.len();
+            }
+            assert_eq!(seen, 131);
+            after.clear();
+            seen = 0;
+            loop {
+                let ids = page(worker_ledger::select_stale_running(&after, NOW));
+                if ids.is_empty() { break; }
+                assert!(ids.len() <= 50);
+                after = ids.last().unwrap().clone();
+                seen += ids.len();
+                for id in ids {
+                    conn.execute("UPDATE worker_jobs SET status='pending' WHERE job_id=?", [id]).unwrap();
+                }
+            }
+            assert_eq!(seen, 130);
+            assert_eq!(status_of(&conn, "live"), "running");
+            assert_eq!(status_of(&conn, "new"), "running");
+        }
+    }
+
+    /// The reaper statements run verbatim against rusqlite — the regression
+    /// pin for "a `retryable` row whose scheduled redelivery was lost to the
+    /// DLQ stays `待機中` forever": before the reaper existed nothing moved
+    /// such a row, and these statements are the ones that either re-enqueue
+    /// it (fresh delivery budget → normal claim path) or finalize it once
+    /// its retry budget is spent.
+    #[cfg(feature = "native-runtime")]
+    mod reaper_sql {
+        use super::super::worker_ledger::{finalize_stuck, mark_reenqueue, select_stuck};
+        use rusqlite::Connection;
+
+        fn db() -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE worker_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    options TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    dedupe_key TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    recovery_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    lease_until TEXT,
+                    execution_token TEXT,
+                    checkpoint_json TEXT,
+                    admission_waiting INTEGER NOT NULL DEFAULT 0
+                ) STRICT;",
+            )
+            .unwrap();
+            conn
+        }
+
+        fn insert(
+            conn: &Connection,
+            job_id: &str,
+            status: &str,
+            attempts: i64,
+            updated_at: &str,
+            lease: Option<&str>,
+        ) {
+            conn.execute(
+                "INSERT INTO worker_jobs (job_id, kind, target, status, dedupe_key, attempts, created_at, updated_at, lease_until)
+                 VALUES (?, 'update', '42', ?, ?, ?, '2026-01-01T00:00:00Z', ?, ?)",
+                rusqlite::params![
+                    job_id,
+                    status,
+                    format!("{status}:{job_id}"),
+                    attempts,
+                    updated_at,
+                    lease
+                ],
+            )
+            .unwrap();
+        }
+
+        fn row_of(conn: &Connection, job_id: &str) -> (String, String) {
+            conn.query_row(
+                "SELECT status, updated_at FROM worker_jobs WHERE job_id = ?",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        fn stuck_ids(conn: &Connection, stuck_before: &str) -> Vec<String> {
+            let statement = select_stuck(stuck_before, 50);
+            let mut query = conn.prepare(&statement.sql).unwrap();
+            query
+                .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        }
+
+        /// `2026-01-01T00:10:00Z` を reaper の実行時刻とし、猶予 2 分
+        /// (worker_entry::scheduler::STUCK_GRACE) を引いた検出境界。
+        const STUCK_BEFORE: &str = "2026-01-01T00:08:00Z";
+        const NOW: &str = "2026-01-01T00:10:00Z";
+
+        #[test]
+        fn the_last_allowed_retry_remains_eligible_for_redelivery() {
+            for max_retries in [0, 3] {
+                for failures in 0..=max_retries + 1 {
+                    let conn = db();
+                    insert(&conn, "boundary", "retryable", i64::from(failures),
+                        "2026-01-01T00:00:00Z", Some("2026-01-01T00:01:00Z"));
+                    let stmt = finalize_stuck("exhausted", NOW, "boundary", STUCK_BEFORE, max_retries);
+                    let changed = conn.execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter())).unwrap();
+                    let exhausted = failures > max_retries;
+                    assert_eq!(changed, usize::from(exhausted),
+                        "failures={failures}, allowed retries={max_retries}");
+                    if !exhausted {
+                        let stmt = mark_reenqueue(NOW, "boundary", STUCK_BEFORE);
+                        assert_eq!(conn.execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter())).unwrap(), 1);
+                        assert_eq!(row_of(&conn, "boundary").0, "retryable");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn lost_retryable_redelivery_is_requeued_then_finalized() {
+            let conn = db();
+            // 403 失敗 → record_attempt が attempts=1, lease=backoff 終了済み。
+            // 配信が DLQ に落ちて二度と来ない行。
+            insert(
+                &conn,
+                "j-lost",
+                "retryable",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            );
+
+            // 検出: ホールド切れの retryable が拾える。
+            assert_eq!(stuck_ids(&conn, STUCK_BEFORE), vec!["j-lost"]);
+
+            // 再投入: CAS が通り updated_at が進む → 1 通だけ envelope を送る。
+            let stmt = mark_reenqueue(NOW, "j-lost", STUCK_BEFORE);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+            assert_eq!(row_of(&conn, "j-lost"), ("retryable".into(), NOW.into()));
+
+            // 同じ tick の CAS は二度目を通さない (updated_at > stuck_before)。
+            let stmt = mark_reenqueue(NOW, "j-lost", STUCK_BEFORE);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0, "a touched row must not be re-sent twice");
+            // 検出対象からも外れる (次の猶予までは再送しない)。
+            assert!(stuck_ids(&conn, STUCK_BEFORE).is_empty());
+
+            // 初回 + 3 回のリトライがすべて失敗した行 (attempts=4) は
+            // permanent に確定する。
+            insert(
+                &conn,
+                "j-spent",
+                "retryable",
+                4,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            );
+            let stmt = finalize_stuck(
+                "retries exhausted and the scheduled redelivery was lost",
+                NOW,
+                "j-spent",
+                STUCK_BEFORE,
+                3,
+            );
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+            assert_eq!(
+                row_of(&conn, "j-spent").0,
+                "permanent",
+                "spent retryable must finalize instead of re-enqueue"
+            );
+        }
+
+        #[test]
+        fn stuck_selection_covers_pending_and_expired_running_only() {
+            let conn = db();
+            // 配信が失われた pending (lease NULL → updated_at で判定)。
+            insert(&conn, "j-pend", "pending", 0, "2026-01-01T00:00:00Z", None);
+            // まだ新しい pending は拾わない (配信中の可能性を潰さない)。
+            insert(&conn, "j-fresh", "pending", 0, "2026-01-01T00:09:00Z", None);
+            // バックオフ中の retryable は拾わない (再配信が予定されている)。
+            insert(
+                &conn,
+                "j-held",
+                "retryable",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:30:00Z"),
+            );
+            // lease 切れ running (claim 側が死亡) は拾う。
+            insert(
+                &conn,
+                "j-dead",
+                "running",
+                0,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:05:00Z"),
+            );
+            // 生きている running は拾わない。
+            insert(
+                &conn,
+                "j-live",
+                "running",
+                0,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:30:00Z"),
+            );
+            // 終端行は拾わない。
+            insert(
+                &conn,
+                "j-done",
+                "permanent",
+                3,
+                "2026-01-01T00:00:00Z",
+                None,
+            );
+
+            let ids = stuck_ids(&conn, STUCK_BEFORE);
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains(&"j-pend".to_string()));
+            assert!(ids.contains(&"j-dead".to_string()));
+        }
+
+        #[test]
+        fn finalize_cas_refuses_rows_that_moved_on() {
+            let conn = db();
+            // まだ枠が残っている retryable は finalize しない (再投入される)。
+            insert(
+                &conn,
+                "j-young",
+                "retryable",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            );
+            let stmt = finalize_stuck("reason", NOW, "j-young", STUCK_BEFORE, 3);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0);
+            assert_eq!(row_of(&conn, "j-young").0, "retryable");
+
+            // 配信が既に claim して running へ進んだ行は finalize しない。
+            insert(
+                &conn,
+                "j-claimed",
+                "running",
+                4,
+                "2026-01-01T00:09:00Z",
+                Some("2026-01-01T00:25:00Z"),
+            );
+            let stmt = finalize_stuck("reason", NOW, "j-claimed", STUCK_BEFORE, 3);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0);
+            assert_eq!(row_of(&conn, "j-claimed").0, "running");
+        }
+    }
+}

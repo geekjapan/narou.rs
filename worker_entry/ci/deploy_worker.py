@@ -1,0 +1,996 @@
+"""Worker を Cloudflare へデプロイする（環境ごとに 1 回）。
+
+同じ Rust 成果物を 6 script として配備する: writer（Web/API/cron、変換と
+旧取得キューの drain-only 入口）、取得専用の 4 レーン、配信専用の reader。
+writer の script 名・DO 名前空間・既存キューは残す。初回は非公開・
+consumer/cron 無しの writer を先に作り、共有 RATE_LIMITER / PUSH_HUB を用意する。
+
+流れ:
+
+1. D1、既存キューと 4 本の取得キュー・各 DLQ を冪等に用意する
+   （`ci/provision_resources.py`。旧キュー・secret は削除しない）
+2. writer / reader / 取得レーン 4 本の設定をレンダリングする
+   （`ci/render_config.py`）
+3. 共有 D1 の schema migration を適用し、assets / Wasm を 1 回だけビルドする
+4. writer が未配備なら同じ成果物で共有 DO 所有者だけを非公開 bootstrap する。
+   存在確認の認証失敗・不明な応答では中止し、既存 writer は変更しない。
+5. `--secrets-file` で取得に必要な資格情報を渡し、取得レーン 4 本を先に配備する。
+   どれかが失敗したら writer の切替は行わない
+6. writer を切り替え、S3 backend / LIST と readiness（source 初期化）を確認して
+   reader を最後に配備する。readiness を確認できなければ既存の配信 Route は変えない。
+   Secrets Store 専用トークンの認証付き検査や前段 Access の 403 は既存の
+   notice / warning 付きスキップとして扱い、検証成功とは報告しない
+7. 配備済み writer / reader の URL に smoke を流す（`NAROU_SMOKE=0` で省略）
+
+CI は NAROU_REQUIRE_S3=true 固定。旧 D1 の挿絵との互換性は維持せず、
+runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカーや挿絵行を検査・
+変更・削除しない。メタデータと本文は引き続き D1 に置く。
+
+必須の環境変数:
+
+- `NAROU_DEPLOY_TARGET` … `develop` / `production`
+- `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`
+- `NAROU_S3_ENDPOINT` / `NAROU_S3_REGION` / `NAROU_S3_BUCKET` … 挿絵の保存先
+- `SERVICE_DOMAIN` … production のみ（カスタムドメイン）
+
+任意:
+
+- `NAROU_ADMIN_TOKEN` … Worker の API トークン（`--secrets-file` で投入）。
+  Bearer 認証が有効なら、Secrets Store に置いた場合も CI の診断認証に必要
+  （ストアの値は読み戻せないため）。ストア専用運用で CI 側に値が無いときは
+  認証付きの S3 LIST 検証と smoke を明示 notice 付きで省略し、無認証の
+  health 検査と 401 の fail-closed 確認は必ず行う。
+  CI 側に値を置く場合は 32 文字以上 (ASCII) を要求する。既に配備済みの短い
+  トークンはこの検査では失効しないが、次回デプロイ時にローテーションする。
+  `NAROU_AUTH_REQUIRED=false`（Zero Trust を境界にする）ときは不要。
+- `NAROU_RS_LOGIN_KEY` … 資格情報の at-rest 鍵（base64 32 バイト）。無い場合は
+  平文の行だけを読む。
+- `NAROU_S3_ACCESS_KEY_ID` / `NAROU_S3_SECRET_ACCESS_KEY` … S3 資格情報。`--secrets-file` で
+  Worker secret (`S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`) として投入する。無い場合は
+  Secrets Store の `*_SECRET_NAME` を使うか、`wrangler secret put` で別途投入する。
+- `NAROU_AUTH_REQUIRED` / `NAROU_WORKERS_DEV` / `DEVELOP_DOMAIN` /
+  `NAROU_S3_PREFIX` / `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` / `NAROU_SMOKE=0`
+- `NAROU_WRANGLER_VERSION` … デプロイと D1 migration に使う wrangler の
+  バージョン (`x.y.z` 形式のみ)。既定は [`WRANGLER_VERSION`]。
+- `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` … 任意の外部取得リレー。
+  リレーの公開先と `X-Proxy-Token` の合言葉を同名の Worker secret として投入する。
+  リレー自体の配置・更新はこの CI からは行わない。
+- `RELAY_DOMAIN` … リレーの公開ドメイン（例 `relay.example.com`）。設定時は
+  `NAROU_RELAY_ENDPOINT` ではなく `https://<RELAY_DOMAIN>` を Worker secret に入れる。
+  Cloudflare の名前付きトンネル等で URL が固定されている場合に使う。
+- `SERVICE_DOMAIN` / `DEVELOP_DOMAIN` … custom domain。secret を推奨（ログへ出さない）
+- `NAROU_DEPLOY_URL` … smoke の宛先を明示する（既定は domain → workers.dev）
+- `NAROU_READER_DEPLOY_URL` … reader の smoke の宛先を明示する（既定は
+  domain → reader の workers.dev URL）
+- `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` … Access の service token。
+  custom domain が Access の内側にある場合は、無いと必須の S3 検証が Worker に
+  到達できない (S3 LIST の失敗は Worker が 503 で返し、この経路で 403 は返さない。
+  403 は前段で弾かれた印)。その場合は失敗にせず、警告つきのスキップとして報告する
+  (ステップサマリも `skipped`)。DNS/TLS エラーは省略しない。
+  この token は Zero Trust のダッシュボードで手動で作り、リポジトリの secret
+  として登録しておく (CI は token を作らない: 権限の広い Cloudflare token で
+  資格情報を自動発行させるのは避けたい)。同じ値が Worker secret
+  (`NAROU_CF_ACCESS_CLIENT_ID` / `NAROU_CF_ACCESS_CLIENT_SECRET`) としても
+  投入されるので、Worker 側の検査と設定ページの「外部API」タブでの表示に
+  使われる (未設定なら Access を設定していないのと同じ扱い)。
+
+ローカルからは実行しない（Cloudflare の資格情報が要る）。CI からのみ呼ぶ。
+"""
+
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import NoReturn
+
+WORKER_DIR = Path(__file__).resolve().parent.parent
+TARGETS = ("develop", "production")
+WORKER_URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+\.workers\.dev")
+
+# 1 回だけビルドした成果物を writer / acquisition 4 本 / reader で共有する。
+WRITER_CONFIG = "wrangler.ci.toml"
+READER_CONFIG = "wrangler.reader.ci.toml"
+ACQUISITION_CONFIGS = tuple(f"wrangler.acquire-{number}.ci.toml" for number in range(1, 5))
+
+# それぞれの smoke。writer は管理 URL (契約テスト)、reader は配信 URL
+# (読み取り専用の回帰) を使う。
+WRITER_SMOKE_SCRIPT = "tests/contract.mjs"
+READER_SMOKE_SCRIPT = "tests/read_worker_deployed.mjs"
+
+
+# デプロイと D1 migration に使う wrangler はバージョンを固定する。
+# `wrangler@4` のような範囲指定だとデプロイのたびに新しい 4.x が入り、
+# wrangler.toml / D1 / secrets の扱いが予告なく変わる (再現性が無く、
+# サプライチェーンの影響も受けやすい)。`NAROU_WRANGLER_VERSION` で
+# 明示的に上げるときだけ上書きする。
+WRANGLER_VERSION = "4.151.3"
+WRANGLER_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
+
+# CI が使う管理 API トークンの最小長。短いトークンは総当たりで破れるため
+# デプロイ時に拒否する (値は Worker の secret として配備される)。
+# Secrets Store 専用で CI 側に値が無い場合は検査できないのでそのまま通す。
+ADMIN_TOKEN_MIN_CHARS = 32
+
+# 配備後の診断 GET に載せる User-Agent。アプリ本体の既定値と同じブラウザ風の
+# 文字列を使う (`src/downloader/mod.rs` の `DEFAULT_USER_AGENT`)。urllib の既定
+# (`Python-urllib/3.x`) は Cloudflare のボット判定に掛かり、Worker の手前で
+# 403 になる。
+PROBE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0"
+)
+
+# custom domain を付けられないときの wrangler のエラー文言 (Cloudflare error
+# 100117)。既存のフロントエンド等が同じホスト名の DNS レコードを持っていると出る。
+DNS_CONFLICT_MARKER = "externally managed DNS records"
+
+# Cloudflare Access のログインリダイレクト先。ルートで Worker を受けている
+# ホスト名では、302 でここへ飛ばされるのも「前段で弾かれた」印になる。
+ACCESS_REDIRECT_MARKER = "cloudflareaccess.com"
+
+# 必須の S3 検証が 403 で返ったときの説明。Worker 自身は S3 LIST の失敗を
+# 503 で返し、この経路で 403 は返さないため、403 は前段 (Cloudflare Access や
+# WAF) で弾かれたことを意味する。custom domain が Access の内側にある構成では
+# service token を CI に渡すまでこの検証は通らない。CI 側からは手の打ちようが
+# ないので、失敗ではなく警告つきスキップとして報告し、成功とは扱わない。
+ACCESS_BLOCKED_NOTICE = (
+    "the mandatory S3 check did not run: HTTP 403 was answered before the Worker "
+    "(Cloudflare Access or WAF). This route answers 503 for a failing S3 LIST and never 403, "
+    "so the deployment was not reached and is NOT verified. Set secrets CF_ACCESS_CLIENT_ID "
+    "and CF_ACCESS_CLIENT_SECRET (an Access service token allowed by the application policy) "
+    "in the Cloudflare environment, or bypass Access for the probed path, to run the full check"
+)
+
+
+class AccessBlocked(Exception):
+    """前段 (Cloudflare Access / WAF) が Worker より先に 403 を返した。
+
+    `detail` は前段が付けた手掛かり (`cf-mitigated` / `content-type`) で、
+    原因の切り分け用。秘密値は含めない。
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+def blocked_detail(headers) -> str:
+    """403 応答から原因の手掛かりだけを取り出す (秘密・本文は含めない)。"""
+    parts = []
+    for name in ("cf-mitigated", "content-type"):
+        value = (headers.get(name) or "").strip() if headers else ""
+        if value:
+            parts.append(f"{name}={value[:40]}")
+    return ", ".join(parts)
+
+
+def fail(message: str) -> NoReturn:
+    raise SystemExit(message)
+
+
+def run(command: list[str], *, capture: bool = False, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(
+        command,
+        cwd=WORKER_DIR,
+        check=False,
+        capture_output=capture,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+    if result.returncode != 0:
+        if capture:
+            sys.stderr.write(result.stdout or "")
+            sys.stderr.write(result.stderr or "")
+        fail(f"{' '.join(command)} failed with {result.returncode}")
+    return (result.stdout or "") if capture else ""
+
+
+def mask(value: str) -> None:
+    """GitHub のログで値を伏せる（`::add-mask::` は以降の出力に効く）。"""
+    if value:
+        print(f"::add-mask::{value}")
+
+
+def auth_required() -> bool:
+    """Bearer トークン検査が有効か（Zero Trust を境界にする場合は false）。"""
+    return os.environ.get("NAROU_AUTH_REQUIRED", "true").strip().lower() != "false"
+
+
+def required(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        fail(f"{name} is required")
+    return value
+
+
+def wrangler_version() -> str:
+    """デプロイに使う wrangler のバージョン。
+
+    既定は [`WRANGLER_VERSION`]。`NAROU_WRANGLER_VERSION` で上書きできるが、
+    `x.y.z` の完全一致だけを受け付ける (`4` や `latest` のような範囲指定は
+    再現性が無いので拒否する)。
+    """
+    value = os.environ.get("NAROU_WRANGLER_VERSION", "").strip()
+    if not value:
+        return WRANGLER_VERSION
+    if not WRANGLER_VERSION_PATTERN.fullmatch(value):
+        fail(
+            "NAROU_WRANGLER_VERSION must be an exact x.y.z version "
+            f"(got {value!r}); ranges such as 4 or latest are not pinned"
+        )
+    return value
+
+
+def wrangler_command(*args: str) -> list[str]:
+    """固定バージョンの wrangler を `npx --yes` で実行するコマンド。"""
+    return ["npx", "--yes", f"wrangler@{wrangler_version()}", *args]
+
+
+def admin_token() -> str:
+    """CI 側で使える Bearer トークン。Secrets Store の値は API でも読み戻せない。"""
+    return os.environ.get("NAROU_ADMIN_TOKEN", "").strip()
+
+
+def require_probe_auth() -> None:
+    """必須の配備後診断に使う認証を、リソースの変更より前に検証する。
+
+    トークンを Secrets Store だけに置く運用 (値は読み戻せない) では CI 側の
+    Bearer を要求しない。代わりに `verify_s3` が無認証の health 検査と
+    fail-closed の 401 確認だけを行い、認証付き検査は notice 付きで省略する。
+    """
+    if (
+        auth_required()
+        and not admin_token()
+        and not os.environ.get("NAROU_ADMIN_TOKEN_SECRET_NAME", "").strip()
+    ):
+        fail(
+            "NAROU_ADMIN_TOKEN is required (or set NAROU_ADMIN_TOKEN_SECRET_NAME to "
+            "keep the token in the Secrets Store, or NAROU_AUTH_REQUIRED=false "
+            "when Zero Trust is the boundary)"
+        )
+    access_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
+    access_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET", "").strip()
+    if bool(access_id) != bool(access_secret):
+        fail("CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must be supplied together")
+    for name in ("NAROU_ADMIN_TOKEN", "CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET"):
+        value = os.environ.get(name, "").strip()
+        if any(ord(character) < 32 or ord(character) > 126 for character in value):
+            fail(f"{name} must be a valid ASCII HTTP header value")
+    # Bearer トークンは総当たりされない長さを要求する (CI 側だけで検査し、
+    # Worker 実行時には持ち込まない)。既に配備済みの短いトークンをこの検証で
+    # 失効させることはないが、次回デプロイ/ローテーション時に 32 文字以上へ
+    # 更新する必要がある。Secrets Store 専用 (CI に値が無い) 場合は検査しない。
+    token = admin_token()
+    if token and len(token) < ADMIN_TOKEN_MIN_CHARS:
+        fail(
+            f"NAROU_ADMIN_TOKEN must be at least {ADMIN_TOKEN_MIN_CHARS} characters "
+            "(existing deployments should rotate to a "
+            f">={ADMIN_TOKEN_MIN_CHARS} character token on the next deploy)"
+        )
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """認証ヘッダを別の宛先や Access のログイン画面へ送らない。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def deployment_url(base_url: str) -> None:
+    """診断の宛先として安全な HTTPS URL か検証する (不適なら失敗)。"""
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                or parsed.password is not None or parsed.query or parsed.fragment
+                or any(ord(character) <= 32 for character in base_url)):
+            raise ValueError
+        parsed.port  # Validate any explicit port before building authenticated headers.
+    except ValueError:
+        fail("deployment checks require an HTTPS deployment URL without credentials, query or fragment")
+
+
+def probe_headers(token: bool = True) -> dict[str, str]:
+    """診断 GET のヘッダ。Bearer は `token=True` かつ値があるときだけ載せる。"""
+    # urllib 既定の `Python-urllib/3.x` は Cloudflare のボット判定で 403 になる
+    # (同じ配備へ Node の fetch で流す contract.mjs は通る)。アプリ本体と同じく
+    # ブラウザ風の UA を必ず送る。
+    headers = {"Accept": "application/json", "User-Agent": PROBE_USER_AGENT}
+    value = admin_token()
+    if token and value:
+        headers["Authorization"] = f"Bearer {value}"
+    access_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
+    if access_id:
+        headers["CF-Access-Client-Id"] = access_id
+        headers["CF-Access-Client-Secret"] = os.environ["CF_ACCESS_CLIENT_SECRET"].strip()
+    return headers
+
+
+def probe_get(base_url: str, path: str, *, token: bool = True) -> tuple[int, bytes]:
+    """`(status, body)` を返す GET。HTTP エラーは `HTTPError` として上げる。"""
+    request = urllib.request.Request(
+        urllib.parse.urljoin(base_url, path),
+        headers=probe_headers(token),
+        method="GET",
+    )
+    with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+        return response.status, response.read(16 * 1024 + 1)
+
+
+def probe_json(base_url: str, path: str, label: str, *, token: bool = True,
+               blocked_is_access: bool = False) -> dict:
+    """200 の JSON オブジェクトを返す。それ以外は {label} つきで失敗。
+
+    `blocked_is_access=True` のときだけ 403 と Access のログインリダイレクト
+    (302 → cloudflareaccess.com) を [`AccessBlocked`] として上げる。どちらも
+    Worker に到達していない印で、CI からは回避できない。
+    """
+    try:
+        status, raw = probe_get(base_url, path, token=token)
+    except urllib.error.HTTPError as error:
+        with error:
+            status = error.code
+            headers = error.headers
+            detail = blocked_detail(headers) if status == 403 else ""
+            access_redirect = 300 <= status < 400 and ACCESS_REDIRECT_MARKER in (
+                (headers.get("Location") or "") if headers else ""
+            )
+        if blocked_is_access and access_redirect:
+            raise AccessBlocked(f"redirect to {ACCESS_REDIRECT_MARKER}") from None
+        if status == 403 and blocked_is_access:
+            raise AccessBlocked(detail) from None
+        fail(probe_failure(label, status))
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+        fail(f"{label} could not reach the deployment; check DNS/TLS/network. Deployment is not verified")
+    if status == 403 and blocked_is_access:
+        raise AccessBlocked
+    if status != 200:
+        fail(probe_failure(label, status))
+    if len(raw) > 16 * 1024:
+        fail(f"{label} returned an oversized response; deployment is not verified")
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeError):
+        fail(f"{label} returned invalid JSON; deployment is not verified")
+    if not isinstance(payload, dict):
+        fail(f"{label} returned an unexpected payload; deployment is not verified")
+    return payload
+
+
+def probe_failure(label: str, status: int) -> str:
+    """診断失敗の一般文言。403 を [`AccessBlocked`] として扱わない呼び出しで使う。"""
+    return f"{label} failed (HTTP {status}); check Worker/Access authentication and configuration"
+
+
+def verify_health(base_url: str) -> None:
+    """無認証で通る配備確認。認証済み検査を省略する代わりの下限 (fail-closed)。
+
+    1. `/health/live` が `status=alive`、`authentication_required=true`
+       (Worker 側も auth 要求)、`authentication_configured=true` (ストアの
+       トークンが Worker で実際に解決できた証拠)。
+    2. `/health/ready` が `status=ready` (D1 / queue / DO の構成が通る)。
+    3. 認証付き probe は無認証だと 401 `authentication_required` で閉じる
+       (200/500 なら認証の構成が壊れているので失敗)。
+    """
+    live = probe_json(base_url, "/health/live", "health check")
+    if (live.get("status") != "alive" or live.get("authentication_required") is not True
+            or live.get("authentication_configured") is not True):
+        fail("health check did not confirm a live, authenticated and configured deployment")
+    ready = probe_json(base_url, "/health/ready", "readiness check")
+    if ready.get("status") != "ready":
+        fail("readiness check did not confirm the deployment stack")
+    try:
+        status, raw = probe_get(base_url, "/api/storage/mode?probe=s3", token=False)
+        if status != 401:
+            fail(
+                f"authenticated probe returned HTTP {status} without a token; "
+                "the deployment must fail closed"
+            )
+    except urllib.error.HTTPError as error:
+        with error:
+            status, raw = error.code, error.read(16 * 1024 + 1)
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+        fail("deployment checks could not reach the deployment; check DNS/TLS/network. Deployment is not verified")
+    try:
+        code = json.loads(raw).get("error", {}).get("code")
+    except (ValueError, UnicodeError, AttributeError):
+        code = None
+    if status != 401 or code != "authentication_required":
+        fail("the deployment must answer 401 authentication_required without a token")
+
+
+def verify_s3(base_url: str) -> str:
+    """選択済み S3 handle の実 LIST を確認する。失敗・未実行は成功扱いしない。
+
+    戻り値はステップサマリに出す状態文字列で、`"ok"` か
+    `"skipped: <理由>"`。401 / 503 / 到達不可などの失敗は例外で終わる。
+
+    403 だけは前段 (Cloudflare Access / WAF) が Worker より先に返した印であり、
+    CI 側からは回避できないため、警告つきのスキップとして報告する (`summary` も
+    `skipped` と表示する)。成功扱いにはしない。
+    """
+    require_probe_auth()
+    deployment_url(base_url)
+    token = admin_token()
+    if auth_required() and not token:
+        # Secrets Store の値は REST/wrangler とも読み戻せないため、CI 側に
+        # トークンが無いとき認証付きの LIST は打てない。空成功にせず、無認証で
+        # 確かめられる範囲だけ検査して「省略」として報告する。
+        verify_health(base_url)
+        print(
+            "::notice::NAROU_ADMIN_TOKEN が Secrets Store 専用のため認証付きの "
+            "S3 LIST 検証を省略しました (health の検査と未認証 401 の確認は実施済み)。"
+            "LIST まで検証するには secrets.NAROU_ADMIN_TOKEN にも同じ値を置いてください"
+        )
+        return "skipped: admin token is available only in the Secrets Store"
+    try:
+        payload = probe_json(
+            base_url,
+            "/api/storage/mode?probe=s3",
+            "S3 verification",
+            blocked_is_access=True,
+        )
+    except AccessBlocked as blocked:
+        detail = f" (edge response headers: {blocked.detail})" if blocked.detail else ""
+        print(f"::warning::{ACCESS_BLOCKED_NOTICE}{detail}")
+        return "skipped: blocked before the Worker (Cloudflare Access or WAF); not verified"
+    if (payload.get("success") is not True
+            or payload.get("metadata_backend") != "d1"
+            or payload.get("illustration_backend") != "s3" or payload.get("s3_required") is not True
+            or payload.get("s3_list") != "ok"):
+        fail("S3 verification did not confirm D1 metadata, required S3 illustrations and a successful S3 LIST")
+    print("S3 deployment check: selected backend and read-only LIST verified")
+    return "ok"
+
+
+def provision(target: str) -> dict[str, str]:
+    """D1 と Queue を用意し、導出された名前・ID を返す。"""
+    output_file = WORKER_DIR / ".provision-output"
+    output_file.unlink(missing_ok=True)
+    env = dict(os.environ)
+    env["NAROU_DEPLOY_TARGET"] = target
+    env["GITHUB_OUTPUT"] = str(output_file)
+    run([sys.executable, "ci/provision_resources.py"], env=env)
+    values: dict[str, str] = {}
+    for line in output_file.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        if key:
+            values[key.strip()] = value.strip()
+    output_file.unlink(missing_ok=True)
+    for key in (
+        "database_name", "database_id", "queue_name", "dead_letter_queue",
+        "convert_queue_name", "convert_dead_letter_queue",
+        *(
+            f"acquire_{kind}_{number}"
+            for number in range(1, 5)
+            for kind in ("queue_name", "dead_letter_queue")
+        ),
+    ):
+        if not values.get(key):
+            fail(f"provisioning did not report {key}")
+    return values
+
+
+def enable_read_replication(resources: dict[str, str]) -> None:
+    """D1 の read replication を有効にする（冪等・develop / production 共通）。
+
+    Sessions API を使わない限り全クエリは primary に行くため、有効化と
+    併せてアプリ側のセッション利用が前提になる（`build_ui` を参照）。
+
+    失敗してもデプロイは止めない: 資格情報の権限不足でリリースが止まるより、
+    警告を残して配信を続ける方が安全（有効化は冪等なので次回も試行される）。
+    """
+    env = os.environ.copy()
+    env["NAROU_D1_DATABASE_ID"] = resources["database_id"]
+    result = subprocess.run(
+        [sys.executable, "ci/enable_read_replication.py"],
+        cwd=WORKER_DIR,
+        check=False,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+    if result.returncode != 0:
+        print(
+            "::warning::read replication を有効化できませんでした"
+            " (CLOUDFLARE_API_TOKEN に D1:Edit が必要です)。デプロイは続行します。"
+        )
+
+
+def render(target: str, resources: dict[str, str]) -> str:
+    """writer / reader / 取得レーン 4 本の設定を作り、共有 D1 の名前を返す。"""
+    env = dict(os.environ)
+    env["NAROU_DEPLOY_TARGET"] = target
+    env["NAROU_D1_DATABASE_NAME"] = resources["database_name"]
+    env["NAROU_D1_DATABASE_ID"] = resources["database_id"]
+    env["NAROU_JOB_QUEUE"] = resources["queue_name"]
+    env["NAROU_JOB_DLQ"] = resources["dead_letter_queue"]
+    env["NAROU_CONVERT_QUEUE"] = resources["convert_queue_name"]
+    env["NAROU_CONVERT_DLQ"] = resources["convert_dead_letter_queue"]
+    for number in range(1, 5):
+        env[f"NAROU_ACQUIRE_QUEUE_{number}"] = resources[f"acquire_queue_name_{number}"]
+        env[f"NAROU_ACQUIRE_DLQ_{number}"] = resources[f"acquire_dead_letter_queue_{number}"]
+    run([sys.executable, "ci/render_config.py", "--role", "writer"], env=env)
+    run([sys.executable, "ci/render_config.py", "--role", "reader"], env=env)
+    for lane in range(4):
+        run([
+            sys.executable, "ci/render_config.py", "--role", "acquisition",
+            "--lane", str(lane),
+        ], env=env)
+    return resources["database_name"]
+
+
+def build_artifact() -> None:
+    """lane の配備より前に共通 artifacts を 1 回だけビルドする。"""
+    run(["node", "build_assets.mjs"])
+    run(["worker-build", "--release"])
+
+
+def writer_exists(name: str) -> bool:
+    """Only a confirmed 404 permits creating the private namespace owner."""
+    account = urllib.parse.quote(required("CLOUDFLARE_ACCOUNT_ID"), safe="")
+    script = urllib.parse.quote(name, safe="")
+    request = urllib.request.Request(
+        f"https://api.cloudflare.com/client/v4/accounts/{account}/workers/scripts/{script}/script-settings",
+        headers={"Authorization": f"Bearer {required('CLOUDFLARE_API_TOKEN')}"},
+    )
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+            body = response.read(64 * 1024 + 1)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            try:
+                body = error.read(64 * 1024 + 1)
+                payload = json.loads(body) if len(body) <= 64 * 1024 else None
+            except ValueError:
+                payload = None
+            errors = payload.get("errors") if isinstance(payload, dict) else None
+            # Pinned Wrangler also identifies a missing Worker with code 10007.
+            # An arbitrary 404 must not replace an existing public writer.
+            if isinstance(errors, list) and errors and all(
+                isinstance(item, dict) and item.get("code") == 10007 for item in errors
+            ) and payload.get("success") is False:
+                return False
+        fail(f"writer discovery failed (HTTP {error.code}); existing deployment was not changed")
+    except (urllib.error.URLError, OSError):
+        fail("writer discovery failed; existing deployment was not changed")
+    try:
+        payload = json.loads(body) if len(body) <= 64 * 1024 else None
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if not isinstance(payload, dict) or payload.get("success") is not True or not isinstance(payload.get("result"), dict):
+        fail("writer discovery returned an invalid response; existing deployment was not changed")
+    return True
+
+
+def bootstrap_writer(secrets: Path | None) -> None:
+    """Create missing shared DO namespaces without exposing or consuming work."""
+    configuration = tomllib.loads((WORKER_DIR / WRITER_CONFIG).read_text(encoding="utf-8"))
+    if writer_exists(configuration["name"]):
+        return
+    configuration["workers_dev"] = False
+    configuration["preview_urls"] = False
+    configuration["main"] = str((WORKER_DIR / configuration["main"]).resolve())
+    for key in ("assets", "routes", "route", "triggers", "build"):
+        configuration.pop(key, None)
+    configuration.get("queues", {}).pop("consumers", None)
+    directory = WORKER_DIR / ".wrangler"
+    directory.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="writer-bootstrap-", dir=directory) as temporary:
+        path = Path(temporary) / "wrangler.json"
+        path.write_text(json.dumps(configuration), encoding="utf-8")
+        code, log = run_deploy(secrets, str(path))
+        print(log)
+        if code != 0:
+            fail("private writer namespace bootstrap failed; acquisition lanes were not deployed")
+
+
+def secret_file(target: str, role: str = "writer") -> Path | None:
+    """`--secrets-file` に渡す JSON を書く（終了時に必ず消す）。
+
+    `NAROU_AUTH_REQUIRED=false`（Cloudflare Access などの Zero Trust が境界）なら
+    `NAROU_ADMIN_TOKEN` は要らない。`*_SECRET_NAME` を渡した項目は Secrets Store に
+    置くので、値が無くても失敗にしない。
+
+    writer と acquisition は取得用の login key / relay を共有する。reader には
+    渡さない。S3 / admin / push 関連の認証設定は各 script で同じ値を使う。
+    """
+    if role not in ("writer", "reader", "acquisition"):
+        fail("secret role must be writer, reader or acquisition")
+    # Worker 側の名前 -> GitHub 側の環境変数名。`*_SECRET_NAME` を渡した項目は
+    # Secrets Store に置くので値が無くてもよい。
+    plain = [
+        ("NAROU_ADMIN_TOKEN", "NAROU_ADMIN_TOKEN", "NAROU_ADMIN_TOKEN_SECRET_NAME"),
+        ("S3_ACCESS_KEY_ID", "NAROU_S3_ACCESS_KEY_ID", "NAROU_S3_ACCESS_KEY_ID_SECRET_NAME"),
+        (
+            "S3_SECRET_ACCESS_KEY",
+            "NAROU_S3_SECRET_ACCESS_KEY",
+            "NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME",
+        ),
+    ]
+    if role in ("writer", "acquisition"):
+        plain.insert(
+            1,
+            ("NAROU_RS_LOGIN_KEY", "NAROU_RS_LOGIN_KEY", "NAROU_RS_LOGIN_KEY_SECRET_NAME"),
+        )
+    secrets: dict[str, str] = {}
+    for name, source, store_var in plain:
+        value = os.environ.get(source, "").strip()
+        if value:
+            secrets[name] = value
+        elif os.environ.get(store_var, "").strip():
+            continue
+        elif name == "NAROU_ADMIN_TOKEN":
+            if auth_required():
+                fail(
+                    "NAROU_ADMIN_TOKEN is required (or set NAROU_ADMIN_TOKEN_SECRET_NAME, "
+                    "or NAROU_AUTH_REQUIRED=false when Zero Trust is the boundary)"
+                )
+        elif name == "NAROU_RS_LOGIN_KEY":
+            print(f"::notice::{source} is not set; stored login credentials stay plaintext-only")
+        else:
+            print(
+                f"::notice::{source} is not set; the S3 illustration backend stays fail-closed "
+                f"(set {source} or {store_var})"
+            )
+    # Cloudflare Access の service token（任意）。Zero Trust の内側で使うとき、
+    # Worker 側の検査と設定ページの「外部API」タブでの表示に使う。値が無い
+    # ときは Access を設定していないのと同じ扱い（narou の Bearer トークンを
+    # 要求する）。token 自体は手動で作り、ここでは受け渡すだけ。
+    access_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
+    access_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET", "").strip()
+    access_in_store = all(
+        os.environ.get(name, "").strip()
+        for name in (
+            "NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME",
+            "NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME",
+        )
+    )
+    if access_id and access_secret:
+        secrets["NAROU_CF_ACCESS_CLIENT_ID"] = access_id
+        secrets["NAROU_CF_ACCESS_CLIENT_SECRET"] = access_secret
+    elif access_in_store:
+        # Secrets Store に置いている場合、値はストアから Worker が読む。
+        pass
+    elif access_id or access_secret:
+        print(
+            "::notice::CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must be supplied "
+            "together; the Worker's Access check and the settings page stay empty"
+        )
+
+    # 外部の取得リレー（任意）。値があるときだけ Worker secret として渡す。
+    # 未設定なら Worker 側のリレー段は無効のまま（Cloudflare から取れないサイトが残る）。
+    # RELAY_DOMAIN があれば https://<domain> を公開先として優先する（名前付きトンネル用）。
+    # 公開先とキーは両方揃ったときだけ入れる（片方だけ残して古い値と組み合わさらないように）。
+    # reader は配信だけを担うのでリレーを持たない (取得レーンには必ず同じ値を渡す)。
+    if role in ("writer", "acquisition"):
+        relay_domain = os.environ.get("RELAY_DOMAIN", "").strip()
+        relay_endpoint = os.environ.get("NAROU_RELAY_ENDPOINT", "").strip()
+        if relay_domain:
+            relay_endpoint = relay_domain if "://" in relay_domain else f"https://{relay_domain}"
+        relay_key = os.environ.get("NAROU_RELAY_KEY", "").strip()
+        if relay_endpoint and relay_key:
+            secrets["NAROU_RELAY_ENDPOINT"] = relay_endpoint
+            secrets["NAROU_RELAY_KEY"] = relay_key
+        else:
+            missing = []
+            if not relay_endpoint:
+                missing.append("RELAY_DOMAIN / NAROU_RELAY_ENDPOINT")
+            if not relay_key:
+                missing.append("NAROU_RELAY_KEY")
+            print(f"::notice::{', '.join(missing)} is not set; the relay fallback stays disabled")
+
+    if not secrets:
+        return None
+    # 値は GitHub のログマスクに登録する。wrangler の出力に値が入っている場合も
+    # ログには伏せられる (登録は以降の出力に効く)。
+    for value in secrets.values():
+        mask(value)
+    suffix = {"writer": "", "reader": "-reader", "acquisition": "-acquire"}[role]
+    path = WORKER_DIR / f".deploy-secrets-{target}{suffix}.json"
+    path.write_text(json.dumps(secrets), encoding="utf-8")
+    # 同ホストの別ユーザーから読まれないよう、秘密ファイルは 0600 にする。
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+    return path
+
+
+def run_deploy(secrets: Path | None, config: str = WRITER_CONFIG) -> tuple[int, str]:
+    """`wrangler deploy` を実行し `(exit code, log)` を返す (失敗でも落とさない)。
+
+    wrangler は固定バージョン ([`wrangler_command`]) を使う。
+    """
+    command = wrangler_command("deploy", "-c", config)
+    if secrets is not None:
+        command += ["--secrets-file", str(secrets)]
+    result = subprocess.run(
+        command,
+        cwd=WORKER_DIR,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def deploy(
+    secrets: Path | None,
+    target: str,
+    resources: dict[str, str],
+    config: str = WRITER_CONFIG,
+) -> str | None:
+    """デプロイし、wrangler が報告した workers.dev の URL を返す（無ければ None）。
+
+    custom domain 運用 (`workers_dev = false`) では有人の URL を出さないため、
+    smoke の宛先は `smoke_url()` が custom domain から決める。ログ中の任意の
+    https URL を拾うと無関係なリンクを掴むので、フォールバックはしない。
+
+    ホスト名の DNS レコードを既存のフロントエンド等が持っている場合、custom
+    domain は付け替えられない (`externally managed DNS records`)。そのときは
+    `NAROU_DOMAIN_MODE=route` で組み直し、同じホスト名に Workers の route と
+    して載せ直す (DNS は触らない・Access はホスト名単位のまま)。
+    """
+    code, log = run_deploy(secrets, config)
+    if code != 0 and DNS_CONFLICT_MARKER in log:
+        print(
+            "::notice::ホスト名の既存 DNS レコードのため custom domain を route に切り替えます "
+            "(NAROU_DOMAIN_MODE=route)"
+        )
+        os.environ["NAROU_DOMAIN_MODE"] = "route"
+        render(target, resources)
+        code, log = run_deploy(secrets, config)
+    print(log)
+    if code != 0:
+        fail(
+            f"npx --yes wrangler@{wrangler_version()} deploy -c {config} "
+            f"failed with {code}"
+        )
+    urls = WORKER_URL_PATTERN.findall(log)
+    return urls[-1] if urls else None
+
+
+def hide(url: str) -> bool:
+    """workers.dev 以外（= custom domain）なら伏せる。"""
+    if url and ".workers.dev" not in url:
+        mask(url)
+        return True
+    return False
+
+
+def smoke_url(target: str, reported: str | None) -> tuple[str | None, bool]:
+    """smoke の宛先 `(url, custom_domain 由来か)`。明示 > custom domain > workers.dev。
+
+    どれも分からない場合は `(None, False)` を返し、呼び出し側は smoke を省略する。
+    """
+    explicit = os.environ.get("NAROU_DEPLOY_URL", "").strip()
+    if explicit:
+        return explicit, hide(explicit)
+    domain = os.environ.get({"develop": "DEVELOP_DOMAIN", "production": "SERVICE_DOMAIN"}[target], "").strip()
+    if domain:
+        # 公開ログ・step summary にドメインを残さない（値は GitHub の secret を想定）。
+        mask(domain)
+        return f"https://{domain}", hide(f"https://{domain}")
+    if reported:
+        return reported, hide(reported)
+    return None, False
+
+
+def reader_smoke_url(target: str, reported: str | None) -> tuple[str | None, bool]:
+    """reader の smoke の宛先 `(url, custom domain 由来か)`。
+
+    明示 > custom domain > reader の workers.dev URL。ドメインがあれば既存
+    ドメインの配信パスが reader へ向かうので、そのドメインを使う。ドメインが
+    無い (workers.dev のみ) ときは reader 自身の URL を使う。writer の URL は
+    使わない (reader の配信を確かめるため)。
+    """
+    explicit = os.environ.get("NAROU_READER_DEPLOY_URL", "").strip()
+    if explicit:
+        return explicit, hide(explicit)
+    domain = os.environ.get({"develop": "DEVELOP_DOMAIN", "production": "SERVICE_DOMAIN"}[target], "").strip()
+    if domain:
+        # 公開ログ・step summary にドメインを残さない（値は GitHub の secret を想定）。
+        mask(domain)
+        return f"https://{domain}", hide(f"https://{domain}")
+    if reported:
+        return reported, hide(reported)
+    return None, False
+
+
+def smoke(base_url: str, script: str = WRITER_SMOKE_SCRIPT) -> bool | None:
+    """デプロイ先に契約テストを流す。失敗してもデプロイは巻き戻さない。
+
+    前段の Cloudflare Access に弾かれた場合（exit 3）、ドメインがまだ届かない
+    場合（exit 4。証明書・DNS の準備待ち）、CI 側にトークンが無く認証済み
+    検査を始められない場合（exit 2）は「省略」として扱う。
+    """
+    if not (WORKER_DIR / script).exists():
+        print(f"::notice::{script} が無いため smoke を省略しました")
+        return None
+    env = dict(os.environ)
+    env["BASE_URL"] = base_url
+    result = subprocess.run(
+        ["node", script],
+        cwd=WORKER_DIR,
+        check=False,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+    if result.returncode == 3:
+        print("::notice::Access が前段にあるため smoke を省略しました (CF_ACCESS_CLIENT_ID/SECRET で実行できます)")
+        return None
+    if result.returncode == 4:
+        print(
+            "::notice::デプロイ先に到達できないため smoke を省略しました "
+            "(新しい custom domain は証明書と DNS の準備に数分かかることがあります)"
+        )
+        return None
+    if result.returncode == 2 and auth_required() and not admin_token():
+        # Secrets Store の値は API でも読み戻せないため、CI 側にトークンが無い
+        # と認証済みの smoke は実行できない (verify_s3 の時点で health と
+        # fail-closed の 401 は検証済み)。空成功にはせず「省略」として報告する。
+        print(
+            "::notice::NAROU_ADMIN_TOKEN を CI 側で解決できないため認証済みの "
+            "smoke を省略しました (health と未認証 401 の検証は実施済み)。"
+            "smoke まで実行するには secrets.NAROU_ADMIN_TOKEN にも同じ値を置いてください"
+        )
+        return None
+    return result.returncode == 0
+
+
+def verify_writer_ready(base_url: str) -> None:
+    """writer の readiness を通す (source の初期化)。
+
+    reader は source を変更しないので、属性の backfill などの初期化は writer が
+    services を組んだ時にだけ走る。reader の配信 path を移す前に writer の
+    readiness を通さないと、初期化前のまま配信が見える (一覧のタグや
+    属性の絞り込みが欠ける)。
+
+    到達できない / 確認できないときは失敗させる。reader の配備と既存の
+    配信 Route の変更を行わない。
+    """
+    try:
+        payload = probe_json(
+            base_url, "/health/ready", "writer readiness check", blocked_is_access=True
+        )
+    except AccessBlocked as blocked:
+        detail = f" (edge response headers: {blocked.detail})" if blocked.detail else ""
+        fail(
+            "the writer's readiness could not be reached"
+            f"{detail}; reader deployment is not updated and existing delivery routes "
+            "remain unchanged. Give CI an Access service token (CF_ACCESS_CLIENT_ID / "
+            "CF_ACCESS_CLIENT_SECRET), then deploy again"
+        )
+    if payload.get("status") != "ready":
+        fail("the writer's readiness check did not confirm the deployment stack")
+    print("Writer readiness: the writer's source initialization ran before the reader")
+
+
+def summary(target: str, url: str, smoke_ok: bool | None, *, hidden_url: bool = False,
+            s3_status: str = "not verified", reader_url: str = "",
+            reader_smoke_ok: bool | None = None, reader_hidden_url: bool = False) -> None:
+    def state(result: bool | None) -> str:
+        return "ok" if result else "skipped" if result is None else "failed"
+
+    lines = [
+        f"### Worker deploy ({target})",
+        "",
+        f"- URL (writer): {'（custom domain。ログでは伏せています）' if hidden_url else url}",
+        f"- acquisition lanes: {len(ACQUISITION_CONFIGS)} private scripts (deployed before writer cutover)",
+        f"- S3 backend + LIST: {s3_status}",
+        f"- smoke (writer): {state(smoke_ok)}",
+    ]
+    if reader_url:
+        shown = (
+            "（custom domain。ログでは伏せています）"
+            if reader_hidden_url
+            else reader_url
+        )
+        lines.append(f"- URL (reader): {shown}")
+        lines.append("- reader delivery routes: published")
+        lines.append(f"- smoke (reader): {state(reader_smoke_ok)}")
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    text = "\n".join(lines) + "\n"
+    if path:
+        with Path(path).open("a", encoding="utf-8") as handle:
+            handle.write(text)
+    print(text)
+
+
+def main() -> None:
+    target = os.environ.get("NAROU_DEPLOY_TARGET", "").strip()
+    if target not in TARGETS:
+        fail("NAROU_DEPLOY_TARGET must be develop or production")
+    # 資格情報は早めに検証する（デプロイ途中で落ちないように）。
+    required("CLOUDFLARE_ACCOUNT_ID")
+    required("CLOUDFLARE_API_TOKEN")
+    require_probe_auth()
+
+    resources = provision(target)
+    database = render(target, resources)
+    enable_read_replication(resources)
+    # wrangler はデプロイと同じ固定バージョンで migration を適用する。
+    # reader は writer と同じ D1 を共有するので migration は 1 本でよい。
+    run(
+        wrangler_command(
+            "d1",
+            "migrations",
+            "apply",
+            database,
+            "--remote",
+            "-c",
+            WRITER_CONFIG,
+        )
+    )
+
+    # 旧 writer は残したままレーンを追加し、全レーンの配備成功後に writer を切り替える。
+    # どの設定も [build] を持たず、この 1 回の成果物を再利用する。
+    build_artifact()
+    writer_secrets = None
+    reader_secrets = None
+    acquisition_secrets = None
+    try:
+        writer_secrets = secret_file(target, role="writer")
+        reader_secrets = secret_file(target, role="reader")
+        acquisition_secrets = secret_file(target, role="acquisition")
+        # First deployment needs the shared DO owner before external bindings.
+        # Existing writers are never replaced by this private bootstrap.
+        bootstrap_writer(writer_secrets)
+        for config in ACQUISITION_CONFIGS:
+            deploy(acquisition_secrets, target, resources, config=config)
+        writer_url = deploy(writer_secrets, target, resources, config=WRITER_CONFIG)
+        target_url, hidden_url = smoke_url(target, writer_url)
+        if target_url is None:
+            fail(
+                "Mandatory S3 verification needs a deployment URL; "
+                "configure NAROU_DEPLOY_URL or a deployment domain"
+            )
+        s3_status = verify_s3(target_url)
+        # reader を配備する前に writer の readiness (source の初期化) を通す。
+        # 確認できなければ失敗し、reader の配備・既存の配信 Route の変更を行わない。
+        verify_writer_ready(target_url)
+        reader_url = deploy(reader_secrets, target, resources, config=READER_CONFIG)
+    finally:
+        for path in (writer_secrets, reader_secrets, acquisition_secrets):
+            if path is not None:
+                path.unlink(missing_ok=True)
+
+    # 配信 path は reader へ向かった後の状態を確認する (writer の契約テストも
+    # /api/v1 系は reader を通る)。
+    reader_target_url, reader_hidden = reader_smoke_url(target, reader_url)
+    smoke_result: bool | None = None
+    reader_smoke_result: bool | None = None
+    if os.environ.get("NAROU_SMOKE", "1") == "0":
+        pass
+    else:
+        smoke_result = smoke(target_url, WRITER_SMOKE_SCRIPT)
+        if reader_target_url is not None:
+            reader_smoke_result = smoke(reader_target_url, READER_SMOKE_SCRIPT)
+    summary(
+        target,
+        target_url,
+        smoke_result,
+        hidden_url=hidden_url,
+        s3_status=s3_status,
+        reader_url=reader_target_url or "",
+        reader_smoke_ok=reader_smoke_result,
+        reader_hidden_url=reader_hidden,
+    )
+    if smoke_result is False:
+        fail("smoke test failed against the deployment")
+    if reader_smoke_result is False:
+        fail("reader smoke test failed against the deployment")
+
+
+if __name__ == "__main__":
+    main()

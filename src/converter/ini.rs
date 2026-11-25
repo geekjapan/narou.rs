@@ -6,24 +6,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum IniValue {
     Integer(i64),
     Float(f64),
     Boolean(bool),
     String(String),
+    #[default]
     Null,
-}
-
-impl Default for IniValue {
-    fn default() -> Self {
-        IniValue::Null
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct IniData {
     pub sections: HashMap<String, HashMap<String, IniValue>>,
+}
+
+impl Default for IniData {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IniData {
@@ -66,10 +67,13 @@ impl IniData {
     }
 
     pub fn load_file(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::new());
-        }
-        let content = fs::read_to_string(path)?;
+        #[cfg(feature = "native-runtime")]
+        crate::application::novel_access::require_private_path(path)?;
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
+            Err(error) => return Err(error.into()),
+        };
         Ok(Self::load(&content))
     }
 
@@ -93,37 +97,38 @@ impl IniData {
     }
 
     pub fn to_ini_string(&self) -> String {
+        use std::fmt::Write;
         let mut output = String::new();
-
+        let sections = self.sections.get_key_value("global").into_iter()
+            .chain(self.sections.iter().filter(|(name, _)| name.as_str() != "global"));
         let mut first = true;
-        for (section, values) in &self.sections {
-            if !first {
+        for (section, values) in sections {
+            if !first { output.push('\n'); }
+            first = false;
+            if section != "global" {
+                writeln!(&mut output, "[{section}]").expect("writing to a String is infallible");
+            }
+            for (key, value) in values {
+                write!(&mut output, "{key} = ").expect("writing to a String is infallible");
+                match value {
+                    IniValue::String(value) => {
+                        output.push('"');
+                        output.push_str(value);
+                        output.push('"');
+                    }
+                    IniValue::Integer(value) => {
+                        write!(&mut output, "{value}").expect("writing to a String is infallible");
+                    }
+                    IniValue::Float(value) => {
+                        write!(&mut output, "{value}").expect("writing to a String is infallible");
+                        if value.is_finite() && value.fract() == 0.0 { output.push_str(".0"); }
+                    }
+                    IniValue::Boolean(value) => output.push_str(if *value { "true" } else { "false" }),
+                    IniValue::Null => {}
+                }
                 output.push('\n');
             }
-            first = false;
-
-            if section != "global" {
-                output.push_str(&format!("[{}]\n", section));
-            }
-
-            for (key, value) in values {
-                let value_str = match value {
-                    IniValue::String(s) => s.clone(),
-                    IniValue::Integer(i) => i.to_string(),
-                    IniValue::Float(f) => f.to_string(),
-                    IniValue::Boolean(b) => {
-                        if *b {
-                            "true".to_string()
-                        } else {
-                            "false".to_string()
-                        }
-                    }
-                    IniValue::Null => String::new(),
-                };
-                output.push_str(&format!("{} = {}\n", key, value_str));
-            }
         }
-
         output
     }
 
@@ -146,30 +151,22 @@ fn cast_ini_value(s: &str) -> IniValue {
         return IniValue::Null;
     }
 
-    if let Some(quoted) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+    if let Some(quoted) = s.strip_prefix('"').and_then(|value| value.strip_suffix('"'))
+        .or_else(|| s.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))
+        .filter(|value| !value.is_empty())
+    {
         return IniValue::String(quoted.to_string());
     }
-    if let Some(quoted) = s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        return IniValue::String(quoted.to_string());
-    }
-
-    let lower = s.to_lowercase();
-    if lower == "true" {
-        return IniValue::Boolean(true);
-    }
-    if lower == "false" {
-        return IniValue::Boolean(false);
-    }
-    if lower == "nil" || lower == "null" {
-        return IniValue::Null;
-    }
-
-    if let Ok(i) = s.parse::<i64>() {
-        return IniValue::Integer(i);
-    }
-
-    if let Ok(f) = s.parse::<f64>() {
-        return IniValue::Float(f);
+    if s.eq_ignore_ascii_case("true") { return IniValue::Boolean(true); }
+    if s.eq_ignore_ascii_case("false") { return IniValue::Boolean(false); }
+    if s.eq_ignore_ascii_case("nil") || s.eq_ignore_ascii_case("null") { return IniValue::Null; }
+    if let Ok(value) = s.parse::<i64>() { return IniValue::Integer(value); }
+    let unsigned = s.strip_prefix('+').or_else(|| s.strip_prefix('-')).unwrap_or(s);
+    if unsigned.split_once('.').is_some_and(|(whole, fraction)| {
+        whole.bytes().all(|byte| byte.is_ascii_digit()) && !fraction.is_empty()
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    }) && let Ok(value) = s.parse::<f64>() {
+        return IniValue::Float(value);
     }
 
     IniValue::String(s.to_string())

@@ -21,58 +21,68 @@ fn load_settings_from_dir(dir: PathBuf, settings: &mut Vec<SiteSetting>) {
         let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
         paths.sort();
         for path in paths {
-            if path.extension().and_then(|e| e.to_str()) == Some("yaml")
-                || path.extension().and_then(|e| e.to_str()) == Some("yml")
-            {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(raw_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                        let name = raw_yaml
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
+            let is_yaml = matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("yml")
+            );
+            if !is_yaml {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                tracing::warn!("サイト定義 {} を読み込めませんでした", path.display());
+                continue;
+            };
+            let parsed = serde_yaml::from_str::<serde_yaml::Value>(&content);
+            if let Err(error) = &parsed {
+                tracing::warn!(
+                    "サイト定義 {} を読み込めませんでした ({error})",
+                    path.display()
+                );
+            }
+            if let Ok(raw_yaml) = parsed {
+                let name = raw_yaml
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
 
-                        if let Some(existing) = name
-                            .as_ref()
-                            .and_then(|name| settings.iter_mut().find(|s| s.name == *name))
-                        {
-                            let incoming_version = raw_yaml.get("version").and_then(|v| v.as_f64());
-                            if should_merge_site_setting(existing, incoming_version) {
-                                if let Ok(merged) = merge_site_setting(existing, &content) {
-                                    *existing = merged;
-                                }
+                if let Some(existing) = name
+                    .as_ref()
+                    .and_then(|name| settings.iter_mut().find(|s| s.name == *name))
+                {
+                    // version gate とキー単位マージは
+                    // `super::merge_user_definition_yaml` に一元化してある
+                    // (core の `SiteDefinitions::effective_runtime()` と
+                    //  規則が逸れないように)。
+                    match serde_yaml::to_string(existing) {
+                        Ok(bundled_yaml) => {
+                            let merged = super::merge_user_definition_yaml(&bundled_yaml, &content);
+                            match serde_yaml::from_str::<SiteSetting>(&merged) {
+                                Ok(merged) => *existing = merged,
+                                Err(error) => tracing::warn!(
+                                    "サイト定義 {} を読み込めませんでした ({error})",
+                                    path.display()
+                                ),
                             }
-                        } else if let Ok(setting) = serde_yaml::from_value::<SiteSetting>(raw_yaml)
-                        {
-                            settings.push(setting);
                         }
+                        Err(error) => tracing::warn!(
+                            "サイト定義 {} を書き出せませんでした ({error})",
+                            path.display()
+                        ),
+                    }
+                } else {
+                    match serde_yaml::from_value::<SiteSetting>(raw_yaml) {
+                        Ok(setting) => settings.push(setting),
+                        // 壊れた定義を黙って捨てると、ユーザーは原因不明で
+                        // 「そのサイトが無い」ことになる。読み込み失敗を出す。
+                        Err(error) => tracing::warn!(
+                            "サイト定義 {} を読み込めませんでした ({error})",
+                            path.display()
+                        ),
                     }
                 }
             }
         }
     }
-}
-
-fn should_merge_site_setting(existing: &SiteSetting, incoming_version: Option<f64>) -> bool {
-    incoming_version.is_none_or(|version| version >= existing.version)
-}
-
-fn merge_site_setting(
-    existing: &SiteSetting,
-    incoming_yaml: &str,
-) -> std::result::Result<SiteSetting, serde_yaml::Error> {
-    let mut base = serde_yaml::to_value(existing)?;
-    let incoming: serde_yaml::Value = serde_yaml::from_str(incoming_yaml)?;
-
-    if let (Some(base_map), Some(incoming_map)) = (base.as_mapping_mut(), incoming.as_mapping()) {
-        for (key, value) in incoming_map {
-            if key.as_str() == Some("name") || key.as_str() == Some("version") {
-                continue;
-            }
-            base_map.insert(key.clone(), value.clone());
-        }
-    }
-
-    serde_yaml::from_value(base)
 }
 
 pub fn dedup_paths(paths: &mut Vec<PathBuf>) {

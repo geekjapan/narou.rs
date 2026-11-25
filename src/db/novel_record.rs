@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::de;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NovelRecord {
     pub id: i64,
     pub author: String,
@@ -53,12 +53,49 @@ pub struct NovelRecord {
         rename = "_convert_failure"
     )]
     pub convert_failure: bool,
+    /// Set once a fetch failed without a login cookie but succeeded with it.
+    /// Novels flagged here send the stored login cookie up front; every other
+    /// novel stays anonymous until a fetch actually needs authentication.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nilable_bool",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub requires_login: bool,
+    /// Identifier of the stored login credential that made this novel's fetch
+    /// work. `requires_login` says a cookie is needed; this says *which* one,
+    /// so a site with several logins (a main account and the one in a マイピク)
+    /// does not walk the whole list on every run. Absent until one succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_session: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_fields: BTreeMap<String, serde_yaml::Value>,
 }
 
 impl NovelRecord {
     pub const RAW_TITLE_KEY: &'static str = "raw_title";
+
+    /// Classification is metadata, not a user-editable tag.
+    pub fn attribute_tag(&self) -> Option<&str> {
+        self.extra_fields.get("attribute_tag")
+            .and_then(serde_yaml::Value::as_str)
+            .filter(|tag| crate::attribute_tag::is_attribute_tag(tag))
+    }
+
+    pub fn set_attribute_tag(&mut self, tag: &str) {
+        assert!(crate::attribute_tag::is_attribute_tag(tag));
+        self.extra_fields.insert(
+            "attribute_tag".to_string(),
+            serde_yaml::Value::String(tag.to_string()),
+        );
+    }
+
+    pub fn average_length(&self) -> i64 {
+        match (self.length, self.general_all_no) {
+            (Some(length), Some(episodes)) if length > 0 && episodes > 0 => length / episodes,
+            _ => 0,
+        }
+    }
 
     pub fn raw_title(&self) -> &str {
         self.extra_fields
@@ -80,6 +117,45 @@ impl NovelRecord {
             Self::RAW_TITLE_KEY.to_string(),
             serde_yaml::Value::String(raw_title.into()),
         );
+    }
+
+    /// Page the novel was registered from, when it differs from `toc_url`.
+    ///
+    /// `toc_url` is what gets fetched and is not always the page a reader
+    /// knows: Pixiv keeps the API endpoint there, so the page the user typed
+    /// (`/novel/series/<id>`, `/works/<id>`) is remembered separately and shown
+    /// as the link in the Web UI.
+    pub const ORIGINAL_URL_KEY: &'static str = "original_url";
+
+    fn is_page_url(url: &str) -> bool {
+        url.split_once("://").is_some_and(|(scheme, address)| {
+            !address.is_empty()
+                && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        })
+    }
+
+    pub fn original_url(&self) -> Option<&str> {
+        self.extra_fields
+            .get(Self::ORIGINAL_URL_KEY)
+            .and_then(serde_yaml::Value::as_str)
+            .filter(|url| Self::is_page_url(url))
+    }
+
+    /// Remember page URLs only; ID/N-code/alias updates must not replace them.
+    pub fn set_original_url(&mut self, url: &str) {
+        if !Self::is_page_url(url) {
+            return;
+        }
+        self.extra_fields.insert(
+            Self::ORIGINAL_URL_KEY.to_string(),
+            serde_yaml::Value::String(url.to_string()),
+        );
+    }
+
+    /// Link to show for this novel: the page it was registered from, falling
+    /// back to `toc_url`.
+    pub fn display_url(&self) -> &str {
+        self.original_url().unwrap_or(&self.toc_url)
     }
 }
 
@@ -152,6 +228,7 @@ mod tests {
 
     #[test]
     fn deserialize_blank_end_as_false() {
+        let _global = crate::test_support::global_state_guard();
         let yaml = r#"---
 id: 115
 author: 風見鶏
@@ -179,6 +256,7 @@ tags: []
 
     #[test]
     fn database_parity_preserves_unknown_fields_during_round_trip() {
+        let _global = crate::test_support::global_state_guard();
         let yaml = r#"---
 id: 0
 author: author
@@ -206,6 +284,7 @@ custom_map:
 
     #[test]
     fn raw_title_uses_compatible_flattened_field() {
+        let _global = crate::test_support::global_state_guard();
         let yaml = r#"---
 id: 0
 author: author
@@ -222,5 +301,30 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
         record.set_raw_title("【発売中】作品名");
         let dumped = serde_yaml::to_string(&record).unwrap();
         assert!(dumped.contains("raw_title: 【発売中】作品名"));
+    }
+
+    #[test]
+    fn original_url_does_not_turn_download_identifiers_into_links() {
+        let mut record: NovelRecord = serde_yaml::from_str(r#"---
+id: 42
+author: author
+title: title
+file_title: file title
+toc_url: https://example.com/api/novels/42
+original_url: '42'
+sitename: Example
+last_update: 2026-04-20 00:00:00.000000000 +09:00
+"#).unwrap();
+        assert_eq!(record.display_url(), record.toc_url);
+
+        record.extra_fields.remove(NovelRecord::ORIGINAL_URL_KEY);
+        record.set_original_url("n0000aa");
+        assert!(!record.extra_fields.contains_key(NovelRecord::ORIGINAL_URL_KEY));
+        assert_eq!(record.display_url(), record.toc_url);
+
+        let page_url = "HTTP://example.com/novels/42";
+        record.set_original_url(page_url);
+        record.set_original_url("42");
+        assert_eq!(record.display_url(), page_url);
     }
 }

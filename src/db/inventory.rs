@@ -42,6 +42,11 @@ struct CacheKey {
 pub struct Inventory {
     root_dir: PathBuf,
     cache: Mutex<InventoryCache>,
+    /// SQLite-backed management state (P2). `Some` only when the instance's
+    /// root owns the process-wide `.narou/db.sqlite` and no legacy escape
+    /// hatch is active.
+    #[cfg(feature = "native-runtime")]
+    state: Option<crate::native::sqlite::state::StateDb>,
 }
 
 struct InventoryCache {
@@ -96,9 +101,13 @@ impl InventoryCache {
 
 impl Inventory {
     pub fn new(root_dir: PathBuf) -> Self {
+        #[cfg(feature = "native-runtime")]
+        let state = crate::native::sqlite::state::active_for(&root_dir.join(".narou"));
         Self {
             root_dir,
             cache: Mutex::new(InventoryCache::new()),
+            #[cfg(feature = "native-runtime")]
+            state,
         }
     }
 
@@ -107,13 +116,10 @@ impl Inventory {
         Ok(Self::new(root))
     }
 
-    fn inventory_path(&self, name: &str, scope: InventoryScope) -> PathBuf {
+    pub(crate) fn inventory_path(&self, name: &str, scope: InventoryScope) -> PathBuf {
         let dir = match scope {
             InventoryScope::Local => self.root_dir.join(".narou"),
-            InventoryScope::Global => {
-                let home = dirs_home();
-                home.join(".narousetting")
-            }
+            InventoryScope::Global => global_setting_dir(&self.root_dir),
         };
         dir.join(format!("{}.yaml", name))
     }
@@ -126,6 +132,10 @@ impl Inventory {
     }
 
     pub fn load_raw(&self, name: &str, scope: InventoryScope) -> Result<String> {
+        #[cfg(feature = "native-runtime")]
+        if let Some(payload) = self.state_load_raw(name, scope)? {
+            return Ok(payload);
+        }
         let path = self.inventory_path(name, scope);
         let cache_key = Self::cache_key(name, scope);
         let current_mtime = file_mtime(&path);
@@ -142,13 +152,54 @@ impl Inventory {
 
         let content = read_optional_yaml_file(&path)?;
 
+        #[cfg(feature = "native-runtime")]
+        if content.trim().is_empty()
+            && scope == InventoryScope::Global
+            && let Some(payload) = self.legacy_global_payload()?
+        {
+            // Older builds imported the global settings map into this
+            // library's `app_state` and renamed the file away, which hid the
+            // settings from other libraries and from narou.rb. Put the file
+            // back on first read and drop the stale row.
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(&path, &payload)?;
+            self.cache
+                .lock()
+                .remember(cache_key, payload.clone(), file_mtime(&path));
+            return Ok(payload);
+        }
+
         self.cache
             .lock()
             .remember(cache_key, content.clone(), current_mtime);
         Ok(content)
     }
 
+    /// Legacy `app_state(global, global_setting)` row, if an older build left
+    /// one behind. Removed once the file has been restored from it.
+    #[cfg(feature = "native-runtime")]
+    fn legacy_global_payload(&self) -> Result<Option<String>> {
+        let Some(state) = &self.state else {
+            return Ok(None);
+        };
+        let Some(payload) = state.get_raw("global", "global_setting")? else {
+            return Ok(None);
+        };
+        if payload.trim().is_empty() {
+            state.delete_raw("global", "global_setting")?;
+            return Ok(None);
+        }
+        state.delete_raw("global", "global_setting")?;
+        Ok(Some(payload))
+    }
+
     pub fn save_raw(&self, name: &str, scope: InventoryScope, content: &str) -> Result<()> {
+        #[cfg(feature = "native-runtime")]
+        if self.state_save_raw(name, scope, content)? {
+            return Ok(());
+        }
         let path = self.inventory_path(name, scope);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -179,6 +230,18 @@ impl Inventory {
         D: DeserializeOwned + Default + Serialize,
         F: FnOnce(D) -> Result<(D, T)>,
     {
+        #[cfg(feature = "native-runtime")]
+        if self.state_managed(name)
+            && let Some(state) = &self.state
+        {
+            let (content, result) = state.update_raw(Self::state_scope(scope), name, |raw| {
+                let current = if raw.trim().is_empty() { D::default() } else { serde_yaml::from_str(raw)? };
+                let (next, result) = update(current)?;
+                Ok((serialize_yaml_content(&next)?, result))
+            })?;
+            self.cache.lock().remember(Self::cache_key(name, scope), content, None);
+            return Ok(result);
+        }
         let path = self.inventory_path(name, scope);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -188,6 +251,61 @@ impl Inventory {
             .lock()
             .remember(Self::cache_key(name, scope), content, file_mtime(&path));
         Ok(result)
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn state_managed(&self, name: &str) -> bool {
+        self.state.is_some() && crate::db::state_inventory::inventory_managed(name)
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn state_scope(scope: InventoryScope) -> &'static str {
+        match scope {
+            InventoryScope::Global => "global",
+            InventoryScope::Local => "inv",
+        }
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn state_load_raw(
+        &self,
+        name: &str,
+        scope: InventoryScope,
+    ) -> Result<Option<String>> {
+        if !self.state_managed(name) {
+            return Ok(None);
+        }
+        let Some(state) = &self.state else {
+            return Ok(None);
+        };
+        match state.get_raw(Self::state_scope(scope), name)? {
+            Some(payload) => Ok(Some(payload)),
+            // A missing SQLite row is empty managed state, not permission to
+            // resurrect a retired compatibility/export file through the cache.
+            None => Ok(Some(String::new())),
+        }
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn state_save_raw(
+        &self,
+        name: &str,
+        scope: InventoryScope,
+        content: &str,
+    ) -> Result<bool> {
+        if !self.state_managed(name) {
+            return Ok(false);
+        }
+        let Some(state) = &self.state else {
+            return Ok(false);
+        };
+        state.set_raw(Self::state_scope(scope), name, content)?;
+        self.cache.lock().remember(
+            Self::cache_key(name, scope),
+            content.to_string(),
+            None,
+        );
+        Ok(true)
     }
 
     pub fn clear_cache(&self) {
@@ -232,7 +350,7 @@ where
         let current = if raw.is_empty() {
             D::default()
         } else {
-            serde_yaml::from_str(&raw)?
+            serde_yaml::from_str(raw)?
         };
         let (updated, result) = update(current)?;
         let content = serialize_yaml_content(&updated)?;
@@ -242,17 +360,32 @@ where
 
 pub(crate) fn with_locked_file_update<T, F>(path: &Path, update: F) -> Result<(String, T)>
 where
-    F: FnOnce(String) -> Result<(String, T)>,
+    F: FnOnce(&str) -> Result<(String, T)>,
 {
     with_exclusive_file_lock(path, || {
         let current = read_optional_yaml_file(path)?;
-        let (new_content, result) = update(current)?;
-        atomic_write_locked(path, &new_content)?;
+        let (new_content, result) = update(&current)?;
+        if new_content != current {
+            atomic_write_locked(path, &new_content)?;
+        }
         Ok((new_content, result))
     })
 }
 
-fn with_exclusive_file_lock<T, F>(path: &Path, operation: F) -> Result<T>
+pub(crate) fn compare_locked_file_content(path: &Path, expected: &str, replacement: &str) -> Result<bool> {
+    with_exclusive_file_lock(path, || {
+        let current = read_optional_yaml_file(path)?;
+        if current != expected {
+            return Ok(false);
+        }
+        if current != replacement {
+            atomic_write_locked(path, replacement)?;
+        }
+        Ok(true)
+    })
+}
+
+pub(crate) fn with_exclusive_file_lock<T, F>(path: &Path, operation: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
@@ -267,6 +400,7 @@ where
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&lock_path)?;
     lock_file.lock_exclusive()?;
     let result = operation();
@@ -274,7 +408,17 @@ where
     result
 }
 
-fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_PUBLICATION: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_after_publication(path: PathBuf) {
+    FAIL_AFTER_PUBLICATION.with(|slot| *slot.borrow_mut() = Some(path));
+}
+
+pub(crate) fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
     let retries = 20u32;
     let mut last_error = None;
 
@@ -286,6 +430,10 @@ fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
 
         match fs::rename(&tmp_path, path) {
             Ok(_) => {
+                #[cfg(test)]
+                if FAIL_AFTER_PUBLICATION.with(|slot| slot.borrow_mut().take_if(|expected| expected == path).is_some()) {
+                    return Err(std::io::Error::other("injected post-publication sync failure").into());
+                }
                 crate::compat::fsync_parent_dir(path)?;
                 return Ok(());
             }
@@ -320,7 +468,7 @@ pub(crate) fn serialize_yaml_content<T: Serialize>(data: &T) -> Result<String> {
     Ok(content)
 }
 
-fn read_optional_yaml_file(path: &Path) -> Result<String> {
+pub(crate) fn read_optional_yaml_file(path: &Path) -> Result<String> {
     match fs::metadata(path) {
         Ok(metadata) => {
             if metadata.len() > MAX_YAML_SIZE_BYTES {
@@ -423,7 +571,13 @@ fn process_write_lock_for(path: &Path) -> Arc<StdMutex<()>> {
         .clone()
 }
 
-fn find_narou_root() -> Result<PathBuf> {
+/// `.narou/` を持つディレクトリが CWD かその親にあるか。未初期化のディレクトリでは
+/// 設定やサイト定義の読み込み対象が無いので、呼び出し側で読み込みを省く判断に使う。
+pub fn narou_root_exists() -> bool {
+    find_narou_root().is_ok()
+}
+
+pub(crate) fn find_narou_root() -> Result<PathBuf> {
     let mut current = std::env::current_dir()?;
     loop {
         if current.join(".narou").exists() {
@@ -435,6 +589,12 @@ fn find_narou_root() -> Result<PathBuf> {
             ));
         }
     }
+}
+
+/// narou.rb prefers a library-local `.narousetting` directory when present.
+pub(crate) fn global_setting_dir(root: &Path) -> PathBuf {
+    let local = root.join(".narousetting");
+    if local.is_dir() { local } else { dirs_home().join(".narousetting") }
 }
 
 fn dirs_home() -> PathBuf {
@@ -638,6 +798,7 @@ mod tests {
 
     #[test]
     fn lock_file_remains_when_update_fails() {
+        let _global = crate::test_support::global_state_guard();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let narou_dir = root.join(".narou");

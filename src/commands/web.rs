@@ -6,6 +6,8 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use narou_rs::db::inventory::{Inventory, InventoryScope};
+use narou_rs::db::settings as settings_store;
+use narou_rs::setting_core::SettingScope;
 use serde_yaml::{Number, Value};
 use tracing::info;
 
@@ -17,7 +19,9 @@ mod web_tray;
 struct WebAddress {
     host: String,
     port: u16,
-    ws_port: u16,
+    /// 併設 WebSocket リスナーのポート。`server-ws-port=0` のときは None
+    /// (本体ポートの `/ws` だけで受ける)。
+    ws_port: Option<u16>,
 }
 
 pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: bool) {
@@ -30,6 +34,15 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
 
     if let Err(e) = narou_rs::db::init_database() {
         eprintln!("Error initializing database: {}", e);
+        std::process::exit(1);
+    }
+    // Recover interrupted transfer publication before bootstrap readers or tasks.
+    if let Err(e) = narou_rs::native::transfer::recover_startup() {
+        eprintln!("Error recovering transfer publication: {}", e);
+        std::process::exit(1);
+    }
+    if let Err(e) = narou_rs::native::application::recover_removals() {
+        eprintln!("Error recovering ordinary library operations: {}", e);
         std::process::exit(1);
     }
     if let Err(e) = fill_general_all_no_in_database() {
@@ -48,54 +61,81 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
 
     info!(
         "Starting narou.rs web server on {}:{} (ws:{})",
-        address.host, address.port, address.ws_port
+        address.host,
+        address.port,
+        match address.ws_port {
+            Some(port) => port.to_string(),
+            None => "off (same port)".to_string(),
+        }
     );
 
-    let security_settings = match load_web_security_settings() {
-        Ok(settings) => settings,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-    let allowed_request_hosts = match load_http_allowed_request_hosts(
-        &address.host,
-        security_settings.reverse_proxy_mode,
-    ) {
-        Ok(hosts) => hosts,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-    let mut push_server = web::push::PushServer::new();
-    let domains =
-        match load_ws_accepted_domains(&address.host, security_settings.reverse_proxy_mode) {
-            Ok(domains) => domains,
+    let server_security =
+        match narou_rs::web::server_security::ServerSecurity::load(&address.host) {
+            Ok(settings) => settings,
             Err(e) => {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         };
-    push_server.set_accepted_domains(domains);
+    let push_server = web::push::PushServer::new();
+    push_server.set_accepted_domains(server_security.accepted_ws_domains.clone());
     let push_server = Arc::new(push_server);
     if requires_basic_auth_for_bind(&address.host)
-        && security_settings.require_basic_auth_for_external_bind
-        && security_settings.basic_auth_header.is_none()
+        && server_security.require_basic_auth_for_external_bind
+        && server_security.basic_auth_header.is_none()
     {
         eprintln!(
             "Error: server-bind が外部公開設定のため、server-basic-auth を有効にして user/password を設定して下さい"
         );
         std::process::exit(1);
     }
+    if requires_basic_auth_for_bind(&address.host)
+        && server_security.basic_auth_header.is_some()
+        && !server_security.reverse_proxy_mode
+    {
+        eprintln!(
+            "WARN: 外部 bind の Basic 認証は平文 HTTP です。LAN 外へ公開する場合は TLS 終端つきリバースプロキシを使用し、server-reverse-proxy.enable と server-add-accepted-hosts を設定してください"
+        );
+    }
+    if requires_basic_auth_for_bind(&address.host)
+        && server_security.basic_auth_header.is_none()
+    {
+        eprintln!(
+            "WARN: server-bind が外部公開ですが Basic 認証が無効です (server-basic-auth.require-for-external-bind=false)。LAN 内の誰でも Web UI/API を操作できます"
+        );
+    }
+    if server_security.reverse_proxy_mode {
+        eprintln!(
+            "WARN: server-reverse-proxy.enable=true では、公開ホストを server-add-accepted-hosts / server-ws-add-accepted-domains に明示し、前段 proxy で Host を検証してください"
+        );
+    }
     let control_token = generate_control_token();
-    let root_dir = match Inventory::with_default_root() {
-        Ok(inventory) => inventory.root_dir().to_path_buf(),
+    let ui_bootstrap_ticket = generate_control_token();
+    let inventory = match Inventory::with_default_root() {
+        Ok(inventory) => Arc::new(inventory),
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     };
+    let root_dir = inventory.root_dir().to_path_buf();
+    let ui_token = match load_or_create_ui_token(&root_dir) {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("Error: UI トークンを準備できません: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let native_services =
+        match narou_rs::native::application::NativeAppServices::new(inventory.clone()) {
+            Ok(services) => services,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+    let site_updates = native_services.site_updates;
+    let services = native_services.services;
     let queue =
         match narou_rs::queue::PersistentQueue::new(&root_dir.join(".narou").join("queue.yaml")) {
             Ok(queue) => Arc::new(queue),
@@ -112,12 +152,16 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
     let auto_update_scheduler = Arc::new(parking_lot::Mutex::new(None));
     let app_state = web::AppState {
         port: address.port,
-        ws_port: address.ws_port,
+        // 併設リスナーを切っているときは本体ポートで受ける (`/ws` は本体のルータにもある)。
+        ws_port: address.ws_port.unwrap_or(address.port),
         push_server: push_server.clone(),
-        basic_auth_header: security_settings.basic_auth_header,
+        services: services.clone(),
+        server_security: Arc::new(parking_lot::RwLock::new(server_security)),
+        bind_host: Arc::from(address.host.as_str()),
         control_token: control_token.clone(),
-        allowed_request_hosts,
-        reverse_proxy_mode: security_settings.reverse_proxy_mode,
+        ui_token: ui_token.clone(),
+        ui_bootstrap_ticket: ui_bootstrap_ticket.clone(),
+        ui_bootstrap_hosts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         queue: queue.clone(),
         restore_prompt_pending: restore_prompt_pending.clone(),
         restorable_tasks_available: restorable_tasks_available.clone(),
@@ -125,33 +169,58 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         running_child_pids: running_child_pids.clone(),
         cancelled_job_ids: cancelled_job_ids.clone(),
         auto_update_scheduler: auto_update_scheduler.clone(),
+        library_backup: Arc::new(web::library_backup::LibraryBackupState::new()),
     };
     let app = web::create_router(app_state.clone());
-    let ws_app = web::push::create_push_router(app_state);
-
+    let local_auth_required = app_state.local_ui_auth_required();
+    let ws_app = address
+        .ws_port
+        .map(|_| web::push::create_push_router(app_state.clone()));
     let addr: SocketAddr = format!("{}:{}", address.host, address.port)
         .parse()
         .unwrap();
-    let ws_addr: SocketAddr = format!("{}:{}", address.host, address.ws_port)
-        .parse()
-        .unwrap();
     let url = format!("http://{}:{}/", display_host(&address.host), address.port);
+    let mut browser_url = url.clone();
+    if local_auth_required {
+        browser_url.push('?');
+        browser_url.push_str(web::UI_AUTH_QUERY_PARAM);
+        browser_url.push('=');
+        browser_url.push_str(&ui_bootstrap_ticket);
+    }
     if !hide_console {
         println!("{}", url);
+        if local_auth_required {
+            // チケットは使う origin ごとに 1 回だけ有効。reverse proxy 経由の
+            // 公開ホストで開くときにも必要なので、常に URL ごと見せる。
+            println!("ブラウザで開く URL: {}", browser_url);
+            if app_state.server_security.read().reverse_proxy_mode {
+                println!(
+                    "WARN: reverse proxy 経由の公開ホストで開く URL にも {} を付けてください (上の URL と同じチケット値)",
+                    web::UI_AUTH_QUERY_PARAM
+                );
+            }
+        }
         println!("サーバを止めるには {}", web_stop_hint(hide_console));
         println!();
     }
 
     if !no_browser {
-        let _ = open::that(&url);
+        let _ = open::that(&browser_url);
     }
 
     let listener = bind_or_shutdown_and_retry(addr, &address.host, address.port, "HTTP").await;
-    let ws_listener =
-        bind_or_shutdown_and_retry(ws_addr, &address.host, address.ws_port, "WebSocket").await;
+    let ws_listener = match address.ws_port {
+        Some(ws_port) => {
+            let ws_addr: SocketAddr = format!("{}:{}", address.host, ws_port)
+                .parse()
+                .unwrap();
+            Some(bind_or_shutdown_and_retry(ws_addr, &address.host, ws_port, "WebSocket").await)
+        }
+        None => None,
+    };
 
     // Write PID file for restart recovery
-    write_pid_file(&control_token);
+    write_pid_file(&control_token, address.port, &address.host);
 
     #[cfg(windows)]
     if hide_console {
@@ -163,20 +232,49 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
     }
 
     let worker_tasks = web::worker::start_queue_workers(
-        root_dir.clone(),
-        queue.clone(),
-        push_server.clone(),
-        running_jobs.clone(),
-        running_child_pids,
-        cancelled_job_ids,
+        web::worker::QueueWorkerContext {
+            root_dir: root_dir.clone(),
+            queue: queue.clone(),
+            push_server: push_server.clone(),
+            library: services.library.clone(),
+            site_updates,
+            running_jobs: running_jobs.clone(),
+            running_child_pids,
+            cancelled_job_ids,
+        },
         narou_rs::compat::load_local_setting_bool("concurrency"),
     );
     web::scheduler::start_or_restart_auto_update_scheduler(
+        services.scheduler.clone(),
         queue,
         running_jobs,
         push_server.clone(),
         &auto_update_scheduler,
     );
+
+    // サイト定義 (webnovel/*.yaml またはオブジェクトストア) の外部変更を拾う。
+    // 自分のプロセスからの保存は PUT/DELETE が即時差し替えるので、ここは
+    // 「外部編集が反映されるまでの最大遅延」として 30 秒間隔で再読込する
+    // (worker_entry::isolate_cache の TTL と同じ粒度)。
+    let site_definitions_poll = tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            if !narou_rs::db::narou_root_exists() {
+                continue;
+            }
+            if let Err(error) =
+                narou_rs::native::site_definitions::install_effective_site_settings().await
+            {
+                tracing::warn!("サイト定義の再読み込みに失敗しました: {error}");
+            }
+        }
+    });
+
+    // `server-*` / `update.auto-schedule.*` / `webui.*` / `logging*` など、
+    // 別プロセス (narou setting や手編集) からの設定変更を拾って再適用する。
+    // 保存 API からの変更は即時反映済みなので、ここは外部変更が反映されるまでの
+    // 最大遅延として 30 秒間隔でポーリングする (上のサイト定義と同じ粒度)。
+    let settings_watch = watch_server_settings(app_state.clone());
 
     // Ruby parity: broadcast startup messages to web console
     {
@@ -210,7 +308,12 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         eprintln!();
     };
 
-    let ws_task = tokio::spawn(async move { axum::serve(ws_listener, ws_app).await });
+    let ws_task = match (ws_listener, ws_app) {
+        (Some(listener), Some(app)) => {
+            Some(tokio::spawn(async move { axum::serve(listener, app).await }))
+        }
+        _ => None,
+    };
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal)
         .await
@@ -219,49 +322,65 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         worker_task.abort();
     }
     web::scheduler::stop_auto_update_scheduler(&auto_update_scheduler);
-    ws_task.abort();
+    if let Some(task) = ws_task {
+        task.abort();
+    }
+    site_definitions_poll.abort();
+    settings_watch.abort();
     remove_pid_file();
 }
 
 fn fill_general_all_no_in_database() -> Result<(), String> {
-    narou_rs::db::with_database_mut(|db| {
-        let archive_root = db.archive_root().to_path_buf();
-        let ids: Vec<i64> = db
-            .all_records()
-            .values()
-            .filter(|record| record.general_all_no.is_none())
-            .map(|record| record.id)
-            .collect();
-        let mut modified = false;
+    use narou_rs::platform::NovelFilter;
 
-        for id in ids {
-            let Some(record) = db.get(id).cloned() else {
-                continue;
-            };
-            let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
-            let Some(toc) = narou_rs::downloader::persistence::load_toc_file(&novel_dir) else {
-                continue;
-            };
-            let Some(target) = db.all_records_mut().get_mut(&id) else {
-                continue;
-            };
-            target.general_all_no = Some(toc.subtitles.len() as i64);
-            modified = true;
-        }
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let ids = novels
+        .scan_ids_sync(&NovelFilter::all(), None, usize::MAX)
+        .map_err(|e| e.to_string())?;
+    // One metadata load for the whole library. Every single-record read
+    // re-reads and re-parses the library metadata, so a per-id loop turns a
+    // large library (a multi-megabyte title included) into minutes of
+    // startup work before the server binds its port.
+    let records = novels
+        .get_many_current_sync(&ids)
+        .map_err(|error| error.to_string())?;
 
-        if modified {
-            db.save()?;
+    for (id, record) in ids.into_iter().zip(records) {
+        let Some(record) = record else {
+            continue;
+        };
+        if record.general_all_no.is_some() {
+            continue;
         }
-        Ok(())
-    })
-    .map_err(|e| e.to_string())
+        let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).map_err(|error| error.to_string())?;
+        let write = narou_rs::native::materialization::capture_write_for_record(&record).map_err(|error| error.to_string())?;
+        narou_rs::native::materialization::block_on(async {
+            let mut access = narou_rs::application::novel_access::NovelAccess::from_writer(write.clone(), "web-fill-count").await?;
+            let result = async {
+                let Some(bytes) = access.read()?.read_small(&keys.toc()).await? else {
+                    return Ok(false);
+                };
+                let toc: narou_rs::downloader::TocFile = serde_yaml::from_slice(&bytes)?;
+                novels.update_existing_guarded_sync(write.fence(), id, |record| {
+                    if record.general_all_no.is_none() {
+                        record.general_all_no = Some(toc.subtitles.len() as i64);
+                    }
+                    Ok(())
+                })
+            }.await;
+            let released = access.release().await;
+            result.and_then(|value| released.map(|_| value))
+        }).map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
 }
+
 
 fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let mut global_setting: HashMap<String, Value> = inventory
-        .load("global_setting", InventoryScope::Global)
-        .unwrap_or_default();
+    let mut global_setting: HashMap<String, Value> =
+        settings_store::load_with_inventory(&inventory, SettingScope::Global).unwrap_or_default();
     let host = normalize_bind_host(yaml_string(global_setting.get("server-bind")));
     let port = if let Some(port) = user_port {
         port
@@ -270,14 +389,21 @@ fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
     } else {
         let port = find_available_web_port(&host)?;
         global_setting.insert("server-port".to_string(), Value::Number(Number::from(port)));
-        inventory
-            .save("global_setting", InventoryScope::Global, &global_setting)
+        settings_store::save_with_inventory(&inventory, SettingScope::Global, &global_setting)
             .map_err(|e| e.to_string())?;
         port
     };
-    let ws_port = port
-        .checked_add(1)
-        .ok_or_else(|| "server-port + 1 が不正な値になります".to_string())?;
+    // `server-ws-port`: 未設定は従来どおり server-port + 1。0 を指定すると
+    // 併設リスナーを作らない (本体ポートの `/ws` で受ける)。SORAHOST のように
+    // 前段が port + 1 を使うプラットフォーム向け。
+    let ws_port = match yaml_u16(global_setting.get("server-ws-port")) {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(
+            port.checked_add(1)
+                .ok_or_else(|| "server-port + 1 が不正な値になります".to_string())?,
+        ),
+    };
     Ok(WebAddress {
         host,
         port,
@@ -345,18 +471,112 @@ fn create_reusable_listener(addr: SocketAddr) -> io::Result<tokio::net::TcpListe
 
 // --- PID file management ---
 
+/// PID ファイルのパス。
+///
+/// サーバと CLI が同じファイルを見る必要があるため、カレントディレクトリ
+/// ではなく「narou ルート」(`.narou` のある最上位ディレクトリ) 基準で決める。
+/// ライブラリ直下以外の場所から起動しても同じファイルを指す。
 fn pid_file_path() -> Option<std::path::PathBuf> {
-    Some(
-        std::env::current_dir()
-            .ok()?
-            .join(".narou")
-            .join("server.pid"),
-    )
+    let root = narou_rs::logger::find_narou_root()
+        .or_else(|| std::env::current_dir().ok())?;
+    Some(root.join(".narou").join("server.pid"))
 }
 
-fn write_pid_file(control_token: &str) {
+/// PID ファイルに書く内容。
+///
+/// 形式は `<pid> <control_token> <port> <host>`。
+/// port / host も同じファイルに書く。
+/// サーバは自分が実際に待ち受けているポートとホストを書くので、
+/// CLI 側は `server-port` 設定に依存せず稼働中のサーバへ到達できる
+/// (`--port` で起動したときの取りこぼしを防ぐ)。
+fn write_pid_file(control_token: &str, port: u16, host: &str) {
     if let Some(path) = pid_file_path() {
-        let _ = std::fs::write(&path, format!("{} {}", std::process::id(), control_token));
+        let _ = write_private_file(
+            &path,
+            &format!(
+                "{} {} {} {}",
+                std::process::id(),
+                control_token,
+                port,
+                host
+            ),
+        );
+    }
+}
+
+/// 起動プロセスだけが読めるファイルを書く (Unix は 0600、Windows は
+/// ユーザープロファイルの ACL を継承)。`.narou/` 配下の秘密情報に使う。
+fn write_private_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// loopback ブラウザ UI 用トークンを読む/作る。
+///
+/// サーバ再起動やセルフアップデート後もブラウザの Cookie を維持できるよう、
+/// `.narou/ui_token` に永続化する。既存ファイルが壊れている場合だけ作り直す。
+fn load_or_create_ui_token(root: &std::path::Path) -> std::io::Result<String> {
+    let path = root.join(".narou").join("ui_token");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let token = text.trim();
+        if token.len() >= 32 && token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Ok(token.to_ascii_lowercase());
+        }
+    }
+    let token = generate_control_token();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(token.as_bytes())?;
+            drop(file);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            Ok(token)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let text = std::fs::read_to_string(&path)?;
+            let existing = text.trim();
+            if existing.len() >= 32 && existing.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                Ok(existing.to_ascii_lowercase())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} が不正です", path.display()),
+                ))
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -373,6 +593,20 @@ fn read_pid_file() -> Option<(u32, Option<String>)> {
     let pid = parts.next()?.trim().parse().ok()?;
     let token = parts.next().map(ToString::to_string);
     Some((pid, token))
+}
+
+/// PID ファイルから待ち受けポートとホストを読む。
+///
+/// 旧形式 (`<pid> <token>` だけ) なら `None` を返す。
+fn read_pid_file_endpoint() -> Option<(u16, String)> {
+    let path = pid_file_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut parts = content.split_whitespace();
+    let _pid = parts.next()?;
+    let _token = parts.next();
+    let port = parts.next()?.parse::<u16>().ok()?;
+    let host = parts.next().unwrap_or("127.0.0.1").to_string();
+    Some((port, host))
 }
 
 // --- Shutdown strategies ---
@@ -413,6 +647,46 @@ fn control_request_host(host: &str) -> &str {
         "::" => "::1",
         _ => host,
     }
+}
+
+/// 稼働中のサーバへ `server-*` 設定の再適用を求める。
+///
+/// `narou setting` で許可ホストや WebSocket の Origin 許可リストを変えた
+/// とき、サーバ側は 30 秒のポーリングで拾うので、その間だけ変更が反映され
+/// ない。CLI 側から再適用の API を呼ぶと即座に反映される。
+///
+/// サーバが動いていない場合は何もしない (設定の保存自体には影響しない)。
+pub(crate) fn notify_running_server_to_reload_security() -> bool {
+    let Some((_, token)) = read_pid_file() else {
+        return false;
+    };
+    // 待ち受けポートとホストはサーバ自身が PID ファイルに記録している。
+    // `server-port` 設定は `--port` で起動したときは反映されないため、
+    // ここでは PID ファイルの値を優先する (旧形式なら設定へ戻る)。
+    let (port, host) = match read_pid_file_endpoint() {
+        Some((port, host)) => (port, host),
+        None => {
+            let Ok(global_setting) = settings_store::load(SettingScope::Global) else {
+                return false;
+            };
+            let Some(port) = global_setting
+                .get("server-port")
+                .and_then(|value| value.as_u64())
+                .and_then(|port| u16::try_from(port).ok())
+            else {
+                return false;
+            };
+            let host = yaml_string(global_setting.get("server-bind"))
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            (port, host)
+        }
+    };
+    send_control_request(
+        &host,
+        port,
+        token.as_deref(),
+        "/api/server_security/reload",
+    )
 }
 
 pub(crate) fn send_control_request(
@@ -491,50 +765,9 @@ fn try_kill_via_pid_file(port: u16) {
     }
 }
 
-struct WebSecuritySettings {
-    basic_auth_header: Option<String>,
-    require_basic_auth_for_external_bind: bool,
-    reverse_proxy_mode: bool,
-}
-
-fn load_web_security_settings() -> Result<WebSecuritySettings, String> {
-    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let global_setting: HashMap<String, Value> = inventory
-        .load("global_setting", InventoryScope::Global)
-        .unwrap_or_default();
-    Ok(WebSecuritySettings {
-        basic_auth_header: basic_auth_header_from_settings(&global_setting),
-        require_basic_auth_for_external_bind: require_basic_auth_for_external_bind_from_settings(
-            &global_setting,
-        ),
-        reverse_proxy_mode: reverse_proxy_mode_from_settings(&global_setting),
-    })
-}
-
-fn basic_auth_header_from_settings(global_setting: &HashMap<String, Value>) -> Option<String> {
-    let enabled = yaml_bool(global_setting.get("server-basic-auth.enable")).unwrap_or(false);
-    if !enabled {
-        return None;
-    }
-    let user = yaml_string(global_setting.get("server-basic-auth.user")).unwrap_or_default();
-    let password =
-        yaml_string(global_setting.get("server-basic-auth.password")).unwrap_or_default();
-    if user.is_empty() || password.is_empty() {
-        return None;
-    }
-    let token = encode_base64(format!("{}:{}", user, password).as_bytes());
-    Some(format!("Basic {}", token))
-}
-
-fn require_basic_auth_for_external_bind_from_settings(
-    global_setting: &HashMap<String, Value>,
-) -> bool {
-    yaml_bool(global_setting.get("server-basic-auth.require-for-external-bind")).unwrap_or(true)
-}
-
-fn reverse_proxy_mode_from_settings(global_setting: &HashMap<String, Value>) -> bool {
-    yaml_bool(global_setting.get("server-reverse-proxy.enable")).unwrap_or(false)
-}
+// `server-*` 系の導出値は `narou_rs::web::server_security::ServerSecurity` が
+// `global_setting` から再計算する。起動時と同じ関数を、保存 API フックと
+// `watch_server_settings` のポーリングからも呼び、稼働中の再適用を可能にする。
 
 #[cfg(test)]
 fn is_wildcard_bind_host(host: &str) -> bool {
@@ -543,80 +776,6 @@ fn is_wildcard_bind_host(host: &str) -> bool {
 
 fn requires_basic_auth_for_bind(host: &str) -> bool {
     !matches!(host, "127.0.0.1" | "localhost" | "::1")
-}
-
-fn default_ws_accepted_domains(host: &str) -> Vec<String> {
-    narou_rs::web::default_allowed_request_hosts(host)
-}
-
-fn load_ws_accepted_domains(host: &str, reverse_proxy_mode: bool) -> Result<Vec<String>, String> {
-    if reverse_proxy_mode {
-        return Ok(Vec::new());
-    }
-    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let global_setting: HashMap<String, Value> = inventory
-        .load("global_setting", InventoryScope::Global)
-        .unwrap_or_default();
-    let mut accepted_domains = default_ws_accepted_domains(host);
-    if let Some(extra) = yaml_string(global_setting.get("server-ws-add-accepted-domains")) {
-        accepted_domains.extend(
-            extra
-                .split(',')
-                .map(str::trim)
-                .filter(|domain| !domain.is_empty())
-                .map(ToString::to_string),
-        );
-    }
-    Ok(accepted_domains)
-}
-
-/// Parses the user-supplied `server-add-accepted-hosts` value (comma
-/// separated) into a vector of trimmed, non-empty host entries. Unsafe
-/// wildcard patterns (bare `*`, `*.com`, trailing wildcards, etc.) are
-/// rejected and skipped with a warning.
-fn parse_extra_allowed_hosts(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter(|s| {
-            if s.contains('*') && !narou_rs::web::is_safe_wildcard_pattern(s) {
-                tracing::warn!(
-                    "server-add-accepted-hosts: '{}' は安全なワイルドカードパターンではないため無視します",
-                    s
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .map(ToString::to_string)
-        .collect()
-}
-
-/// Loads the HTTP `Host` header allow-list: defaults from
-/// `default_allowed_request_hosts` plus the user-supplied
-/// `server-add-accepted-hosts` (comma-separated). Wildcard patterns such as
-/// `*.example.com` are kept verbatim here and validated at request time by
-/// `narou_rs::web::is_safe_wildcard_pattern`. Unsafe patterns are dropped with
-/// a warning log so the server still starts.
-fn load_http_allowed_request_hosts(
-    host: &str,
-    reverse_proxy_mode: bool,
-) -> Result<Vec<String>, String> {
-    if reverse_proxy_mode {
-        return Ok(Vec::new());
-    }
-    let mut allowed = narou_rs::web::default_allowed_request_hosts(host);
-    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let global_setting: HashMap<String, Value> = inventory
-        .load("global_setting", InventoryScope::Global)
-        .unwrap_or_default();
-    if let Some(extra) = yaml_string(global_setting.get("server-add-accepted-hosts")) {
-        allowed.extend(parse_extra_allowed_hosts(&extra));
-    }
-    allowed.sort();
-    allowed.dedup();
-    Ok(allowed)
 }
 
 fn generate_control_token() -> String {
@@ -630,8 +789,7 @@ fn confirm_first_web_boot(no_browser: bool, hide_console: bool) -> Result<bool, 
     let mut server_setting: HashMap<String, Value> = inventory
         .load("server_setting", InventoryScope::Global)
         .unwrap_or_default();
-    let is_first = !yaml_bool(server_setting.get("already-server-boot")).unwrap_or(false);
-    if !is_first {
+    if !is_first_web_boot(&server_setting) {
         return Ok(false);
     }
 
@@ -653,11 +811,33 @@ fn confirm_first_web_boot(no_browser: bool, hide_console: bool) -> Result<bool, 
         let _ = io::stdin().read_line(&mut buffer);
     }
 
-    server_setting.insert("already-server-boot".to_string(), Value::Bool(true));
+    mark_first_web_boot_done(&mut server_setting);
     inventory
         .save("server_setting", InventoryScope::Global, &server_setting)
         .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// `server_setting` の `already-server-boot` を読む。
+///
+/// narou.rb は素の文字列キー `"already-server-boot"` を読み書きするが、YAML
+/// ファイルには Ruby シンボル由来の `:already-server-boot:` キーが紛れ込む
+/// ことがあるため、読みは両形式を見る。
+fn is_first_web_boot(server_setting: &HashMap<String, Value>) -> bool {
+    let value = server_setting
+        .get("already-server-boot")
+        .or_else(|| server_setting.get(":already-server-boot"));
+    !value
+        .and_then(narou_rs::setting_core::setting_bool_value)
+        .unwrap_or(false)
+}
+
+/// `already-server-boot = true` を narou.rb と同じ素の文字列キーで書く
+/// (`narou.rb` は `setting["already-server-boot"]` を読む)。シンボルキー
+/// 由来の `:already-server-boot:` が残っていれば消して一本化する。
+fn mark_first_web_boot_done(server_setting: &mut HashMap<String, Value>) {
+    server_setting.remove(":already-server-boot");
+    server_setting.insert("already-server-boot".to_string(), Value::Bool(true));
 }
 
 fn find_available_web_port(host: &str) -> Result<u16, String> {
@@ -717,15 +897,6 @@ fn yaml_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn yaml_bool(value: Option<&Value>) -> Option<bool> {
-    match value {
-        Some(Value::Bool(b)) => Some(*b),
-        Some(Value::String(s)) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
-        Some(Value::Number(n)) => Some(n.as_i64().unwrap_or(0) != 0),
-        _ => None,
-    }
-}
-
 fn yaml_u16(value: Option<&Value>) -> Option<u16> {
     match value {
         Some(Value::Number(n)) => n.as_u64().and_then(|v| u16::try_from(v).ok()),
@@ -734,33 +905,151 @@ fn yaml_u16(value: Option<&Value>) -> Option<u16> {
     }
 }
 
-fn encode_base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut index = 0usize;
-    while index < input.len() {
-        let b0 = input[index];
-        let b1 = input.get(index + 1).copied().unwrap_or(0);
-        let b2 = input.get(index + 2).copied().unwrap_or(0);
-        let combined = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-
-        out.push(TABLE[((combined >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((combined >> 12) & 0x3f) as usize] as char);
-        if index + 1 < input.len() {
-            out.push(TABLE[((combined >> 6) & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if index + 2 < input.len() {
-            out.push(TABLE[(combined & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-
-        index += 3;
+/// Polls `local_setting` / `global_setting` for changes made outside this
+/// process (`narou setting`, manual YAML edits, other tools) and re-applies
+/// the affected runtime state:
+///
+/// - `server-*` 系 (`server-basic-auth.*` / `server-add-accepted-hosts` /
+///   `server-ws-add-accepted-domains` / `server-reverse-proxy.enable`) →
+///   `AppState::reload_server_security`
+/// - `update.auto-schedule(.enable/.timezone)` → 自動更新スケジューラの再起動
+/// - `webui.*` / `concurrency` → `webui.config.reload` をブラウザへ broadcast
+/// - `logging*` / `concurrency` (ログ分割) → `logger::init` で状態を再構築
+///
+/// 保存 API からの変更は `save_global_settings` が即時反映するため、この
+/// ポーリングは「外部編集が反映されるまでの最大遅延」を決めるだけ。
+fn watch_server_settings(state: narou_rs::web::AppState) -> tokio::task::JoinHandle<()> {
+    fn signature(
+        settings: &HashMap<String, Value>,
+        names: &[&str],
+    ) -> Vec<(String, Value)> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), settings.get(*name).cloned().unwrap_or(Value::Null)))
+            .collect()
     }
-    out
+
+    const AUTO_SCHEDULE_NAMES: &[&str] = &[
+        "update.auto-schedule.enable",
+        "update.auto-schedule",
+        "update.auto-schedule.timezone",
+    ];
+    const LOGGING_NAMES: &[&str] = &[
+        "logging",
+        "logging.format-filename",
+        "logging.format-timestamp",
+        "concurrency",
+    ];
+    /// 起動時に組んだストア (NativeStore / SqliteObjectStore / SplitStore) を
+    /// 組み替えないと反映できない設定。値をその場で差し替えると、CLI の
+    /// 子プロセス (新しい設定を読む) と常駐 Web (古いストア) が別の保存先を
+    /// 指すため、ここでは変更を検知して再起動を要求するだけにする。
+    /// 判定対象と文言は `SettingsEffect::StorageRestartRequired` と共有する。
+    const STORAGE_NAMES: &[&str] = narou_rs::native::application::STORAGE_RESTART_SETTING_NAMES;
+
+    tokio::spawn(async move {
+        let mut last_auto_schedule: Option<Vec<(String, Value)>> = None;
+        let mut last_webui: Option<Vec<(String, Value)>> = None;
+        let mut last_logging: Option<Vec<(String, Value)>> = None;
+        let mut last_storage: Option<Vec<(String, Value)>> = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            if !narou_rs::db::narou_root_exists() {
+                continue;
+            }
+
+            // global: server-* セキュリティ設定。load が失敗した tick は
+            // 既存の値を維持する (一時的な読み取り失敗で締め出さない)。
+            match narou_rs::web::server_security::ServerSecurity::load(&state.bind_host) {
+                Ok(security) => {
+                    if *state.server_security.read() != security {
+                        state.apply_server_security(&security);
+                        state
+                            .push_server
+                            .broadcast_echo("server-* 設定を再適用しました", "stdout");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("server 設定の再読み込みに失敗しました: {error}");
+                }
+            }
+
+            let local = settings_store::load(SettingScope::Local).unwrap_or_default();
+
+            let auto_schedule = signature(&local, AUTO_SCHEDULE_NAMES);
+            if last_auto_schedule.as_ref() == Some(&auto_schedule) {
+                // unchanged
+            } else {
+                let first = last_auto_schedule.replace(auto_schedule).is_none();
+                if !first {
+                    let started = narou_rs::web::scheduler::start_or_restart_auto_update_scheduler(
+                        state.services.scheduler.clone(),
+                        state.queue.clone(),
+                        state.running_jobs.clone(),
+                        state.push_server.clone(),
+                        &state.auto_update_scheduler,
+                    );
+                    let message = if started {
+                        "自動アップデートスケジューラーを更新しました"
+                    } else {
+                        "自動アップデートスケジューラーを停止しました"
+                    };
+                    state.push_server.broadcast_echo(message, "stdout");
+                }
+            }
+
+            let webui = signature(&local, narou_rs::application::LIVE_WEBUI_CONFIG_NAMES);
+            if last_webui.as_ref() == Some(&webui) {
+                // unchanged
+            } else {
+                let first = last_webui.replace(webui).is_none();
+                if !first {
+                    state.push_server.broadcast_event("webui.config.reload", "");
+                }
+            }
+
+            let logging = signature(&local, LOGGING_NAMES);
+            if last_logging.as_ref() == Some(&logging) {
+                // unchanged
+            } else {
+                let first = last_logging.replace(logging).is_none();
+                if !first {
+                    // 設定変更で LoggerState を再構築する。ロガーは lib 側
+                    // (`narou_rs::logger`) を bin と共有しているので 1 回で足りる。
+                    crate::logger::init();
+                }
+            }
+
+            let storage = signature(&local, STORAGE_NAMES);
+            if last_storage.as_ref() == Some(&storage) {
+                // unchanged
+            } else {
+                let first = last_storage.replace(storage).is_none();
+                if !first {
+                    // 常駐ストアを組み替えられないため、保存先の構成変更は
+                    // ストレージモード切替と同じ再起動経路に乗せる
+                    // (CLI の子プロセスだけ新設定を読み続ける混在を防ぐ)。
+                    let note = narou_rs::native::application::STORAGE_RESTART_REQUIRED_NOTE;
+                    match narou_rs::web::jobs::schedule_server_reboot(state.clone()).await {
+                        Ok(()) => {
+                            state.push_server.broadcast_event("reboot", "");
+                            state.push_server.broadcast_echo(note, "yellow");
+                        }
+                        Err(error) => {
+                            state.push_server.broadcast_echo(
+                                &format!(
+                                    "{note} (自動再起動に失敗したので手動で再起動して下さい: {error})"
+                                ),
+                                "yellow",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -769,12 +1058,40 @@ mod tests {
     use serde_yaml::Value;
 
     use super::{
-        basic_auth_header_from_settings, control_request_host, default_ws_accepted_domains,
-        display_host, encode_base64, generate_control_token, is_wildcard_bind_host,
-        normalize_bind_host, parse_extra_allowed_hosts,
-        require_basic_auth_for_external_bind_from_settings, requires_basic_auth_for_bind,
-        reverse_proxy_mode_from_settings,
+        control_request_host, display_host, generate_control_token, is_wildcard_bind_host,
+        normalize_bind_host, requires_basic_auth_for_bind,
     };
+
+    #[test]
+    fn first_boot_reads_both_key_forms() {
+        // narou.rb は素の文字列キー、紛れ込んだ YAML にはシンボルキー由来の
+        // `:already-server-boot` もある。どちらも「起動済み」として読む。
+        let mut settings = HashMap::new();
+        assert!(super::is_first_web_boot(&settings));
+        settings.insert("already-server-boot".to_string(), Value::Bool(true));
+        assert!(!super::is_first_web_boot(&settings));
+
+        let mut symbol_only = HashMap::new();
+        symbol_only.insert(":already-server-boot".to_string(), Value::Bool(true));
+        assert!(!super::is_first_web_boot(&symbol_only));
+
+        let mut symbol_false = HashMap::new();
+        symbol_false.insert(":already-server-boot".to_string(), Value::Bool(false));
+        assert!(super::is_first_web_boot(&symbol_false));
+    }
+
+    #[test]
+    fn first_boot_write_uses_plain_key_and_drops_symbol_key() {
+        // 書き込みは narou.rb が読む素のキー一本に揃える。
+        let mut settings = HashMap::new();
+        settings.insert(":already-server-boot".to_string(), Value::Bool(false));
+        super::mark_first_web_boot_done(&mut settings);
+        assert_eq!(
+            settings.get("already-server-boot"),
+            Some(&Value::Bool(true))
+        );
+        assert!(!settings.contains_key(":already-server-boot"));
+    }
 
     #[test]
     fn normalize_bind_host_defaults_to_loopback() {
@@ -791,11 +1108,6 @@ mod tests {
         assert_eq!(display_host("0.0.0.0"), "0.0.0.0");
     }
 
-    #[test]
-    fn encode_base64_matches_basic_examples() {
-        assert_eq!(encode_base64(b"user:pass"), "dXNlcjpwYXNz");
-        assert_eq!(encode_base64(b"ab"), "YWI=");
-    }
 
     #[test]
     fn wildcard_bind_hosts_require_explicit_auth() {
@@ -804,70 +1116,12 @@ mod tests {
         assert!(!requires_basic_auth_for_bind("127.0.0.1"));
     }
 
-    #[test]
-    fn external_bind_auth_guard_defaults_to_enabled() {
-        let settings = HashMap::new();
-        assert!(require_basic_auth_for_external_bind_from_settings(
-            &settings
-        ));
-    }
-
-    #[test]
-    fn external_bind_auth_guard_can_be_disabled() {
-        let mut settings = HashMap::new();
-        settings.insert(
-            "server-basic-auth.require-for-external-bind".to_string(),
-            Value::Bool(false),
-        );
-        assert!(!require_basic_auth_for_external_bind_from_settings(
-            &settings
-        ));
-    }
-
-    #[test]
-    fn reverse_proxy_mode_defaults_to_disabled() {
-        let settings = HashMap::new();
-        assert!(!reverse_proxy_mode_from_settings(&settings));
-    }
-
-    #[test]
-    fn reverse_proxy_mode_can_be_enabled() {
-        let mut settings = HashMap::new();
-        settings.insert("server-reverse-proxy.enable".to_string(), Value::Bool(true));
-        assert!(reverse_proxy_mode_from_settings(&settings));
-    }
-
-    #[test]
-    fn basic_auth_header_uses_setting_values() {
-        let mut settings = HashMap::new();
-        settings.insert("server-basic-auth.enable".to_string(), Value::Bool(true));
-        settings.insert(
-            "server-basic-auth.user".to_string(),
-            Value::String("user".to_string()),
-        );
-        settings.insert(
-            "server-basic-auth.password".to_string(),
-            Value::String("pass".to_string()),
-        );
-
-        assert_eq!(
-            basic_auth_header_from_settings(&settings).as_deref(),
-            Some("Basic dXNlcjpwYXNz")
-        );
-    }
 
     #[test]
     fn control_token_generation_is_non_empty() {
         let token = generate_control_token();
         assert_eq!(token.len(), 32);
         assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn wildcard_bind_defaults_do_not_accept_arbitrary_ws_domains() {
-        let domains = default_ws_accepted_domains("0.0.0.0");
-        assert!(domains.contains(&"127.0.0.1".to_string()));
-        assert!(!domains.iter().any(|domain| domain == "*"));
     }
 
     #[test]
@@ -878,41 +1132,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_extra_allowed_hosts_splits_and_trims() {
-        let parsed = parse_extra_allowed_hosts("narou.example.com, *.lan.example ,,  , foo");
-        assert_eq!(
-            parsed,
-            vec![
-                "narou.example.com".to_string(),
-                "*.lan.example".to_string(),
-                "foo".to_string(),
-            ]
-        );
-    }
+    fn ui_token_file_is_stable_and_private() {
+        // Other tests change the process-wide cwd, so anchor the artifact
+        // directory to the manifest instead of the current directory.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-artifacts")
+            .join(format!("web-ui-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
 
-    #[test]
-    fn parse_extra_allowed_hosts_drops_empty_input() {
-        assert!(parse_extra_allowed_hosts("").is_empty());
-        assert!(parse_extra_allowed_hosts("  , , ").is_empty());
-    }
+        let first = super::load_or_create_ui_token(&root).unwrap();
+        let second = super::load_or_create_ui_token(&root).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(root.join(".narou").join("ui_token").is_file());
 
-    #[test]
-    fn parse_extra_allowed_hosts_drops_unsafe_wildcards() {
-        // Unsafe patterns: bare *, *.com (too few labels), trailing wildcard, mid wildcard
-        let parsed =
-            parse_extra_allowed_hosts("*, *.com, *.example.com, example.com*, sub*.example.com");
-        assert_eq!(parsed, vec!["*.example.com".to_string()]);
-    }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join(".narou").join("ui_token"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
 
-    #[test]
-    fn parse_extra_allowed_hosts_preserves_safe_wildcard() {
-        let parsed = parse_extra_allowed_hosts("*.example.com, foo.bar.example.com");
-        assert_eq!(
-            parsed,
-            vec![
-                "*.example.com".to_string(),
-                "foo.bar.example.com".to_string(),
-            ]
-        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

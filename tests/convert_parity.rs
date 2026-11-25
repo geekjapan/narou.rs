@@ -22,6 +22,7 @@ fn story_html_is_converted_before_text_pipeline() {
             subdate: String::new(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         }],
         novel_type: Some(1),
     };
@@ -35,6 +36,7 @@ fn story_html_is_converted_before_text_pipeline() {
         subdate: String::new(),
         subupdate: None,
         download_time: None,
+        download_revision: 0,
         element: SectionElement {
             data_type: "text".to_string(),
             introduction: String::new(),
@@ -44,7 +46,7 @@ fn story_html_is_converted_before_text_pipeline() {
     }];
 
     let mut converter = NovelConverter::new(NovelSettings::default());
-    let output = converter.convert_novel(&toc, &sections).unwrap();
+    let output = converter.convert_novel(&toc, &sections, None).unwrap();
 
     assert!(!output.contains("<br"));
     assert!(!output.contains("ｂｒ"));
@@ -52,9 +54,95 @@ fn story_html_is_converted_before_text_pipeline() {
 }
 
 #[test]
+fn synthetic_html_entities_match_literal_spaces_through_conversion() {
+    // Original synthetic prose only; no untracked novel or network dependency.
+    let toc = TocObject {
+        title: "変換テスト".to_string(),
+        author: "テスト作者".to_string(),
+        toc_url: String::new(),
+        story: Some("<p>甲&nbsp;乙</p>".to_string()),
+        subtitles: Vec::new(),
+        novel_type: Some(1),
+    };
+    let section: SectionFile = serde_yaml::from_str(
+        r#"
+index: '1'
+href: '/1/'
+subtitle: 第一話
+file_subtitle: 第一話
+subdate: ''
+element:
+  data_type: html
+  introduction: '<p>前&nbsp;書き</p>'
+  body: '<p>&nbsp;本文&nbsp;甲。</p><p>乙&nbsp;丙。</p>'
+  postscript: '<p>後&nbsp;書き</p>'
+"#,
+    )
+    .unwrap();
+    let mut literal_toc = toc.clone();
+    literal_toc.story = toc.story.as_ref().map(|story| story.replace("&nbsp;", " "));
+    let mut literal_section = section.clone();
+    literal_section.element.introduction = section.element.introduction.replace("&nbsp;", " ");
+    literal_section.element.body = section.element.body.replace("&nbsp;", " ");
+    literal_section.element.postscript = section.element.postscript.replace("&nbsp;", " ");
+
+    let encoded = NovelConverter::new(NovelSettings::default())
+        .convert_novel(&toc, &[section], None)
+        .unwrap();
+    let literal = NovelConverter::new(NovelSettings::default())
+        .convert_novel(&literal_toc, &[literal_section], None)
+        .unwrap();
+    assert_eq!(encoded.as_bytes(), literal.as_bytes());
+    assert!(!encoded.contains('\u{00A0}'));
+    assert!(encoded.contains("本文"));
+}
+
+#[test]
+fn setting_ini_value_equal_to_original_default_still_beats_default_scope() {
+    use std::collections::HashMap;
+
+    use narou_rs::converter::ini::IniData;
+
+    let resolve = |ini_text: &str, settings: &[(&str, bool)]| {
+        let ini = IniData::load(ini_text);
+        let map: HashMap<String, serde_yaml::Value> = settings
+            .iter()
+            .map(|(key, value)| (key.to_string(), serde_yaml::Value::Bool(*value)))
+            .collect();
+        NovelSettings::from_sources(Some(1), "title", "author", &ini, &map, false, false)
+            .enable_half_indent_bracket
+    };
+
+    // issue #42: `enable_half_indent_bracket` のオリジナル設定は true なので、
+    // setting.ini に true と明示した場合は default.* = false より優先される。
+    // 以前は「現在値がオリジナル設定と同じか」で ini の有無を判定していたため、
+    // この組み合わせだけ default.* が上書きしていた。
+    assert!(resolve(
+        "enable_half_indent_bracket = true\n",
+        &[("default.enable_half_indent_bracket", false)],
+    ));
+    // 明示された false は default.* = true に勝つ。
+    assert!(!resolve(
+        "enable_half_indent_bracket = false\n",
+        &[("default.enable_half_indent_bracket", true)],
+    ));
+    // force.* は setting.ini より強い。
+    assert!(!resolve(
+        "enable_half_indent_bracket = true\n",
+        &[("force.enable_half_indent_bracket", false)],
+    ));
+}
+
+#[test]
+#[ignore = "requires local, untracked narou.rb reference novels; see tests/README.md"]
 fn kakuyomu_sample_matches_narou_rb_reference_byte_for_byte() {
-    let root = std::env::current_dir().unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let kakuyomu_root = root.join("sample").join("novel").join("小説データ").join("カクヨム");
+    assert!(
+        kakuyomu_root.is_dir(),
+        "reference fixture directory is missing: {}",
+        kakuyomu_root.display()
+    );
     let mut checked = 0;
 
     for entry in fs::read_dir(&kakuyomu_root).expect("kakuyomu sample root") {
@@ -137,7 +225,7 @@ fn convert_sample_to_string(converter: &mut NovelConverter, novel_dir: &Path) ->
         })
         .collect::<Vec<_>>();
 
-    converter.convert_novel(&toc_object, &sections).unwrap()
+    converter.convert_novel(&toc_object, &sections, None).unwrap()
 }
 
 fn find_reference_output(root: &Path) -> Option<PathBuf> {

@@ -37,74 +37,74 @@ fn render_inline_ctx(s: &str, illust: Option<&IllustMap>) -> String {
 
     while i < n {
         // 既存の <a ...>...</a> アンカーはそのまま通す（属性・本文は健全化）。
-        if starts_with(&chars, i, "<a ") {
-            if let Some(end) = find_sub(&chars, i, "</a>") {
-                let frag: String = chars[i..end + 4].iter().collect();
-                out.push_str(&sanitize_anchor(&frag));
-                i = end + 4;
-                continue;
-            }
+        if starts_with(&chars, i, "<a ")
+            && let Some(end) = find_sub(&chars, i, "</a>")
+        {
+            let frag: String = chars[i..end + 4].iter().collect();
+            out.push_str(&sanitize_anchor(&frag));
+            i = end + 4;
+            continue;
         }
 
         // ※［＃ ... ］ 形式の名前付き外字。
-        if starts_with(&chars, i, "※［＃") {
-            if let Some(close) = find_char(&chars, i + 3, '］') {
-                let inner: String = chars[i + 3..close].iter().collect();
-                match gaiji::resolve_named(&inner) {
-                    Some(c) => out.push_str(&escape_text(&c)),
-                    None => out.push(gaiji::FALLBACK_CHAR),
-                }
-                i = close + 1;
-                continue;
+        if starts_with(&chars, i, "※［＃")
+            && let Some(close) = find_char(&chars, i + 3, '］')
+        {
+            let inner: String = chars[i + 3..close].iter().collect();
+            match gaiji::resolve_named(&inner) {
+                Some(c) => out.push_str(&escape_text(&c)),
+                None => out.push(gaiji::FALLBACK_CHAR),
             }
+            i = close + 1;
+            continue;
         }
 
         // ［＃ ... ］ 形式（ペアのインライン注記 / 面区点外字 / 未知）。
-        if starts_with(&chars, i, "［＃") {
-            if let Some(close) = find_char(&chars, i + 2, '］') {
-                let tag: String = chars[i + 2..close].iter().collect();
+        if starts_with(&chars, i, "［＃")
+            && let Some(close) = find_char(&chars, i + 2, '］')
+        {
+            let tag: String = chars[i + 2..close].iter().collect();
 
-                // 挿絵 ［＃挿絵（PATH）入る］。
-                if let Some(path) = tag
-                    .strip_prefix("挿絵（")
-                    .and_then(|r| r.strip_suffix("）入る"))
-                {
-                    // 行内に混在した場合は <p> をネストさせないよう裸の <img/> を出す。
-                    // 行全体が挿絵のみの場合はブロック側 (render_illust_line) が処理する。
-                    if let Some(href) = illust.and_then(|m| m.get(path)) {
-                        out.push_str(&format!(
-                            "<img src=\"{}\" alt=\"\"/>",
-                            escape_attr(href)
-                        ));
-                    }
-                    i = close + 1;
-                    continue;
+            // 挿絵 ［＃挿絵（PATH）入る］。
+            if let Some(path) = tag
+                .strip_prefix("挿絵（")
+                .and_then(|r| r.strip_suffix("）入る"))
+            {
+                // 行内に混在した場合は <p> をネストさせないよう裸の <img/> を出す。
+                // 行全体が挿絵のみの場合はブロック側 (render_illust_line) が処理する。
+                if let Some(href) = illust.and_then(|m| m.get(path)) {
+                    out.push_str(&format!(
+                        "<img src=\"{}\" alt=\"\"/>",
+                        escape_attr(href)
+                    ));
                 }
-
-                if let Some((closer, (open_html, close_html))) = inline_open_tag(&tag) {
-                    let end_marker: Vec<char> = format!("［＃{closer}］").chars().collect();
-                    if let Some(epos) = find_seq(&chars, close + 1, &end_marker) {
-                        let inner: String = chars[close + 1..epos].iter().collect();
-                        out.push_str(open_html);
-                        out.push_str(&render_inline_ctx(&inner, illust));
-                        out.push_str(close_html);
-                        i = epos + end_marker.len();
-                        continue;
-                    }
-                }
-
-                if tag.contains('、') {
-                    if let Some(c) = gaiji::resolve_named(&tag) {
-                        out.push_str(&escape_text(&c));
-                        i = close + 1;
-                        continue;
-                    }
-                }
-
-                // 未知注記はマーカーのみ除去し、本文は残す。
                 i = close + 1;
                 continue;
             }
+
+            if let Some((closer, (open_html, close_html))) = inline_open_tag(&tag) {
+                let end_marker: Vec<char> = format!("［＃{closer}］").chars().collect();
+                if let Some(epos) = find_seq(&chars, close + 1, &end_marker) {
+                    let inner: String = chars[close + 1..epos].iter().collect();
+                    out.push_str(open_html);
+                    out.push_str(&render_inline_ctx(&inner, illust));
+                    out.push_str(close_html);
+                    i = epos + end_marker.len();
+                    continue;
+                }
+            }
+
+            if tag.contains('、')
+                && let Some(c) = gaiji::resolve_named(&tag)
+            {
+                out.push_str(&escape_text(&c));
+                i = close + 1;
+                continue;
+            }
+
+            // 未知注記はマーカーのみ除去し、本文は残す。
+            i = close + 1;
+            continue;
         }
 
         // ルビ。標準青空形式 ｜親《ルビ》と、narou.rb がギュメ ≪≫ / パーレン （） ルビを
@@ -124,18 +124,18 @@ fn render_inline_ctx(s: &str, illust: Option<&IllustMap>) -> String {
                 (None, Some(cp)) if cp > i + 1 => Some((cp, '」')),
                 _ => None,
             };
-            if let Some((obrace, close)) = bracket {
-                if let Some(cbrace) = find_char(&chars, obrace + 1, close) {
-                    let base: String = chars[i + 1..obrace].iter().collect();
-                    let ruby: String = chars[obrace + 1..cbrace].iter().collect();
-                    out.push_str("<ruby>");
-                    out.push_str(&render_inline_ctx(&base, illust));
-                    out.push_str("<rt>");
-                    out.push_str(&escape_text(&ruby));
-                    out.push_str("</rt></ruby>");
-                    i = cbrace + 1;
-                    continue;
-                }
+            if let Some((obrace, close)) = bracket
+                && let Some(cbrace) = find_char(&chars, obrace + 1, close)
+            {
+                let base: String = chars[i + 1..obrace].iter().collect();
+                let ruby: String = chars[obrace + 1..cbrace].iter().collect();
+                out.push_str("<ruby>");
+                out.push_str(&render_inline_ctx(&base, illust));
+                out.push_str("<rt>");
+                out.push_str(&escape_text(&ruby));
+                out.push_str("</rt></ruby>");
+                i = cbrace + 1;
+                continue;
             }
         }
 
@@ -352,19 +352,17 @@ fn push_escaped(out: &mut String, c: char) {
 
 /// `<a href="URL">TEXT</a>` を健全な XHTML アンカーへ整形する。
 fn sanitize_anchor(frag: &str) -> String {
-    if let Some(rest) = frag.strip_prefix("<a href=\"") {
-        if let Some(qpos) = rest.find('"') {
-            let href = &rest[..qpos];
-            if let Some(after) = rest[qpos..].strip_prefix("\">") {
-                if let Some(text) = after.strip_suffix("</a>") {
-                    return format!(
-                        "<a href=\"{}\">{}</a>",
-                        escape_attr(href),
-                        escape_text(text)
-                    );
-                }
-            }
-        }
+    if let Some(rest) = frag.strip_prefix("<a href=\"")
+        && let Some(qpos) = rest.find('"')
+        && let Some(after) = rest[qpos..].strip_prefix("\">")
+        && let Some(text) = after.strip_suffix("</a>")
+    {
+        let href = &rest[..qpos];
+        return format!(
+            "<a href=\"{}\">{}</a>",
+            escape_attr(href),
+            escape_text(text)
+        );
     }
     escape_text(frag)
 }

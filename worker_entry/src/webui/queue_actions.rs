@@ -1,0 +1,389 @@
+//! Web UI のキュー操作系エンドポイント (D1 台帳 `worker_jobs` ベース)。
+//!
+//! JSON parity with the native handlers in `src/web/jobs.rs`:
+//! - `queue_clear`      → POST /api/queue/clear
+//! - `api_cancel`       → POST /api/cancel (Ruby parity: running only,
+//!   pending は消さない。`/api/queue/cancel` は未割当)
+//! - `cancel_running_task` → POST /api/cancel_running_task
+//! - `remove_pending_task` → POST /api/remove_pending_task
+//! - `restore_pending_tasks` → POST /api/restore_pending_tasks
+//! - `defer_restore_pending_tasks` → POST /api/defer_restore_pending_tasks
+//! - `reorder_pending_tasks` → POST /api/reorder_pending_tasks (501)
+//!
+//! 台帳セマンティクス (`ledger.rs` の "Web UI queue mutations" を参照):
+//! - 「キューから外す」は行削除ではなく `permanent` tombstone。Cloudflare
+//!   Queue は送信済みメッセージを保持するので、行を消すと配信時に
+//!   `record_rejected` が `kind='unknown'` の phantom `blocked` 行を挿入して
+//!   しまう。tombstone なら再配信は `AlreadyTerminal` → ack で解決し、
+//!   台帳の dedupe index からも外れる (native 同様、同じ対象を即再投入可)。
+//!   副作用として Web UI では `failed` バケットに数えられる — 第 1 波の
+//!   写像 (`permanent` + `blocked` → `failed`) と矛盾しない唯一の状態。
+//! - running job の中断は Wasm を途中で殺せないため、tombstone 後も
+//!   execution_token と lease を保持し、物理実行が戻るまで解放しない。以降
+//!   の check_active は失敗し、終端 CAS が停止を確認してから予約 ID/namespace
+//!   を解放する。作成予約を含む checkpoint は解放完了まで残し、クラッシュ
+//!   時は cron が回収する。
+//!   未実行の pending 予約は取消と同じ batch で解放し、配信待ちにしない。
+//! - native の restorable tasks (停止時に running だったジョブ) に相当する
+//!   のは、実行中の Worker が失われて lease 切れになった `running` 行。
+//!   `claim` の lease 期限分岐が回収できるので、envelope を再送して復元する。
+
+use narou_rs::application::JobId;
+use serde::Deserialize;
+use serde_json::json;
+use worker::{console_log, Env, Method, Request, Response};
+
+use crate::composition::WorkerRuntime;
+
+use super::json_error;
+
+/// `cancel_pending_task` などが `last_error` に残す理由 (台帳の記録用、
+/// Web UI の失敗理由表示と同じく英語の機械可読文字列)。
+pub(super) const REASON_REMOVED: &str = "removed from queue by user via Web UI";
+pub(super) const REASON_QUEUE_CLEARED: &str = "queue cleared by user via Web UI";
+/// running 行の tombstone 理由。`crate::consumer` はこの文字列を「実行中に
+/// ユーザーがキャンセルした」判定に使う (native の killed child →
+/// `JobOutcome::Cancelled` 相当) ので、真実源は consumer 側に 1 つだけ置く。
+const REASON_CANCELLED: &str = crate::consumer::USER_CANCEL_REASON;
+
+/// `src/web/state.rs::TaskIdBody` と同じ形 (`{"task_id": "..."}`)。
+#[derive(Debug, Deserialize)]
+struct TaskIdBody {
+    task_id: String,
+}
+
+/// `src/web/state.rs::ReorderBody` と同じ形。リクエストの検証 (native の
+/// `Json<ReorderBody>` による 4xx 拒否と同じタイミング) のためだけに使う;
+/// 並べ替え自体は Worker では実現不能 (下の `reorder_pending_tasks` 参照)。
+#[derive(Debug, Deserialize)]
+struct ReorderBody {
+    #[allow(dead_code)]
+    task_ids: Vec<String>,
+}
+
+/// Entry point; `lib.rs` routes the queue-action paths here.
+pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
+    match req.path().as_str() {
+        "/api/queue/clear" => queue_clear(req, env).await,
+        "/api/cancel" => cancel(req, env).await,
+        "/api/cancel_running_task" => cancel_running_task(req, env).await,
+        "/api/remove_pending_task" => remove_pending_task(req, env).await,
+        "/api/restore_pending_tasks" => restore_pending_tasks(req, env).await,
+        "/api/reorder_pending_tasks" => reorder_pending_tasks(req, env).await,
+        "/api/defer_restore_pending_tasks" => defer_restore_pending_tasks(req, env).await,
+        _ => Response::error("Not Found", 404),
+    }
+}
+
+/// native `ApiResponse` (`{success, message}`)。成功時も失敗時も HTTP 200 —
+/// `queue_clear` / `remove_pending_task` はこの形で返す。
+fn api_response(success: bool, message: &str) -> worker::Result<Response> {
+    Response::from_json(&super::api_response(success, message))
+}
+
+fn api_failure(message: impl std::fmt::Display) -> worker::Result<Response> {
+    api_response(false, &message.to_string())
+}
+
+/// native `src/web/jobs.rs::notify_queue_changed` 相当。キュー書き換えが
+/// 成功したことを UI (`main.js` の `notification.queue`) に知らせる。
+/// 表示更新なので best-effort — 送信失敗でも応答は変えない。
+async fn notify_queue_changed(env: &Env, runtime: &WorkerRuntime) {
+    let push = crate::push_hub::PushHubClient::new(env, runtime.subrequests.clone());
+    crate::consumer::notify_queue_changed(&push).await;
+}
+
+/// Cancel APIs also close progress for executions that can no longer report
+/// their own terminal event (expired/orphaned invocations).
+async fn notify_running_cancelled(env: &Env, runtime: &WorkerRuntime, job_id: JobId) {
+    let push = crate::push_hub::PushHubClient::new(env, runtime.subrequests.clone());
+    crate::push_hub::broadcast_terminal_events(
+        &push,
+        &job_id,
+        &[narou_rs::application::push_events::queue_cancelled(job_id.as_str())],
+        crate::consumer::table_reload_after_job(runtime).await,
+    ).await;
+}
+
+/// Build the runtime or finish with the native-style 503 error response
+/// (`webui/download.rs` と同じ形)。
+macro_rules! runtime_or_503 {
+    ($env:expr) => {
+        match WorkerRuntime::build_ui(&$env).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                console_log!("service composition failed: {error}");
+                return json_error(503, "service_unavailable", None);
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/queue/clear — native `queue_clear` (`clear_non_running`)
+// ---------------------------------------------------------------------------
+
+async fn queue_clear(req: Request, env: Env) -> worker::Result<Response> {
+    if req.method() != Method::Post {
+        return json_error(405, "method_not_allowed", None);
+    }
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    let runtime = runtime_or_503!(env);
+
+    // `clear_non_running`: pending (=`pending` + `retryable`) を全部外す;
+    // running は残す。除去済み行の tombstone は再配信防止に残すが、
+    // キューの集計では失敗として数えない。
+    if let Err(error) = runtime.ledger.cancel_all_pending(REASON_QUEUE_CLEARED).await {
+        return api_failure(error);
+    }
+    if let Err(error) = crate::scheduler::recover_creation_reservations(&runtime).await {
+        return api_failure(error);
+    }
+    let running_count = match runtime.ledger.running_job_count().await {
+        Ok(count) => count,
+        Err(_) => return json_error(500, "ledger_read_failed", None),
+    };
+    // native `queue_clear` は `clear_non_running` の Ok 分岐で送る。台帳を読む
+    // この分岐が成功した時点で書き換えは確定している (native の `running_count`
+    // は非 fallible なので、worker では fallible な読み込みの後に置く)。
+    notify_queue_changed(&env, &runtime).await;
+    api_response(
+        true,
+        if running_count > 0 {
+            "Queue cleared (running tasks kept)"
+        } else {
+            "Queue cleared"
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/cancel — native `api_cancel`: running を中断 (pending は残す)
+// ---------------------------------------------------------------------------
+
+async fn cancel(req: Request, env: Env) -> worker::Result<Response> {
+    if req.method() != Method::Post {
+        return json_error(405, "method_not_allowed", None);
+    }
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    let runtime = runtime_or_503!(env);
+
+    // `kill_running_child` 相当: 実行中ジョブを tombstone して結果を記録
+    // 不能にする。native はパイプライン上の共有プロセスを殺すので lane 単位
+    // だったが、worker の各ジョブは独立した実行なので関連ジョブを道連れに
+    // する必要はない — ここは native 同様「全 running」を対象にする。
+    let before = runtime.now_rfc3339();
+    let mut after = String::new();
+    loop {
+        let running_ids = match runtime.ledger.running_job_ids(&after, &before).await {
+            Ok(ids) => ids,
+            Err(_) => return json_error(500, "ledger_read_failed", None),
+        };
+        if running_ids.is_empty() { break; }
+        for job_id in running_ids {
+            after.clone_from(&job_id);
+            match runtime.ledger.cancel_running_job(&job_id, REASON_CANCELLED).await {
+                Ok(true) => notify_running_cancelled(&env, &runtime, JobId(job_id)).await,
+                Ok(false) => {}
+                Err(error) => return api_failure(error),
+            }
+        }
+    }
+    // native `api_cancel` は `kill_running_child` の直後に無条件で送る
+    // (対象 0 件でも成功応答では同じ)。
+    notify_queue_changed(&env, &runtime).await;
+    api_response(true, "キャンセルしました")
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/cancel_running_task — native `cancel_running_task`
+// ---------------------------------------------------------------------------
+
+async fn cancel_running_task(mut req: Request, env: Env) -> worker::Result<Response> {
+    if req.method() != Method::Post {
+        return json_error(405, "method_not_allowed", None);
+    }
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    let body: TaskIdBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    let runtime = runtime_or_503!(env);
+
+    match runtime
+        .ledger
+        .cancel_running_job(&body.task_id, REASON_CANCELLED)
+        .await
+    {
+        // native は kill 成功 (`Ok(true)`) のみで送り、失敗応答には送らない。
+        Ok(true) => {
+            notify_running_cancelled(&env, &runtime, JobId(body.task_id)).await;
+            Response::from_json(&json!({ "status": "ok" }))
+        }
+        Ok(false) => Response::from_json(
+            &json!({ "error": "実行中の処理を中断できませんでした" }),
+        ),
+        Err(error) => api_failure(error),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/remove_pending_task — native `remove_pending_task` (`remove_pending`)
+// ---------------------------------------------------------------------------
+
+async fn remove_pending_task(mut req: Request, env: Env) -> worker::Result<Response> {
+    if req.method() != Method::Post {
+        return json_error(405, "method_not_allowed", None);
+    }
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    let body: TaskIdBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    let runtime = runtime_or_503!(env);
+
+    // `remove_pending` parity: pending に無い id (running / 終了済み / 未知)
+    // は `Ok(false)` → `success:false` で返す。
+    match runtime
+        .ledger
+        .cancel_pending_job(&body.task_id, REASON_REMOVED)
+        .await
+    {
+        // native は削除成功 (`Ok(true)`) のみで送る。
+        Ok(true) => {
+            // The cancelled row keeps its creation reservation until the
+            // fenced release succeeds; the lane dispatcher then assigns the
+            // freed identity again.
+            if let Err(error) = crate::consumer::advance_terminal_creation(&runtime, &JobId(body.task_id.clone())).await {
+                return api_failure(error);
+            }
+            if let Err(error) = runtime.dispatch_acquisition().await {
+                worker::console_log!("acquisition dispatch after cancellation failed: {error}");
+            }
+            notify_queue_changed(&env, &runtime).await;
+            api_response(true, "Task removed")
+        }
+        Ok(false) => api_response(false, "キューから削除できませんでした"),
+        Err(error) => api_failure(error),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/restore_pending_tasks — native `restore_pending_tasks`
+// (`activate_restorable_tasks`)
+// ---------------------------------------------------------------------------
+
+async fn restore_pending_tasks(req: Request, env: Env) -> worker::Result<Response> {
+    if req.method() != Method::Post {
+        return json_error(405, "method_not_allowed", None);
+    }
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    let runtime = runtime_or_503!(env);
+
+    // native は停止時に `running` のままディスクに残ったジョブを pending に
+    // 戻す。worker で同じ状態にあるのは、実行中の isolate が失われて lease
+    // 切れ (または lease 未記録) になった `running` 行だけ。これらは
+    // `claim` の lease 期限分岐が回収できるので envelope を再送する。
+    // pending/retryable 行は再送不要 — それらのメッセージは Queue 側に
+    // 生存中か、配信が消えたか区別できないため、無条件再送は二重投入に
+    // なり得る (dedupe は active 行を見るので Ledger 側は防げても Queue 側
+    // の順序は汚れる)。配信が消えた行は cron の reaper
+    // (`scheduler::reap_stuck_jobs`) が猶予付きで検出して再送・確定する。
+    let before = runtime.now_rfc3339();
+    let mut after = String::new();
+    let mut count = 0usize;
+    loop {
+        let stale_jobs = match runtime.ledger.stale_running_jobs(&after, &before).await {
+            Ok(jobs) => jobs,
+            Err(error) => return Response::from_json(&json!({ "error": error.to_string() })),
+        };
+        if stale_jobs.is_empty() { break; }
+        for job in stale_jobs {
+            after.clone_from(&job.job_id);
+            let recovered = async {
+                if runtime.ledger.finalize_stuck(&job.job_id, &before, u32::MAX, "execution recovery exhausted without checkpoint progress").await? {
+                    return Ok::<bool, narou_rs::error::NarouError>(false);
+                }
+                if !runtime.ledger.touch_for_reenqueue(&job.job_id, &before).await? { return Ok(false); }
+                runtime.send_existing_job(&JobId::from(job.job_id), &job.kind).await?;
+                Ok(true)
+            }.await;
+            match recovered {
+                Ok(true) => count += 1,
+                Ok(false) => {}
+                Err(error) => return Response::from_json(&json!({ "error": error.to_string() })),
+            }
+        }
+    }
+    // native `restore_pending_tasks` は `activate_restorable_tasks` の Ok 後に
+    // 無条件で送る (失敗応答 `{error}` では送らない — worker も同じ)。
+    notify_queue_changed(&env, &runtime).await;
+    Response::from_json(&json!({ "status": "ok", "count": count }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/defer_restore_pending_tasks — native `defer_restorable_tasks`
+// ---------------------------------------------------------------------------
+
+async fn defer_restore_pending_tasks(req: Request, env: Env) -> worker::Result<Response> {
+    if req.method() != Method::Post {
+        return json_error(405, "method_not_allowed", None);
+    }
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    // native は「後で復元する」フラグを立てるだけでジョブ自体は動かさない。
+    // worker 側に deferred 集合は無く、lease 切れの running 行はいつでも
+    // restore 可能なので、状態を持たないこの環境では承諾だけを返すのが
+    // 正直な応答 (native 同様 `{"status": "ok"}`)。
+    //
+    // native は Ok 分岐で `notification.queue` を送る。このハンドラは runtime
+    // を組み立てない (組立失敗で 503 を新設したくない — 応答を変えない) ので、
+    // 送信専用の budget を新規に割り当てて送る。
+    let push = crate::push_hub::PushHubClient::new(&env, crate::budget::SubrequestBudget::new());
+    crate::consumer::notify_queue_changed(&push).await;
+    Response::from_json(&json!({ "status": "ok" }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/reorder_pending_tasks — 実現不能 (501)
+// ---------------------------------------------------------------------------
+
+async fn reorder_pending_tasks(mut req: Request, env: Env) -> worker::Result<Response> {
+    if req.method() != Method::Post {
+        return json_error(405, "method_not_allowed", None);
+    }
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    // native 同様、まず body の形だけ検証する (不正 JSON はここで 400)。
+    let _body: ReorderBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+
+    // 実行順序は Cloudflare Queue のメッセージ順であり、台帳側からは
+    // 変更できない。`created_at` を書き換えて表示順だけ変えるのは
+    // (実行順と表示が食い違うので) 成功の偽装に当たる — 並べ替えと再投入
+    // は新しい job_id と追加メッセージを要求し、tombstone と衝突する。
+    // よって `webui/library_backup.rs` 同様、成功を偽装せず 501 で返す。
+    json_error(
+        501,
+        "queue_reorder_not_supported",
+        Some(
+            "reordering pending tasks requires control over Cloudflare Queue \
+             message order, which the worker does not have; queue order is \
+             fixed at send time",
+        ),
+    )
+}

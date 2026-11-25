@@ -4,6 +4,8 @@
  */
 import { State, El, lsSet, persistListState } from '../core/state.js';
 import { fetchJson, postJson } from '../core/http.js';
+import { postSortedJson } from '../core/sort_state.js';
+import { canUseAction, applyActionCapabilities } from '../core/capabilities.js';
 import { showContextMenu, showTagColorMenu } from './context_menu.js';
 
 const TAG_COLOR_MAP = {
@@ -20,6 +22,27 @@ const ANNOTATION_COLOR_TIME_LIMIT_MS = 6 * 60 * 60 * 1000;
 
 let selectionDrag = null;
 let queueDragTaskId = null;
+let storyGeneration = 0;
+let storyOwner = null;
+let storyPopover = null;
+let rankedTags = null;
+let tagRanks = new Map();
+
+function closeStoryPopover() {
+  ++storyGeneration;
+  storyPopover?.remove();
+  storyPopover = null;
+  storyOwner = null;
+}
+
+document.addEventListener('click', event => {
+  if (storyOwner && !storyOwner.contains(event.target) && !storyPopover?.contains(event.target)) {
+    closeStoryPopover();
+  }
+}, true);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeStoryPopover();
+});
 
 function materialIcon(name, extraClass = '') {
   const cls = extraClass
@@ -33,6 +56,7 @@ function materialIcon(name, extraClass = '') {
 export function renderNovelList() {
   const tbody = El.novelListBody;
   if (!tbody) return;
+  closeStoryPopover();
 
   const sorted = getFilteredSortedNovels();
   const pageLength = normalizePageLength(State.pageLength);
@@ -42,6 +66,13 @@ export function renderNovelList() {
   const start = pageLength === -1 ? 0 : (State.currentPage - 1) * pageLength;
   const end = pageLength === -1 ? totalCount : Math.min(start + pageLength, totalCount);
   const visible = pageLength === -1 ? sorted : sorted.slice(start, end);
+
+  // The menu's server-sorted snapshot also defines the order of row badges.
+  if (rankedTags !== State.tags) {
+    rankedTags = State.tags;
+    tagRanks = new Map();
+    rankedTags.forEach((tag, index) => tagRanks.set(tag, index));
+  }
 
   const fragment = document.createDocumentFragment();
   for (let i = 0; i < visible.length; i++) {
@@ -187,6 +218,10 @@ function parseFilterToken(rawToken) {
   const token = rawToken.trim();
   const negate = token.startsWith('-') || token.startsWith('^') || token.startsWith('!');
   const body = negate ? token.slice(1) : token;
+  // A pasted URL is a plain search value, not an "https:" field token.
+  if (/^https?:\/\//i.test(body)) {
+    return { negate, field: '', value: body.trim().toLowerCase() };
+  }
   const colon = body.indexOf(':');
   const field = colon > 0 ? body.slice(0, colon).toLowerCase() : '';
   const value = (colon > 0 ? body.slice(colon + 1) : body).trim().toLowerCase();
@@ -240,6 +275,17 @@ function matchFilterToken(novel, token) {
     statusText,
     ...tags,
   ].join(' ');
+  // The same identities the server-side search accepts: a pasted page URL, the
+  // N-code or numeric id in it, and the record id itself.
+  const pageUrl = target(novel.display_url || novel.toc_url).replace(/\/+$/, '');
+  const urlSegment = pageUrl.split('/').pop() || '';
+  const matchIdentity = (value) => {
+    if (!value) return false;
+    if (value.includes('://')) return pageUrl.includes(value.replace(/\/+$/, ''));
+    return String(novel.id) === value
+      || target(novel.ncode).includes(value)
+      || urlSegment === value;
+  };
 
   switch (token.field) {
     case 'tag':
@@ -265,8 +311,8 @@ function matchFilterToken(novel, token) {
       break;
     default:
       matched = values.length > 0
-        ? values.some(v => plainText.includes(v))
-        : plainText.includes(token.value);
+        ? values.some(v => plainText.includes(v) || matchIdentity(v))
+        : plainText.includes(token.value) || matchIdentity(token.value);
       break;
   }
 
@@ -473,11 +519,10 @@ function createRow(novel, rowIndex) {
   // Status
   const statusText = getStatusText(novel);
 
-  // TOC URL link button
-  const tocUrl = novel.toc_url || '';
-  const tocLink = tocUrl
-    ? `<a href="${esc(tocUrl)}" target="_blank" rel="noopener" class="btn-link-icon" title="${esc(tocUrl)}">${materialIcon('link', 'icon-only')}</a>`
-    : '';
+  // TOC URL link button. `display_url` is the page the novel was registered
+  // from; `toc_url` can be an API endpoint (Pixiv), which is not something to
+  // open in a browser.
+  const tocLink = renderNovelSourceLink(novel);
 
   // Episode count with "話" suffix (narou.rb style)
   const episodes = getEpisodeCount(novel);
@@ -496,7 +541,7 @@ function createRow(novel, rowIndex) {
 
   // Menu button (opens context menu) — glyphicon-option-horizontal equivalent
   const downloadLink = `<a href="/novels/${encodeURIComponent(String(novel.id))}/download" class="row-action-btn btn-download" title="書籍データをダウンロード">${materialIcon('download', 'icon-only')}</a>`;
-  const folderBtn = `<button class="row-action-btn btn-folder" data-folder-id="${novel.id}" type="button" title="保存先を開く">${materialIcon('folder_open', 'icon-only')}</button>`;
+  const folderBtn = `<button class="row-action-btn btn-folder" data-capability="open_folder" data-folder-id="${novel.id}" type="button" title="保存先を開く">${materialIcon('folder_open', 'icon-only')}</button>`;
   const updateBtn = `<button class="row-action-btn btn-update-action" data-update-id="${novel.id}" type="button" title="凍結済みでも更新">${materialIcon('refresh', 'icon-only')}</button>`;
   const menuBtn = `<button class="row-action-btn btn-menu-icon" data-menu-id="${novel.id}" type="button" title="個別メニュー">${materialIcon('more_horiz', 'icon-only')}</button>`;
 
@@ -551,7 +596,7 @@ function createRow(novel, rowIndex) {
     update.addEventListener('click', async (e) => {
       e.stopPropagation();
       try {
-        const result = await postJson('/api/update', { targets: [String(novel.id)], force: true });
+        const result = await postSortedJson('/api/update', { targets: [String(novel.id)], force: true });
         if (result?.success === false) {
           showNotification(result.message || '更新ジョブを追加できませんでした', 'warning');
         }
@@ -566,30 +611,34 @@ function createRow(novel, rowIndex) {
   if (storyBtn) {
     storyBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      const existing = document.querySelector('.story-popover');
-      if (existing) existing.remove();
-
+      if (storyOwner === storyBtn) {
+        closeStoryPopover();
+        return;
+      }
+      closeStoryPopover();
+      const generation = ++storyGeneration;
+      storyOwner = storyBtn;
+      const pop = document.createElement('div');
+      pop.className = 'story-popover';
+      pop.textContent = '読み込み中...';
+      storyPopover = pop;
+      document.body.appendChild(pop);
+      const rect = storyBtn.getBoundingClientRect();
+      pop.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+      pop.style.left = Math.max(0, rect.left + window.scrollX - 200) + 'px';
       const nid = storyBtn.dataset.storyId;
       try {
         const data = await fetchJson(`/api/story?id=${nid}`);
-        if (!data) return;
-        const pop = document.createElement('div');
-        pop.className = 'story-popover';
+        if (generation !== storyGeneration || storyOwner !== storyBtn || !storyBtn.isConnected) return;
+        if (!data) {
+          closeStoryPopover();
+          return;
+        }
         pop.innerHTML = `<div class="story-popover-title">${esc(data.title || '')}</div>
           <div class="story-popover-body">${renderMultilineHtml(data.story, '(あらすじなし)')}</div>`;
-        document.body.appendChild(pop);
-        const rect = storyBtn.getBoundingClientRect();
-        pop.style.top = (rect.bottom + window.scrollY + 4) + 'px';
-        pop.style.left = Math.max(0, rect.left + window.scrollX - 200) + 'px';
-
-        const dismiss = (ev) => {
-          if (!pop.contains(ev.target) && ev.target !== storyBtn) {
-            pop.remove();
-            document.removeEventListener('click', dismiss);
-          }
-        };
-        setTimeout(() => document.addEventListener('click', dismiss), 0);
-      } catch { /* ignore */ }
+      } catch {
+        if (generation === storyGeneration) closeStoryPopover();
+      }
     });
   }
 
@@ -750,9 +799,9 @@ export function getSelectedIdsInDisplayOrder() {
 }
 
 export function pruneSelectedIdsToCurrentList() {
-  const visibleIds = new Set(getFilteredNovels().map(novel => String(novel.id)));
+  const currentIds = new Set(State.novels.map(novel => String(novel.id)));
   for (const id of [...State.selectedIds]) {
-    if (!visibleIds.has(id)) {
+    if (!currentIds.has(id)) {
       State.selectedIds.delete(id);
     }
   }
@@ -799,12 +848,45 @@ export function updateEnableSelected() {
       el.classList.toggle('disabled', !hasSelection);
     }
   });
+  applyActionCapabilities();
 }
 
 /* ===== Tags ===== */
+export function attributeTagVisible(tag) {
+  // 属性タグ機能全体が OFF のときは種別スイッチに関係なく属性タグを出さない。
+  if (tag === '小説' || tag === '漫画') {
+    if (!State.attributeTagsEnabled) return false;
+    return tag === '小説' ? State.showNovelAttribute : State.showMangaAttribute;
+  }
+  return true;
+}
+
+/**
+ * 属性タグ機能全体のスイッチと種別スイッチの状態を UI に反映する。
+ * 機能 OFF の間は種別スイッチを無効化 (値は保存されたまま保持する)。
+ */
+export function syncAttributeTagControls() {
+  const master = document.getElementById('enable-attribute-tags');
+  if (master && master.dataset.saving !== '1') {
+    master.checked = Boolean(State.attributeTagsEnabled);
+  }
+  const enabled = Boolean(State.attributeTagsEnabled);
+  for (const id of ['show-novel-attribute', 'show-manga-attribute']) {
+    const checkbox = document.getElementById(id);
+    if (!checkbox) continue;
+    checkbox.disabled = !enabled || checkbox.dataset.saving === '1';
+  }
+}
+
+
+function compareTagRank(a, b) {
+  // A list response can contain a new tag before the menu snapshot does.
+  // Keep those badges visible, in their stored relative order, at the end.
+  return (tagRanks.get(a) ?? Number.MAX_SAFE_INTEGER) - (tagRanks.get(b) ?? Number.MAX_SAFE_INTEGER);
+}
 
 function renderTags(tags) {
-  return tags.map(tag => {
+  return tags.filter(attributeTagVisible).sort(compareTagRank).map(tag => {
     const colorName = State.tagColors[tag] || 'default';
     const cls = TAG_COLOR_MAP[colorName] || 'tag-default';
     return `<span class="tag-label ${cls}" data-tag="${escAttr(tag)}">${esc(tag)}</span>`;
@@ -819,6 +901,7 @@ export function renderTagList() {
   canvas.textContent = '';
 
   for (const tag of State.tags) {
+    if (!attributeTagVisible(tag)) continue;
     const colorName = State.tagColors[tag] || 'default';
     const cls = TAG_COLOR_MAP[colorName] || 'tag-default';
     const span = document.createElement('span');
@@ -909,6 +992,13 @@ export function renderQueueStatus() {
     if ((qs.failed || 0) > 0) resultParts.push(`失敗 ${qs.failed}件`);
     El.queueResultSummary.textContent = resultParts.join(' / ');
   }
+  if (State.queueRestoreCheckPending && typeof qs.restore_prompt_pending === 'boolean') {
+    State.queueRestoreCheckPending = false;
+    State.queueRestorePrompted = !!(qs.restore_prompt_pending && qs.restorable_tasks_available);
+    if (State.queueRestorePrompted) {
+      El.queueRestoreModal?.classList.remove('hide');
+    }
+  }
 }
 
 /* ===== Queue Detailed ===== */
@@ -953,15 +1043,16 @@ function renderTaskItem(task, isRunning, idx, total) {
   if (isRunning) {
     actionBtns = `<button class="queue-task-cancel" data-task-id="${esc(task.id)}" title="中止">${materialIcon('stop', 'icon-only')}</button>`;
   } else {
-    const upBtn = idx > 0
+    const reorder = canUseAction('queue_reorder');
+    const upBtn = reorder && idx > 0
       ? `<button class="queue-task-up" data-task-idx="${idx}" title="上へ">${materialIcon('keyboard_arrow_up', 'icon-only')}</button>`
       : `<button class="queue-task-up" disabled title="上へ">${materialIcon('keyboard_arrow_up', 'icon-only')}</button>`;
-    const downBtn = idx < total - 1
+    const downBtn = reorder && idx < total - 1
       ? `<button class="queue-task-down" data-task-idx="${idx}" title="下へ">${materialIcon('keyboard_arrow_down', 'icon-only')}</button>`
       : `<button class="queue-task-down" disabled title="下へ">${materialIcon('keyboard_arrow_down', 'icon-only')}</button>`;
-    actionBtns = `${upBtn}${downBtn}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">${materialIcon('delete', 'icon-only')}</button>`;
+    actionBtns = `${reorder ? upBtn + downBtn : ''}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">${materialIcon('delete', 'icon-only')}</button>`;
   }
-  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}"${isRunning ? '' : ' draggable="true"'}>
+  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}"${!isRunning && canUseAction('queue_reorder') ? ' draggable="true"' : ''}>
     <span class="queue-task-icon">${icon}</span>
     <span class="queue-task-label">${esc(label)}</span>
     <span class="queue-task-target">${esc(task.display_target || task.target || '')}</span>
@@ -971,8 +1062,11 @@ function renderTaskItem(task, isRunning, idx, total) {
 }
 
 function assertQueueActionSuccess(result, fallbackMessage) {
-  if (result && result.success === false) {
-    throw new Error(result.message || fallbackMessage);
+  if (result && (result.success === false || result.error)) {
+    const errorMessage = typeof result.error === 'string'
+      ? result.error
+      : result.error?.message;
+    throw new Error(errorMessage || result.message || fallbackMessage);
   }
   return result;
 }
@@ -1002,10 +1096,12 @@ export function renderQueueDetailed() {
       El.queueModalPendingList.innerHTML = qd.pending.map((t, i) => renderTaskItem(t, false, i, qd.pending.length)).join('');
       El.queueModalPendingList.querySelectorAll('.queue-task-delete').forEach(btn => {
         btn.addEventListener('click', async () => {
-          const taskId = btn.dataset.taskId;
-          await postJson('/api/remove_pending_task', { task_id: taskId });
-          const { refreshQueueDetailed } = await import('./actions.js');
-          await refreshQueueDetailed();
+          const { refreshQueue, refreshQueueDetailed, runGuardedAction } = await import('./actions.js');
+          await runGuardedAction(btn, async () => {
+            const result = await postJson('/api/remove_pending_task', { task_id: btn.dataset.taskId });
+            assertQueueActionSuccess(result, '待機中の処理を削除できませんでした');
+            await Promise.all([refreshQueue(), refreshQueueDetailed()]);
+          }, '待機中の処理を削除できませんでした');
         });
       });
       // Up/down reorder buttons
@@ -1017,29 +1113,22 @@ export function renderQueueDetailed() {
             const swapIdx = idx + direction;
             if (swapIdx >= 0 && swapIdx < ids.length) {
               [ids[idx], ids[swapIdx]] = [ids[swapIdx], ids[idx]];
-              await postJson('/api/reorder_pending_tasks', { task_ids: ids });
-              const { refreshQueueDetailed } = await import('./actions.js');
-              await refreshQueueDetailed();
+              await reorderPendingTaskIds(ids);
             }
           });
         });
       };
-      wireReorder('.queue-task-up', -1);
-      wireReorder('.queue-task-down', 1);
-      wireQueueDragDrop();
+      if (canUseAction('queue_reorder')) {
+        wireReorder('.queue-task-up', -1);
+        wireReorder('.queue-task-down', 1);
+        wireQueueDragDrop();
+      }
     } else {
       El.queueModalPendingList.textContent = 'なし';
     }
   }
   if (El.queuePendingCount) {
     El.queuePendingCount.textContent = `(${qd.pending_count || 0})`;
-  }
-  if (State.queueRestoreCheckPending) {
-    State.queueRestoreCheckPending = false;
-    State.queueRestorePrompted = !!(qd.restore_prompt_pending && qd.restorable_tasks_available);
-    if (State.queueRestorePrompted) {
-      El.queueRestoreModal?.classList.remove('hide');
-    }
   }
 }
 
@@ -1113,9 +1202,19 @@ async function reorderQueuedTask(sourceId, targetId, before) {
   } else {
     ids.push(sourceId);
   }
-  await postJson('/api/reorder_pending_tasks', { task_ids: ids });
-  const { refreshQueueDetailed } = await import('./actions.js');
-  await refreshQueueDetailed();
+  await reorderPendingTaskIds(ids);
+}
+
+async function reorderPendingTaskIds(ids) {
+  const errorMessage = 'キューの並べ替えに失敗しました';
+  try {
+    const result = await postJson('/api/reorder_pending_tasks', { task_ids: ids });
+    assertQueueActionSuccess(result, errorMessage);
+    const { refreshQueueDetailed } = await import('./actions.js');
+    await refreshQueueDetailed();
+  } catch (error) {
+    showNotification(error.message || errorMessage, 'error');
+  }
 }
 
 /* ===== Notifications ===== */
@@ -1155,6 +1254,7 @@ export function syncViewChecks() {
   const containerMain = document.querySelector('.container-main');
   if (containerMain) containerMain.classList.toggle('wide-mode', State.wideMode);
 
+  El.controlPanel?.classList.toggle('hide', !State.buttonsTop);
   // Footer navbar
   if (El.footerNavbar) {
     El.footerNavbar.classList.toggle('hide', !State.buttonsFooter);
@@ -1309,6 +1409,13 @@ function unitizeNumeric(num) {
     return (num / 10000).toFixed(1) + '万';
   }
   return num.toLocaleString();
+}
+
+function renderNovelSourceLink(novel) {
+  const tocUrl = novel.display_url || novel.toc_url || '';
+  return tocUrl
+    ? `<a href="${escAttr(tocUrl)}" target="_blank" rel="noopener" class="btn-link-icon" title="${escAttr(tocUrl)}">${materialIcon('link', 'icon-only')}</a>`
+    : '';
 }
 
 function esc(s) {

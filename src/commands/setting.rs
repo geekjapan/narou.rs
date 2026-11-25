@@ -4,7 +4,7 @@ use narou_rs::compat::confirm;
 use narou_rs::converter::ini::{IniData, IniValue};
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
-use narou_rs::db::{novel_dir_for_record, with_database};
+use narou_rs::db::settings as settings_store;
 use narou_rs::setting_core::{
     SettingScope as Scope, apply_device_related_settings, cast_setting_value, setting_scope,
     var_type_description, yaml_value_display,
@@ -12,6 +12,7 @@ use narou_rs::setting_core::{
 use narou_rs::setting_info::{self, SettingVariables, VarInfo, VarType, default_arg_command_names};
 
 use super::download::{get_data_by_target, tagname_to_ids};
+use super::log;
 
 pub fn cmd_setting(args: &[String], list: bool, all: bool, burn: bool) {
     if let Err(e) = cmd_setting_inner(args, list, all, burn) {
@@ -49,16 +50,19 @@ fn cmd_setting_inner(
     }
 
     let mut local_settings: HashMap<String, serde_yaml::Value> =
-        inv.load("local_setting", InventoryScope::Local)?;
+        settings_store::load_with_inventory(&inv, Scope::Local)?;
     let mut global_settings: HashMap<String, serde_yaml::Value> =
-        inv.load("global_setting", InventoryScope::Global)?;
+        settings_store::load_with_inventory(&inv, Scope::Global)?;
 
     let mut error_count = 0u32;
+    // `server-*` 系の値が変わったか (変わったら稼働中のサーバへ再適用を
+    // 伝えてすぐ反映する)。
+    let mut security_changed = false;
 
     for arg in args {
         let (name, value_str) = split_arg(arg);
         if name.is_empty() {
-            eprintln!("書式が間違っています。変数名=値 のように書いて下さい");
+            log::report_error("書式が間違っています。変数名=値 のように書いて下さい");
             error_count += 1;
             continue;
         }
@@ -76,7 +80,7 @@ fn cmd_setting_inner(
                     None => println!(),
                 }
             } else {
-                eprintln!("{} という変数は存在しません", name);
+                log::report_error(&format!("{} という変数は存在しません", name));
                 error_count += 1;
             }
             continue;
@@ -90,11 +94,11 @@ fn cmd_setting_inner(
                 if deleted {
                     println!("{} の設定を削除しました", name);
                 } else {
-                    eprintln!("{} という変数は存在しません", name);
+                    log::report_error(&format!("{} という変数は存在しません", name));
                     error_count += 1;
                 }
             } else {
-                eprintln!("{} という変数は設定出来ません", name);
+                log::report_error(&format!("{} という変数は設定出来ません", name));
                 error_count += 1;
             }
             continue;
@@ -113,28 +117,45 @@ fn cmd_setting_inner(
             match cast_value(&name, &value_str) {
                 Ok(casted) => {
                     let display = format_yaml_value(&casted);
+                    let changed = settings.get(&name) != Some(&casted);
                     settings.insert(name.clone(), casted);
                     println!("{} を {} に設定しました", name, display);
                     if name == "device" && matches!(s, Scope::Local) {
                         modify_settings_when_device_changed(settings);
                     }
+                    if changed && is_server_security_name(&name) {
+                        security_changed = true;
+                    }
                 }
                 Err(msg) => {
-                    eprintln!("{}", msg);
+                    log::report_error(&msg);
                     error_count += 1;
                 }
             }
         }
     }
 
-    inv.save("local_setting", InventoryScope::Local, &local_settings)?;
-    inv.save("global_setting", InventoryScope::Global, &global_settings)?;
+    settings_store::save_with_inventory(&inv, Scope::Local, &local_settings)?;
+    settings_store::save_with_inventory(&inv, Scope::Global, &global_settings)?;
+
+    // `server-*` 系の値を変えたときは、稼働中のサーバへ再適用を伝えて
+    // すぐ反映する (ポーリング待ちだと 30 秒も反映されない)。
+    if error_count == 0 && security_changed {
+        super::web::notify_running_server_to_reload_security();
+    }
 
     if error_count > 0 {
         std::process::exit(error_count as i32);
     }
 
     Ok(())
+}
+
+/// `server-*` 系 (許可ホスト / WebSocket Origin / reverse proxy) の設定名か。
+///
+/// これらの値の変更はサーバ側のセキュリティ設定の即時再適用を必要とする。
+fn is_server_security_name(name: &str) -> bool {
+    narou_rs::application::settings::SERVER_SECURITY_NAMES.contains(&name)
 }
 
 fn split_arg(arg: &str) -> (String, Option<String>) {
@@ -156,34 +177,30 @@ fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> 
 }
 
 fn output_setting_list(inv: &Inventory) {
-    let local_settings: HashMap<String, serde_yaml::Value> = inv
+    // Ruby の Inventory.load は YAML の記述順を保つので、
+    // --list の出力も格納順をそのまま出す（ソートしない）
+    let local_settings: serde_yaml::Mapping = inv
         .load("local_setting", InventoryScope::Local)
         .unwrap_or_default();
-    let global_settings: HashMap<String, serde_yaml::Value> = inv
+    let global_settings: serde_yaml::Mapping = inv
         .load("global_setting", InventoryScope::Global)
         .unwrap_or_default();
 
-    println!("[Local Variables]");
-    let mut local_sorted: Vec<_> = local_settings.iter().collect();
-    local_sorted.sort_by_key(|(k, _)| *k);
-    for (name, value) in &local_sorted {
-        let display = format_yaml_value(value);
-        if display.contains(' ') {
-            println!("{}='{}'", name, display);
-        } else {
-            println!("{}={}", name, display);
-        }
-    }
-
-    println!("[Global Variables]");
-    let mut global_sorted: Vec<_> = global_settings.iter().collect();
-    global_sorted.sort_by_key(|(k, _)| *k);
-    for (name, value) in &global_sorted {
-        let display = format_yaml_value(value);
-        if display.contains(' ') {
-            println!("{}='{}'", name, display);
-        } else {
-            println!("{}={}", name, display);
+    for (header, settings) in [
+        ("[Local Variables]", &local_settings),
+        ("[Global Variables]", &global_settings),
+    ] {
+        println!("{}", header);
+        for (name, value) in settings {
+            let Some(name) = name.as_str() else {
+                continue;
+            };
+            let display = format_yaml_value(value);
+            if display.contains(' ') {
+                println!("{}='{}'", name, display);
+            } else {
+                println!("{}={}", name, display);
+            }
         }
     }
 }
@@ -203,14 +220,24 @@ fn sweep_dust_variable(
     deleted
 }
 
+/// narou.rb の `get_variable_list_strings(scope).gsub(/^ {4}/, "")` 相当。
+/// 文字列を作る段階では upstream と同じく各行4スペースで始め、
+/// 出力時に各行の先頭4スペースを取り除く（複数行 help の継続行も同じく処理）。
+fn strip_leading4(text: &str) -> String {
+    text.lines()
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn print_variable_entry(name: &str, info: &VarInfo, newline_help: bool) {
     let type_desc = var_type_description(info.var_type);
-    if newline_help {
-        println!("    {:32} {}", name, type_desc);
-        println!("      {}", info.help);
+    let text = if newline_help {
+        format!("    {:<18} {} \n      {}", name, type_desc, info.help)
     } else {
-        println!("    {:32} {} {}", name, type_desc, info.help);
-    }
+        format!("    {:<18} {} {}", name, type_desc, info.help)
+    };
+    println!("{}", strip_leading4(&text));
 }
 
 fn display_variable_list(show_all: bool) {
@@ -230,10 +257,13 @@ fn display_variable_list(show_all: bool) {
         }
         for cmd in default_arg_command_names() {
             println!(
-                "    {:32} {} {} コマンドのデフォルトオプション",
-                format!("default_args.{}", cmd),
-                var_type_description(VarType::String),
-                cmd
+                "{}",
+                strip_leading4(&format!(
+                    "    {:<18} {} {} コマンドのデフォルトオプション",
+                    format!("default_args.{}", cmd),
+                    var_type_description(VarType::String),
+                    cmd
+                ))
             );
         }
     }
@@ -305,7 +335,7 @@ fn burn_default_settings(
     targets: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if targets.is_empty() {
-        eprintln!("対象小説を指定して下さい");
+        log::report_error("対象小説を指定して下さい");
         std::process::exit(127);
     }
 
@@ -319,45 +349,63 @@ fn burn_default_settings(
     let targets = tagname_to_ids(targets);
     let default_settings = load_settings_by_pattern(inv, "default");
     let original_settings = get_original_settings();
-    let archive_root = inv.root_dir().join("小説データ");
+    narou_rs::db::init_database()?;
 
     for target in targets {
         let data = match get_data_by_target(&target) {
             Some(data) => data,
             None => {
-                eprintln!("{} は存在しません", target);
+                log::report_error(&format!("{} は存在しません", target));
                 continue;
             }
         };
-        let record = match with_database(|db| Ok(db.get(data.id).cloned())) {
+        let record = match narou_rs::native::novel_repository::NativeNovelRepository::new()
+            .get_current_sync(data.id.into())
+        {
             Ok(Some(r)) => r,
             _ => {
-                eprintln!("{} は存在しません", target);
+                log::report_error(&format!("{} は存在しません", target));
                 continue;
             }
         };
 
-        let archive_path = novel_dir_for_record(&archive_root, &record);
+        let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        let write = narou_rs::native::materialization::capture_write_for_record(&record)?;
 
-        let ini_path = archive_path.join("setting.ini");
-        let mut ini = IniData::load_file(&ini_path).unwrap_or_else(|_| IniData::new());
-
-        for (name, default_value) in &original_settings {
-            if ini.get_global(name).is_none() {
-                if let Some(default_val) = default_settings.get(name) {
-                    ini.set_global(name, yaml_to_ini_value(default_val));
-                } else {
-                    ini.set_global(name, default_value.clone());
+        // Web UI の設定保存と同じ `setting.ini` オブジェクトへ書く。FS だけに
+        // 書くと SQLite モード (`mirror-files=false`) の本文と DB の設定が
+        // 分離し、次の変換で焼き付けが消える。
+        let setting_key = keys.prefix().join("setting.ini")?;
+        let mut mutate = |raw: Option<&[u8]>| {
+            let text = std::str::from_utf8(raw.unwrap_or_default()).map_err(|error| {
+                narou_rs::error::NarouError::Platform(format!("setting.ini is not UTF-8: {error}"))
+            })?;
+            let mut ini = IniData::load(text);
+            let mut changed = false;
+            for (name, default_value) in &original_settings {
+                if ini.get_global(name).is_none() {
+                    let value = default_settings.get(name).map(yaml_to_ini_value)
+                        .unwrap_or_else(|| default_value.clone());
+                    ini.set_global(name, value);
+                    changed = true;
                 }
             }
+            Ok(changed.then(|| std::borrow::Cow::Owned(ini.to_ini_string().into_bytes())))
+        };
+        let result = futures::executor::block_on(
+            write.update_small(&setting_key, &mut mutate),
+        )?;
+        match result {
+            narou_rs::platform::ObjectUpdateResult::Committed => {}
+            narou_rs::platform::ObjectUpdateResult::ProjectionFailed(error) => return Err(error.into()),
+            narou_rs::platform::ObjectUpdateResult::Conflict => return Err("小説設定の保存が競合しました".into()),
         }
-
-        ini.save(&ini_path)?;
         println!("{} の設定を保存しました", data.title);
     }
 
     Ok(())
 }
+
 
 fn modify_settings_when_device_changed(settings: &mut HashMap<String, serde_yaml::Value>) {
     let Some(changed) = apply_device_related_settings(settings) else {
@@ -381,9 +429,8 @@ fn modify_settings_when_device_changed(settings: &mut HashMap<String, serde_yaml
 }
 
 fn load_settings_by_pattern(inv: &Inventory, pattern: &str) -> HashMap<String, serde_yaml::Value> {
-    let local: HashMap<String, serde_yaml::Value> = inv
-        .load("local_setting", InventoryScope::Local)
-        .unwrap_or_default();
+    let local: HashMap<String, serde_yaml::Value> =
+        settings_store::load_with_inventory(inv, Scope::Local).unwrap_or_default();
 
     let prefix = format!("{}.", pattern);
     let mut result = HashMap::new();

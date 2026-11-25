@@ -12,6 +12,7 @@ use crate::converter::settings::NovelSettings;
 use crate::converter::user_converter::UserConverter;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::error::{NarouError, Result};
+use crate::setting_core::SettingScope;
 use unicode_normalization::UnicodeNormalization;
 
 const DIGEST_CHOICES: &[(&str, &str)] = &[
@@ -200,11 +201,21 @@ pub fn canonicalize_existing_path(path: impl AsRef<Path>) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
+pub fn fsync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+pub fn fsync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 pub fn fsync_parent_dir(path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    fs::File::open(parent)?.sync_all()
+    fsync_dir(parent)
 }
 
 #[cfg(not(unix))]
@@ -212,20 +223,109 @@ pub fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn canonicalize_aozoraepub3_jar_dir(dir: &str) -> Option<PathBuf> {
+/// `dir` (または jpackage MSI 配置の `<dir>/app/`) から `AozoraEpub3.jar` を探す。
+pub fn find_aozoraepub3_jar_in_dir(dir: &Path) -> Option<PathBuf> {
+    let canonical_dir = canonicalize_existing_path(dir)?;
+    for candidate in [
+        canonical_dir.join("AozoraEpub3.jar"),
+        canonical_dir.join("app").join("AozoraEpub3.jar"),
+    ] {
+        if candidate.is_file()
+            && let Some(jar) = canonicalize_existing_path(candidate)
+        {
+            return Some(jar);
+        }
+    }
+    None
+}
+
+/// AozoraEpub3 の資材 (`chuki_tag.txt` / `template/` / `gaiji/`) が置かれた
+/// ディレクトリを解決する。jpackage MSI 版では `<dir>/app/` を返す。
+pub fn resolve_aozora_assets_dir(dir: &Path) -> Option<PathBuf> {
+    if let Some(jar) = find_aozoraepub3_jar_in_dir(dir) {
+        return jar.parent().map(Path::to_path_buf);
+    }
+    let canonical_dir = canonicalize_existing_path(dir)?;
+    let app_dir = canonical_dir.join("app");
+    if app_dir.join("chuki_tag.txt").is_file()
+        && let Some(resolved) = canonicalize_existing_path(app_dir)
+    {
+        return Some(resolved);
+    }
+    Some(canonical_dir)
+}
+
+/// jpackage MSI 版 (`<install_dir>/app/AozoraEpub3.jar` + `<install_dir>/runtime/bin/java`)
+/// に同梱された JRE を探す。
+pub fn resolve_bundled_java_for_jar(jar_path: &Path) -> Option<PathBuf> {
+    let java_name = if cfg!(windows) { "java.exe" } else { "java" };
+    let candidate = jar_path
+        .parent()?
+        .parent()?
+        .join("runtime")
+        .join("bin")
+        .join(java_name);
+    candidate
+        .is_file()
+        .then(|| canonicalize_existing_path(candidate))
+        .flatten()
+}
+
+/// `aozoraepub3dir` 設定が指すディレクトリから変換ツールの実体を解決する。
+/// Java 版 (`AozoraEpub3.jar` または jpackage 配置の `app/AozoraEpub3.jar`) を優先し、
+/// 無ければ Rust 製 Lite のバイナリ (`AozoraEpub3_Lite.exe` / `AozoraEpub3.exe`、
+/// 非 Windows は拡張子なし) を受け付ける。
+pub fn canonicalize_aozoraepub3_tool_path(dir: &str) -> Option<PathBuf> {
+    if let Some(jar) = find_aozoraepub3_jar_in_dir(Path::new(dir)) {
+        return Some(jar);
+    }
     let canonical_dir = canonicalize_existing_path(PathBuf::from(dir))?;
-    let jar = canonical_dir.join("AozoraEpub3.jar");
-    canonicalize_existing_path(jar)
+    [
+        "AozoraEpub3_Lite.exe",
+        "AozoraEpub3.exe",
+        "AozoraEpub3_Lite",
+        "AozoraEpub3",
+    ]
+    .into_iter()
+    .find_map(|name| canonicalize_existing_path(canonical_dir.join(name)))
+}
+
+/// `aozoraepub3dir` 設定が指す AozoraEpub3 ディレクトリ。
+///
+/// Java 版を起動する場合はカレントディレクトリとして使われ、`chuki_*.txt` /
+/// `gaiji/*.ttf` / `AozoraEpub3.ini` がここから読まれる。組み込みエンジンも
+/// 同じ資産を読む必要があるため、ツール本体 (jar / exe) の有無とは独立に解決する。
+pub fn aozora_assets_dir() -> Option<PathBuf> {
+    let dir = load_global_setting_string("aozoraepub3dir")?;
+    resolve_aozora_assets_dir(Path::new(&dir))
+}
+
+/// 組み込みエンジン (AozoraEpub3_Lite) の設定ディレクトリ。
+///
+/// 配布物の exe と同じ場所、または開発時のカレントディレクトリにある
+/// `preset/` を返す。ここには `AozoraEpub3.ini.default` (同梱の既定値) と
+/// `custom_chuki_tag.txt.default` があり、利用者は同じ名前の `.ini` /
+/// `.txt` (配布物には含まれない) を作って上書きできる。外部 AozoraEpub3 の
+/// `aozoraepub3dir` とは独立して編集できる (issue #45)。
+pub fn lite_preset_dir() -> Option<PathBuf> {
+    let candidates = [
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|parent| parent.join("preset"))),
+        std::env::current_dir().ok().map(|cwd| cwd.join("preset")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(canonicalize_existing_path)
 }
 
 pub fn resolve_java_command_path() -> Option<PathBuf> {
     if let Some(path) =
         load_global_setting_string_with_aliases(&["java_path", "java-path", "javapath"])
-    {
-        if let Some(canonical) = canonicalize_existing_path(PathBuf::from(path)) {
+        && let Some(canonical) = canonicalize_existing_path(PathBuf::from(path)) {
             return Some(canonical);
         }
-    }
 
     if let Some(java_home) = std::env::var_os("JAVA_HOME") {
         let java_name = if cfg!(windows) { "java.exe" } else { "java" };
@@ -252,14 +352,11 @@ pub fn resolve_java_command_path() -> Option<PathBuf> {
 }
 
 pub fn load_global_setting_value(key: &str) -> Option<serde_yaml::Value> {
-    let path = global_setting_path()?;
-    let raw = fs::read_to_string(path).ok()?;
-    let settings: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(&raw).ok()?;
-    settings.get(key).cloned()
+    crate::db::settings::value(SettingScope::Global, key)
 }
 
 pub fn load_global_setting_string(key: &str) -> Option<String> {
-    load_global_setting_value(key).and_then(|v| yaml_value_to_string(&v))
+    crate::db::settings::string(SettingScope::Global, key)
 }
 
 pub fn load_global_setting_string_with_aliases(keys: &[&str]) -> Option<String> {
@@ -267,49 +364,23 @@ pub fn load_global_setting_string_with_aliases(keys: &[&str]) -> Option<String> 
 }
 
 pub fn load_local_setting_value(key: &str) -> Option<serde_yaml::Value> {
-    crate::db::with_database(|db| {
-        let settings: HashMap<String, serde_yaml::Value> = db
-            .inventory()
-            .load("local_setting", InventoryScope::Local)?;
-        Ok(settings.get(key).cloned())
-    })
-    .ok()
-    .flatten()
-}
-
-fn global_setting_path() -> Option<PathBuf> {
-    if let Ok(inv) = Inventory::with_default_root() {
-        let dir = inv.root_dir().join(".narousetting");
-        if dir.is_dir() {
-            return Some(dir.join("global_setting.yaml"));
-        }
-    }
-
-    let home = home_dir()?;
-    Some(home.join(".narousetting").join("global_setting.yaml"))
-}
-
-fn home_dir() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var("USERPROFILE").ok().map(PathBuf::from)
-    } else {
-        std::env::var("HOME").ok().map(PathBuf::from)
-    }
+    crate::db::settings::value(SettingScope::Local, key)
 }
 
 pub fn load_local_setting_string(key: &str) -> Option<String> {
     load_local_setting_value(key).and_then(|v| yaml_value_to_string(&v))
 }
 
-pub fn load_local_setting_bool(key: &str) -> bool {
+/// 未設定なら `default` を返す bool 設定。既定 true の設定を「明示的に
+/// false のときだけ切る」ために使う。
+pub fn load_local_setting_bool_or(key: &str, default: bool) -> bool {
     load_local_setting_value(key)
-        .and_then(|v| match v {
-            serde_yaml::Value::Bool(b) => Some(b),
-            serde_yaml::Value::String(s) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
-            serde_yaml::Value::Number(n) => Some(n.as_i64().unwrap_or(0) != 0),
-            _ => None,
-        })
-        .unwrap_or(false)
+        .and_then(|v| crate::setting_core::setting_bool_value(&v))
+        .unwrap_or(default)
+}
+
+pub fn load_local_setting_bool(key: &str) -> bool {
+    load_local_setting_bool_or(key, false)
 }
 
 pub fn relay_web_stream_to_console<R: io::Read>(
@@ -327,8 +398,8 @@ pub fn relay_web_stream_to_console<R: io::Read>(
 }
 
 pub fn reroute_web_line_to_console(text: &str, target_console: &str) -> String {
-    if let Some(json_str) = text.strip_prefix(crate::progress::WS_LINE_PREFIX) {
-        if let Ok(mut message) =
+    if let Some(json_str) = text.strip_prefix(crate::progress::WS_LINE_PREFIX)
+        && let Ok(mut message) =
             serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json_str)
         {
             message.insert(
@@ -341,7 +412,6 @@ pub fn reroute_web_line_to_console(text: &str, target_console: &str) -> String {
                 serde_json::Value::Object(message)
             );
         }
-    }
     format!(
         "{}{}",
         crate::progress::WS_LINE_PREFIX,
@@ -380,7 +450,7 @@ pub fn yaml_value_to_string(value: &serde_yaml::Value) -> Option<String> {
 
 pub fn current_device() -> Option<Device> {
     let raw = load_local_setting_string("device")?;
-    let device = Device::from_str(&raw);
+    let device = raw.parse::<Device>().unwrap_or(Device::Text);
     (device != Device::Text).then_some(device)
 }
 
@@ -397,6 +467,37 @@ pub fn load_frozen_ids_from_inventory(inventory: &Inventory) -> Result<HashSet<i
 pub fn load_locked_ids_from_inventory(inventory: &Inventory) -> Result<HashSet<i64>> {
     let locked: HashMap<i64, serde_yaml::Value> = inventory.load("lock", InventoryScope::Local)?;
     Ok(locked.into_keys().collect())
+}
+
+/// Novels a running child says it is working on right now.
+///
+/// `lock.yaml` is written by the child that owns a novel (`convert`,
+/// `download`, `update`) and cleared when it finishes. Entries older than
+/// `max_age` are ignored so a killed child cannot block a novel forever.
+pub fn load_active_locked_ids(max_age: std::time::Duration) -> Result<HashSet<i64>> {
+    let inventory = Inventory::with_default_root()?;
+    let locked: HashMap<i64, serde_yaml::Value> = inventory.load("lock", InventoryScope::Local)?;
+    let now = chrono::Local::now();
+    Ok(locked
+        .into_iter()
+        .filter(|(_, value)| lock_is_fresh(value, now, max_age))
+        .map(|(id, _)| id)
+        .collect())
+}
+
+/// A lock value is `%Y-%m-%d %H:%M:%S%.9f %:z` in local time. Unparseable or
+/// future values count as fresh (a clock change must not unlock a novel).
+fn lock_is_fresh(value: &serde_yaml::Value, now: chrono::DateTime<chrono::Local>, max_age: std::time::Duration) -> bool {
+    let Some(text) = value.as_str() else {
+        return true;
+    };
+    let Ok(when) = chrono::DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.9f %:z") else {
+        return true;
+    };
+    match now.signed_duration_since(when.with_timezone(&chrono::Local)).to_std() {
+        Ok(age) => age <= max_age,
+        Err(_) => true,
+    }
 }
 
 pub struct NovelLockGuard {
@@ -455,95 +556,79 @@ fn current_lock_timestamp() -> serde_yaml::Value {
 }
 
 pub fn record_is_frozen(record: &crate::db::NovelRecord, frozen_ids: &HashSet<i64>) -> bool {
-    frozen_ids.contains(&record.id) || record.tags.iter().any(|tag| tag == "frozen")
+    // upstream の Narou.novel_frozen? は freeze inventory だけを見る。
+    // `frozen` という名前のタグは upstream では意味を持たない。
+    crate::platform::repository::record_is_frozen(
+        record,
+        Some(frozen_ids),
+        crate::platform::repository::FreezeReadMode::InventoryOnly,
+    )
 }
 
 pub fn is_frozen_id(id: i64) -> bool {
-    let frozen_ids = load_frozen_ids().unwrap_or_default();
-    if frozen_ids.contains(&id) {
-        return true;
+    load_frozen_ids()
+        .map(|frozen_ids| frozen_ids.contains(&id))
+        .unwrap_or(false)
+}
+
+/// Set the frozen state, or toggle the effective state when `frozen` is None.
+pub fn set_frozen_state(write: &crate::application::novel_access::NovelWriteGuard, id: i64, frozen: Option<bool>) -> Result<bool> {
+    let repository = crate::native::novel_repository::NativeNovelRepository::new();
+    let record = repository.get_current_sync(id.into())?.ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+    let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+    if write.prefix().as_ref() != keys.prefix().as_ref() { return Err(NarouError::Platform("freeze record changed its origin".into())); }
+    let inventory = crate::db::inventory::Inventory::with_default_root()?;
+    let primary = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())?;
+    let frozen = primary.with_open_write(write.fence(), || {
+        inventory.update_yaml::<bool, HashMap<i64, serde_yaml::Value>, _>(
+            "freeze", InventoryScope::Local, |mut frozen_list| {
+                let current = frozen_list.contains_key(&id) || record.tags.iter().any(|tag| tag == "frozen");
+                let frozen = frozen.unwrap_or(!current);
+                if frozen { frozen_list.insert(id, serde_yaml::Value::Bool(true)); }
+                else { frozen_list.remove(&id); }
+                Ok((frozen_list, frozen))
+            },
+        )
+    })?;
+    repository.update_existing_guarded_sync(write.fence(), id.into(), |record| {
+        crate::application::novel_actions::sync_frozen_tag(record, frozen);
+        Ok(())
+    })?;
+    Ok(frozen)
+}
+
+pub fn mark_not_found_and_freeze(write: &crate::application::novel_access::NovelWriteGuard, id: i64) -> Result<()> {
+    set_frozen_state(write, id, Some(true))?;
+    crate::native::novel_repository::NativeNovelRepository::new()
+        .update_existing_guarded_sync(write.fence(), id.into(), |record| {
+            crate::application::novel_actions::mark_not_found(record);
+            Ok(())
+        })?;
+    Ok(())
+}
+fn absolute_directory_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
     }
-
-    crate::db::with_database(|db| {
-        Ok(db
-            .get(id)
-            .map(|record| record_is_frozen(record, &frozen_ids))
-            .unwrap_or(false))
-    })
-    .unwrap_or(false)
-}
-
-pub fn set_frozen_state(id: i64, frozen: bool) -> Result<()> {
-    crate::db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-
-        let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        let _ = crate::db::inventory::update_locked_yaml_file::<
-            (),
-            HashMap<i64, serde_yaml::Value>,
-            _,
-        >(&freeze_path, |mut frozen_list| {
-            if frozen {
-                frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                if !updated.tags.iter().any(|tag| tag == "frozen") {
-                    updated.tags.push("frozen".to_string());
-                }
-            } else {
-                frozen_list.remove(&id);
-                updated.tags.retain(|tag| tag != "frozen" && tag != "404");
-            }
-
-            db.insert(updated.clone());
-            Ok((frozen_list, ()))
-        })?;
-        db.save()
-    })
-}
-
-pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
-    crate::db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-
-        let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        let _ = crate::db::inventory::update_locked_yaml_file::<
-            (),
-            HashMap<i64, serde_yaml::Value>,
-            _,
-        >(&freeze_path, |mut frozen_list| {
-            frozen_list.insert(id, serde_yaml::Value::Bool(true));
-            if !updated.tags.iter().any(|tag| tag == "frozen") {
-                updated.tags.push("frozen".to_string());
-            }
-            if !updated.tags.iter().any(|tag| tag == "404") {
-                updated.tags.push("404".to_string());
-            }
-
-            db.insert(updated.clone());
-            Ok((frozen_list, ()))
-        })?;
-        db.save()
-    })
 }
 
 pub fn open_directory(path: &Path, confirm_message: Option<&str>) {
-    if let Some(message) = confirm_message {
-        if !confirm(message, false, false) {
+    if let Some(message) = confirm_message
+        && !confirm(message, false, false) {
             return;
         }
-    }
 
-    let path = path.to_string_lossy().to_string();
+    // 相対パスのまま explorer に渡すと、explorer 側の CWD (多くの場合
+    // Documents) を開いてしまう。必ず絶対パスへ直し、Windows では
+    // `file:///` URL ではなく OS パスをそのまま渡す (issue #41)。
+    let path = absolute_directory_path(path).to_string_lossy().to_string();
     if cfg!(windows) {
         let mut command = std::process::Command::new("explorer");
-        command.arg(format!("file:///{}", path.replace('\\', "/")));
+        command.arg(&path);
         configure_hidden_console_command(&mut command);
         let _ = command.spawn();
     } else if cfg!(target_os = "macos") {
@@ -626,6 +711,8 @@ fn choose_digest_action_inner(
             "1" => return DigestChoice::Update,
             "2" => return DigestChoice::Cancel,
             "3" => return DigestChoice::CancelAndFreeze,
+            // 閲覧・バックアップ・変換は更新の承認ではない。自動選択を
+            // 使い切ったら既定の 2 で止め、続行には明示的な 1 を必要とする。
             "4" => return DigestChoice::Backup,
             "5" => return DigestChoice::ShowStory,
             "6" => return DigestChoice::OpenBrowser,
@@ -657,8 +744,22 @@ pub fn choose_digest_action(title: &str, message: &str) -> DigestChoice {
     choose_digest_action_inner(title, message, &mut auto_choices)
 }
 
-pub fn create_backup(novel_dir: &Path, title: &str) -> Result<String> {
-    let backup_dir = novel_dir.join("backup");
+pub fn create_backup(write: &crate::application::novel_access::NovelWriteGuard, title: &str) -> Result<String> {
+    let inventory = crate::db::inventory::Inventory::with_default_root()?;
+    let directory = crate::native::materialization::directory_for_origin(write)?;
+    let snapshot = crate::native::materialization::snapshot_with_origin(&directory, write)?;
+    // The archive must be staged outside the snapshotted inputs so the zip
+    // being written can never end up inside itself.
+    let staging = tempfile::Builder::new().prefix(".narou-snapshot-").tempdir_in(inventory.root_dir())?;
+    let name = create_backup_from_private(snapshot.path(), staging.path(), title)?;
+    crate::native::materialization::publish_file(write, &staging.path().join("backup").join(&name), &directory.join("backup").join(&name))?;
+    Ok(name)
+}
+
+fn create_backup_from_private(source_dir: &Path, staging_dir: &Path, title: &str) -> Result<String> {
+    crate::application::novel_access::require_private_path(source_dir)?;
+    crate::application::novel_access::require_private_path(staging_dir)?;
+    let backup_dir = staging_dir.join("backup");
     fs::create_dir_all(&backup_dir)?;
     let backup_name = format!(
         "{}_{}.zip",
@@ -671,40 +772,61 @@ pub fn create_backup(novel_dir: &Path, title: &str) -> Result<String> {
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
-    add_directory_to_zip(&mut zip, novel_dir, novel_dir, options)?;
+    add_directory_to_zip(&mut zip, source_dir, source_dir, options)?;
     zip.finish()
         .map_err(|e| NarouError::Conversion(e.to_string()))?;
     Ok(backup_name)
 }
 
 pub fn convert_existing_novel(
+    write: &crate::application::novel_access::NovelWriteGuard,
     id: i64,
-    title: &str,
-    author: &str,
-    novel_dir: &Path,
     no_open: bool,
 ) -> std::result::Result<PathBuf, String> {
     let _lock = NovelLockGuard::acquire(Some(id)).map_err(|e| e.to_string())?;
+    // All inputs are copied privately; the original operation token authorizes
+    // canonical publication after rendering, including subprocess continuations.
+    let novel_dir = crate::native::materialization::directory_for_origin(write).map_err(|error| error.to_string())?;
+    let primary = crate::native::object_store::NativeStore::for_current_root().map_err(|error| error.to_string())?;
+    let record = primary.with_open_write(write.fence(), || {
+        let record = crate::native::novel_repository::NativeNovelRepository::new().get_current_sync(id.into())?
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+        let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+        if keys.prefix().as_ref() != write.prefix().as_ref() { return Err(NarouError::Platform("conversion record changed its original namespace".into())); }
+        Ok(record)
+    }).map_err(|error| error.to_string())?;
+    let title = record.title.as_str();
+    let author = record.author.as_str();
+    let novel_dir = novel_dir.as_path();
+    let multi_device = load_local_setting_string("convert.multi-device").is_some();
     let devices = resolve_auto_convert_devices()?;
+    let (snapshot, base_settings) = crate::native::materialization::conversion_snapshot_with_origin(novel_dir, write, None, |path| {
+        let settings = NovelSettings::load_for_novel(id, title, author, path)?;
+        let selection = crate::native::materialization::ConversionInputSelection {
+            illustrations: settings.enable_illust,
+            cover: devices.iter().any(|device| device.is_some_and(|device| device != Device::Text)),
+        };
+        Ok((settings, selection))
+    }).map_err(|error| error.to_string())?;
     let mut last_output_path = None;
     for device in devices {
-        let mut settings = NovelSettings::load_for_novel(id, title, author, novel_dir);
-        apply_auto_convert_device_settings(&mut settings, device);
-        let mut converter =
-            if let Some(user_converter) = UserConverter::load_with_title(novel_dir, title) {
-                NovelConverter::with_user_converter(settings, user_converter)
-            } else {
-                NovelConverter::new(settings)
-            };
-        converter.set_progress(Box::new(crate::progress::NoProgress));
+        let mut settings = base_settings.clone();
+        apply_auto_convert_device_settings(&mut settings, device, multi_device);
+        let mut converter = if let Some(user_converter) = UserConverter::load_with_title(snapshot.path(), title) {
+            NovelConverter::try_with_user_converter(settings, user_converter)
+        } else {
+            NovelConverter::try_new(settings)
+        }.map_err(|error| error.to_string())?;
+        converter.set_write_guard(write.clone()).map_err(|error| error.to_string())?;
+        converter.set_progress(Box::new(crate::platform::progress::NoProgress));
 
         let output_path = match device {
             Some(device) => converter
-                .convert_novel_by_id_with_device(id, novel_dir, device, false, false)
+                .convert_novel_by_id_with_device(id, snapshot.path(), device, false, false)
                 .map_err(|e| e.to_string())?,
             None => PathBuf::from(
                 converter
-                    .convert_novel_by_id(id, novel_dir)
+                    .convert_novel_by_id(id, snapshot.path())
                     .map_err(|e| e.to_string())?,
             ),
         };
@@ -714,13 +836,17 @@ pub fn convert_existing_novel(
             println!("{}", inspection);
         }
 
+        let private_output = match output_path.strip_prefix(novel_dir) {
+            Ok(relative) => snapshot.path().join(relative),
+            Err(_) => { crate::application::novel_access::require_private_path(&output_path).map_err(|error| error.to_string())?; output_path.clone() }
+        };
         if let Some(device) = device {
-            match copy_to_converted_file(&output_path, Some(device), id) {
+            match copy_to_converted_file(&private_output, Some(device), id) {
                 Ok(Some(path)) => println!("{} へコピーしました", path.display()),
                 Ok(None) => {}
                 Err(err) => println!("{}", err),
             }
-            let _ = send_file_to_device(&output_path, device);
+            let _ = send_file_to_device(&private_output, device);
         }
         last_output_path = Some(output_path);
     }
@@ -778,7 +904,22 @@ fn parse_convert_device_name(name: &str) -> Option<Device> {
     }
 }
 
-fn apply_auto_convert_device_settings(settings: &mut NovelSettings, device: Option<Device>) {
+/// ダウンロード/更新後の自動変換で、端末由来の設定を適用する。
+///
+/// Ruby 版 `Command::Convert#change_settings` と同じく、端末を明示した変換
+/// (`convert.multi-device`) のときだけ `Device::RELATED_VARIABLES` を適用する。
+/// 通常の変換 (端末設定から選ばれた `device`) では何もしない — `device` を
+/// 変えた時点で `default.enable_half_indent_bracket` が保存されており、変換時は
+/// `force.*` > setting.ini > `default.*` の順で解決されるため、ここで上書きすると
+/// 利用者の設定を無視してしまう (issue #42)。
+fn apply_auto_convert_device_settings(
+    settings: &mut NovelSettings,
+    device: Option<Device>,
+    explicit_device: bool,
+) {
+    if !explicit_device {
+        return;
+    }
     if matches!(device, Some(Device::Mobi)) {
         settings.enable_half_indent_bracket = true;
     }
@@ -827,19 +968,18 @@ fn get_copy_to_directory(
     if grouping
         .iter()
         .any(|value| value.eq_ignore_ascii_case("device"))
-    {
-        if let Some(device) = device {
+        && let Some(device) = device {
             dir.push(device.display_name());
         }
-    }
     if grouping
         .iter()
         .any(|value| value.eq_ignore_ascii_case("site"))
     {
-        let sitename =
-            crate::db::with_database(|db| Ok(db.get(novel_id).map(|r| r.sitename.clone())))
-                .ok()
-                .flatten();
+        let sitename = crate::native::novel_repository::NativeNovelRepository::new()
+            .get_current_sync(novel_id.into())
+            .ok()
+            .flatten()
+            .map(|record| record.sitename);
         if let Some(sitename) = sitename.filter(|value| !value.is_empty()) {
             dir.push(sitename);
         }
@@ -956,7 +1096,7 @@ fn sanitize_backup_name(title: &str) -> String {
     if load_local_setting_bool("normalize-filename") {
         cleaned = cleaned.nfc().collect();
     }
-    while cleaned.as_bytes().len() > 180 {
+    while cleaned.len() > 180 {
         cleaned.pop();
     }
     cleaned
@@ -964,6 +1104,7 @@ fn sanitize_backup_name(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::process::Command;
 
     use crate::db::inventory::Inventory;
@@ -971,13 +1112,15 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        DigestChoice, NovelLockGuard, choose_digest_action_with_auto_choices,
-        configure_process_group_command, configure_web_subprocess_command, get_copy_to_directory,
-        load_frozen_ids_from_inventory,
+        DigestChoice, NovelLockGuard, absolute_directory_path,
+        canonicalize_aozoraepub3_tool_path,
+        canonicalize_existing_path, choose_digest_action_with_auto_choices, configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
         record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
         sanitize_backup_name, terminate_process,
     };
+    #[cfg(unix)]
+    use super::configure_process_group_command;
     use crate::converter::device::Device;
     use crate::db::NovelRecord;
 
@@ -1007,6 +1150,8 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
     }
@@ -1022,7 +1167,7 @@ mod tests {
     #[test]
     fn sanitize_backup_name_truncates_by_byte_length() {
         let name = sanitize_backup_name(&"あ".repeat(100));
-        assert!(name.as_bytes().len() <= 180);
+        assert!(name.len() <= 180);
         assert!(name.chars().all(|ch| ch == 'あ'));
     }
 
@@ -1055,12 +1200,67 @@ mod tests {
     }
 
     #[test]
+    fn open_directory_path_is_always_absolute() {
+        // explorer へ相対パスを渡すと explorer 側の CWD を開くため、必ず絶対化する。
+        let relative = Path::new("小説データ").join("site").join("title");
+        assert!(absolute_directory_path(&relative).is_absolute());
+        let absolute = std::env::current_dir().unwrap().join("x");
+        assert_eq!(absolute_directory_path(&absolute), absolute);
+    }
+
+    #[test]
     fn parse_digest_auto_choices_splits_comma_separated_values() {
         let queue = parse_digest_auto_choices(Some("8, 4,1")).unwrap();
         assert_eq!(
             queue.into_iter().collect::<Vec<_>>(),
             vec!["8".to_string(), "4".to_string(), "1".to_string()]
         );
+    }
+
+    #[test]
+    fn digest_auto_choices_cancel_after_non_terminal_actions_unless_update_is_explicit() {
+        // issue #41: 閲覧・バックアップだけでは本文の置き換えを承認しない。
+        for (value, action) in [
+            ("4", DigestChoice::Backup),
+            ("5", DigestChoice::ShowStory),
+            ("6", DigestChoice::OpenBrowser),
+            ("7", DigestChoice::OpenFolder),
+            ("8", DigestChoice::Convert),
+        ] {
+            for (suffix, expected) in [
+                ("", DigestChoice::Cancel),
+                (",1", DigestChoice::Update),
+                (",2", DigestChoice::Cancel),
+                (",3", DigestChoice::CancelAndFreeze),
+            ] {
+                let mut choices = parse_digest_auto_choices(Some(&format!("{value}{suffix}")));
+                assert_eq!(
+                    choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                    action
+                );
+                assert_eq!(
+                    choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_invalid_digest_auto_choices_cancel_safely() {
+        for value in ["", " , ", "invalid", "0,9", "7,invalid"] {
+            let mut choices = parse_digest_auto_choices(Some(value));
+            if value.starts_with('7') {
+                assert_eq!(
+                    choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                    DigestChoice::OpenFolder
+                );
+            }
+            assert_eq!(
+                choose_digest_action_with_auto_choices("title", "message", &mut choices),
+                DigestChoice::Cancel
+            );
+        }
     }
 
     #[test]
@@ -1115,12 +1315,14 @@ mod tests {
     }
 
     #[test]
-    fn record_is_frozen_checks_freeze_inventory_before_tags() {
+    fn record_is_frozen_uses_only_freeze_inventory() {
+        // upstream の Narou.novel_frozen? は freeze inventory だけを見る。
+        // `frozen` タグを手動で付けても凍結扱いにはならない。
         let mut frozen_ids = std::collections::HashSet::new();
         frozen_ids.insert(1);
 
         assert!(record_is_frozen(&sample_record(1, &[]), &frozen_ids));
-        assert!(record_is_frozen(
+        assert!(!record_is_frozen(
             &sample_record(2, &["frozen"]),
             &frozen_ids
         ));
@@ -1150,16 +1352,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::write(temp.path().join(".narou/storage-backend"), "sqlite").unwrap();
 
         *crate::db::DATABASE.lock() = None;
         crate::db::init_database().unwrap();
         crate::db::with_database_mut(|db| {
             db.insert(sample_record(7, &[]));
-            Ok(())
+            db.save()
         })
         .unwrap();
 
-        mark_not_found_and_freeze(7).unwrap();
+        let write = crate::native::materialization::capture_write_for_id(7).unwrap();
+        mark_not_found_and_freeze(&write, 7).unwrap();
 
         let record = crate::db::with_database(|db| Ok(db.get(7).cloned().unwrap())).unwrap();
         assert!(record.tags.contains(&"404".to_string()));
@@ -1168,6 +1372,10 @@ mod tests {
         let inventory = Inventory::new(temp.path().to_path_buf());
         let frozen_ids = load_frozen_ids_from_inventory(&inventory).unwrap();
         assert!(frozen_ids.contains(&7));
+        assert!(!temp.path().join(".narou/freeze.yaml").exists());
+        assert!(std::fs::read_dir(temp.path().join(".narou")).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with("freeze.yaml.imported-")
+        }));
 
         *crate::db::DATABASE.lock() = None;
     }
@@ -1220,6 +1428,7 @@ mod tests {
 
     #[test]
     fn database_parity_get_copy_to_directory_includes_site_for_zero_id() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -1238,7 +1447,7 @@ mod tests {
         crate::db::init_database().unwrap();
         crate::db::with_database_mut(|db| {
             db.insert(sample_record(0, &[]));
-            Ok(())
+            db.save()
         })
         .unwrap();
 
@@ -1250,6 +1459,7 @@ mod tests {
 
     #[test]
     fn update_auto_convert_uses_convert_multi_device_before_device_setting() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -1290,27 +1500,19 @@ mod tests {
         let parent_sid = unsafe { libc::getsid(0) };
         assert!(parent_sid > 0, "parent must have a session id");
 
-        // Keep the child alive long enough to query its session via getsid(2).
-        // macOS `ps` has no `sid` keyword, so do not depend on `ps` output.
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c")
-            .arg("sleep 1")
-            .stdin(Stdio::null())
+        // Keep the child running until getsid has read its session.
+        let mut cmd = Command::new("/bin/cat");
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_process_group_command(&mut cmd);
 
-        let mut child = cmd.spawn().expect("spawn shell with setsid");
+        let mut child = cmd.spawn().expect("spawn child with setsid");
         let pid = child.id() as i32;
-        std::thread::sleep(std::time::Duration::from_millis(50));
         let sid = unsafe { libc::getsid(pid) };
-        assert!(
-            sid > 0,
-            "getsid({pid}) failed: {}",
-            std::io::Error::last_os_error()
-        );
-        let status = child.wait().expect("wait for child");
-        assert!(status.success(), "child sleep failed: {status:?}");
+        drop(child.stdin.take());
+        assert!(child.wait().expect("wait for child").success());
+        assert!(sid > 0, "getsid({pid}) failed");
 
         // (a) setsid 後は自プロセスがセッションリーダー。
         assert_eq!(sid, pid, "child should be its own session leader");
@@ -1381,5 +1583,101 @@ mod tests {
 
         let status = child.wait().expect("wait child");
         assert!(status.success(), "child failed: {status:?}");
+    }
+
+    #[test]
+    fn aozora_tool_path_requires_existing_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+        assert_eq!(canonicalize_aozoraepub3_tool_path(&dir), None);
+    }
+
+    #[test]
+    fn aozora_tool_path_accepts_lite_binary_when_jar_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("AozoraEpub3_Lite.exe"), b"stub").unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+
+        let resolved = canonicalize_aozoraepub3_tool_path(&dir).expect("lite binary resolved");
+
+        assert_eq!(
+            Some(resolved),
+            canonicalize_existing_path(temp.path().join("AozoraEpub3_Lite.exe"))
+        );
+    }
+
+    #[test]
+    fn aozora_tool_path_prefers_jar_over_lite_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("AozoraEpub3.jar"), b"stub jar").unwrap();
+        std::fs::write(temp.path().join("AozoraEpub3_Lite.exe"), b"stub lite").unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+
+        let resolved = canonicalize_aozoraepub3_tool_path(&dir).expect("jar resolved");
+
+        assert_eq!(
+            Some(resolved),
+            canonicalize_existing_path(temp.path().join("AozoraEpub3.jar"))
+        );
+    }
+
+    /// issue #42: 自動変換でも通常の `device` 設定は利用者の
+    /// `enable_half_indent_bracket` を上書きしない。端末を明示した
+    /// (`convert.multi-device`) 変換のときだけ端末由来の設定を適用する。
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn auto_convert_device_settings_only_apply_to_explicit_devices() {
+        use crate::converter::settings::NovelSettings;
+
+        let mut settings = NovelSettings::default();
+        settings.enable_half_indent_bracket = false;
+        super::apply_auto_convert_device_settings(&mut settings, Some(Device::Mobi), false);
+        assert!(
+            !settings.enable_half_indent_bracket,
+            "通常の自動変換で端末設定が利用者設定を上書きした"
+        );
+
+        super::apply_auto_convert_device_settings(&mut settings, Some(Device::Mobi), true);
+        assert!(
+            settings.enable_half_indent_bracket,
+            "端末を明示した Kindle 変換で二分アキが付かない"
+        );
+    }
+
+    #[test]
+    fn lite_preset_dir_uses_the_current_directory_preset() {
+        let temp = tempfile::tempdir().unwrap();
+        let preset = temp.path().join("preset");
+        std::fs::create_dir_all(&preset).unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        let found = super::lite_preset_dir().expect("preset directory");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            preset.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn aozora_tool_path_supports_jpackage_app_subdir_over_gui_launcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        let runtime_bin = temp.path().join("runtime").join("bin");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&runtime_bin).unwrap();
+        // jpackage MSI places AozoraEpub3.exe (GUI launcher) in root and JAR + assets under app/.
+        std::fs::write(temp.path().join("AozoraEpub3.exe"), b"gui launcher").unwrap();
+        std::fs::write(app.join("AozoraEpub3.jar"), b"stub jar").unwrap();
+        std::fs::write(app.join("chuki_tag.txt"), b"").unwrap();
+        let java_name = if cfg!(windows) { "java.exe" } else { "java" };
+        std::fs::write(runtime_bin.join(java_name), b"stub java").unwrap();
+
+        let dir = temp.path().to_string_lossy().to_string();
+        let tool = canonicalize_aozoraepub3_tool_path(&dir).expect("app jar resolved");
+        assert_eq!(Some(tool.clone()), canonicalize_existing_path(app.join("AozoraEpub3.jar")));
+        assert_eq!(super::resolve_aozora_assets_dir(temp.path()), canonicalize_existing_path(app));
+        assert_eq!(
+            super::resolve_bundled_java_for_jar(&tool),
+            canonicalize_existing_path(runtime_bin.join(java_name))
+        );
     }
 }

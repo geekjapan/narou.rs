@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Local, Utc};
 use narou_rs::compat::confirm;
@@ -32,6 +32,8 @@ pub struct ListOptions {
     /// CLI `--sort-by` で指定されたキー。`db::sort_keys()` で検証する。
     pub sort_by: Option<String>,
     pub frozen: bool,
+    /// 非表示設定を無視してすべて表示する。
+    pub show_hidden: bool,
 }
 
 impl ListOptions {
@@ -135,6 +137,17 @@ enum TagOutput {
     Error(String),
 }
 
+fn attribute_visibility() -> (bool, bool, bool) {
+    let settings = narou_rs::db::settings::load(narou_rs::setting_core::SettingScope::Local).unwrap_or_default();
+    let value = |name| settings.get(name).and_then(narou_rs::setting_core::setting_bool_value);
+    (value("tag.attributes-enabled").unwrap_or(false), value("tag.show-novel").unwrap_or(false), value("tag.show-manga").unwrap_or(true))
+}
+
+fn visible_tag(tag: &str, visibility: (bool, bool, bool)) -> bool {
+    !narou_rs::application::attribute_tags::is_attribute_tag(tag)
+        || (visibility.0 && narou_rs::application::attribute_tags::is_visible(tag, visibility.1, visibility.2))
+}
+
 pub fn cmd_list(options: ListOptions) -> i32 {
     use narou_rs::db;
 
@@ -151,8 +164,6 @@ pub fn cmd_list(options: ListOptions) -> i32 {
 }
 
 fn cmd_list_inner(options: &ListOptions) -> i32 {
-    use narou_rs::db;
-
     let filter_words = match options.filter_words() {
         Ok(filters) => filters,
         Err(message) => {
@@ -182,25 +193,20 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         }
     };
 
-    let records = match db::with_database(|db| {
-        let mut values = if let Some(key) = sort_key {
-            // 明示的な --sort-by が指定された場合: db::sort_by の型付き比較を使う。
-            db.sort_by(key, false).into_iter().cloned().collect::<Vec<_>>()
-        } else if options.latest {
-            db.sort_by(options.view_date_type(), true)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            let mut records = db.all_records().values().cloned().collect::<Vec<_>>();
-            records.sort_by_key(|record| record.id);
-            records
-        };
-        if options.reverse {
-            values.reverse();
-        }
-        Ok(values)
-    }) {
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    // CLI list は全件表示: display 用 query ではなく全件を取得する
+    // (既存挙動: フィルタは表示後に適用される)。
+    let all_records = {
+        let sort = resolve_list_sort(options, sort_key);
+        let query = narou_rs::platform::NovelQuery::page(
+            narou_rs::platform::NovelFilter::all(),
+            sort,
+            0,
+            usize::MAX,
+        );
+        novels.query_current_sync(&query)
+    };
+    let records = match all_records {
         Ok(records) => records,
         Err(err) => {
             log::report_error(&err.to_string());
@@ -223,33 +229,72 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         }
     };
 
+    let visibility = attribute_visibility();
     let mut selected = Vec::new();
+    let hidden = if options.show_hidden {
+        narou_rs::hidden::HiddenState::default()
+    } else {
+        narou_rs::native::hidden::load().unwrap_or_default()
+    };
+    let virtual_members = super::virtual_novel::hidden_member_ids();
     for record in &records {
-        let frozen = frozen_ids.contains(&record.id);
+        if virtual_members.contains(&record.id) {
+            continue;
+        }
+        let frozen = narou_rs::platform::repository::record_is_frozen(
+            record,
+            Some(&frozen_ids),
+            narou_rs::platform::repository::FreezeReadMode::InventoryOnly,
+        );
+        if !options.show_hidden
+            && (hidden.matches(
+                record.id,
+                &record.author,
+                &record.tags,
+                record.domain.as_deref(),
+                &record.sitename,
+            ) || (visibility.0 && record.attribute_tag().is_some_and(|tag| hidden.tags.contains(tag))))
+        {
+            continue;
+        }
         if !matches_filters(record, frozen, &filter_words) {
             continue;
         }
-        if !valid_tags(record, &tag_filters) {
+        if !valid_tags(record, &tag_filters, visibility.0) {
             continue;
         }
 
-        let plain = decorate_line(record, options, frozen, &tag_colors, false);
-        if !matches_grep(&plain, &grep_words) {
+        let mut displayed_record = record.clone();
+        if let Some(tag) = record.attribute_tag().filter(|tag| visible_tag(tag, visibility)) {
+            displayed_record.tags.push(tag.to_string());
+        }
+        if !grep_words.is_empty()
+            && !matches_grep(&decorate_line(&displayed_record, options, frozen, &tag_colors, false), &grep_words)
+        {
             continue;
         }
-        selected.push((record.clone(), frozen, plain));
+        let plain = decorate_line(&displayed_record, options, frozen, &tag_colors, false);
+        selected.push((displayed_record, frozen, plain));
     }
 
-    let colors_changed = if options.show_tags() {
-        tag_colors::ensure_tag_colors(
-            &mut tag_colors,
-            selected
-                .iter()
-                .flat_map(|(record, _, _)| record.tags.iter().map(String::as_str)),
-        )
-    } else {
-        false
-    };
+    if options.show_tags() {
+        tag_colors = match tag_colors::update_tag_colors(
+            &inventory,
+            tag_colors::TagColorUpdate::Ensure {
+                tags: selected
+                    .iter()
+                    .flat_map(|(record, _, _)| record.tags.iter().cloned())
+                    .collect(),
+                default_color: tag_colors::configured_new_tag_color(),
+            },
+        ) {
+            Ok(colors) => colors,
+            Err(err) => {
+                log::report_error(&err.to_string());
+                return 127;
+            }
+        };
+    }
 
     let lines = selected
         .into_iter()
@@ -263,13 +308,6 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
             plain,
         })
         .collect::<Vec<_>>();
-
-    if colors_changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
-            log::report_error(&err.to_string());
-            return 127;
-        }
-    }
 
     let limit = options.limit.unwrap_or(lines.len());
     let taken = lines.into_iter().take(limit).collect::<Vec<_>>();
@@ -292,6 +330,11 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             return 127;
         }
     };
+    if matches!(&mode, TagMode::Add(tags) | TagMode::Delete(tags) if tags.iter().any(|tag| narou_rs::application::attribute_tags::is_attribute_tag(tag))) {
+        log::report_error("属性タグは編集できません");
+        return 127;
+    }
+
 
     let inventory = match Inventory::with_default_root() {
         Ok(inventory) => inventory,
@@ -312,20 +355,46 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
     if let Some(color) = normalize_color(options.color.as_deref()) {
         if tag_colors::is_valid_tag_color(&color) {
             if let Some(tags) = mode.tag_names() {
-                for tag in tags {
-                    explicit_color_changed |=
-                        tag_colors.set_color(tag, &color, options.no_overwrite_color);
+                if options.no_overwrite_color {
+                    let colors = match tag_colors::update_tag_colors(
+                        &inventory,
+                        tag_colors::TagColorUpdate::Ensure {
+                            tags: tags.to_vec(),
+                            default_color: Some(color),
+                        },
+                    ) {
+                        Ok(colors) => colors,
+                        Err(err) => {
+                            log::report_error(&err.to_string());
+                            return 127;
+                        }
+                    };
+                    explicit_color_changed = tags
+                        .iter()
+                        .any(|tag| colors.color_for(tag) != tag_colors.color_for(tag));
+                    tag_colors = colors;
+                } else {
+                    for tag in tags {
+                        let colors = match tag_colors::update_tag_colors(
+                            &inventory,
+                            tag_colors::TagColorUpdate::Set {
+                                tag: tag.clone(),
+                                color: Some(color.clone()),
+                            },
+                        ) {
+                            Ok(colors) => colors,
+                            Err(err) => {
+                                log::report_error(&err.to_string());
+                                return 127;
+                            }
+                        };
+                        explicit_color_changed |= colors.color_for(tag) != tag_colors.color_for(tag);
+                        tag_colors = colors;
+                    }
                 }
             }
         } else {
             eprintln!("{}という色は存在しません。色指定は無視されます", color);
-        }
-    }
-
-    if explicit_color_changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
-            log::report_error(&err.to_string());
-            return 127;
         }
     }
 
@@ -359,9 +428,13 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         .collect::<Vec<_>>();
 
     let new_tag_color = tag_colors::configured_new_tag_color();
-    let outputs = match db::with_database_mut(|db| {
+    let visibility = attribute_visibility();
+    let outputs = (|| -> narou_rs::error::Result<(Vec<TagOutput>, Vec<String>)> {
+        let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
         let mut outputs = Vec::new();
-        let mut auto_color_changed = false;
+        let mut color_tags = Vec::new();
+        let mut mutations = Vec::new();
+        let mut fences = Vec::new();
         for item in resolved {
             let (id, title) = match item {
                 Ok(data) => data,
@@ -371,11 +444,15 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
                 }
             };
 
-            let Some(record) = db.get(id).cloned() else {
-                outputs.push(TagOutput::Error(format!("ID:{} は存在しません", id)));
-                continue;
-            };
+            let record = novels
+                .get_current_sync(id.into())
+                .map_err(|err| narou_rs::error::NarouError::Database(err.to_string()))?
+                .ok_or_else(|| {
+                    narou_rs::error::NarouError::NotFound(format!("ID:{} は存在しません", id))
+                })?;
 
+            let write = narou_rs::native::materialization::capture_write_for_record(&record)?;
+            fences.push(write.fence().clone());
             let mut updated = record;
             match &mode {
                 TagMode::Add(tags) => {
@@ -400,20 +477,25 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
                 TagMode::List => {}
             }
 
-            if !updated.tags.is_empty() {
-                auto_color_changed |= tag_colors::ensure_tag_colors_with_default_color(
-                    &mut tag_colors,
-                    updated.tags.iter().map(String::as_str),
-                    new_tag_color.as_deref(),
-                );
-                outputs.push(TagOutput::Current(updated.tags.clone()));
+            let mut displayed_tags = updated.tags.clone();
+            if let Some(tag) = updated.attribute_tag().filter(|tag| visible_tag(tag, visibility)) {
+                displayed_tags.push(tag.to_string());
+            }
+            if !displayed_tags.is_empty() {
+                color_tags.extend(displayed_tags.iter().cloned());
+                outputs.push(TagOutput::Current(displayed_tags));
             }
 
-            db.insert(updated);
+            mutations.push(narou_rs::platform::NovelMutation::Upsert(updated));
         }
-        db.save()?;
-        Ok::<(Vec<TagOutput>, bool), narou_rs::error::NarouError>((outputs, auto_color_changed))
-    }) {
+        if !mutations.is_empty() {
+            use narou_rs::platform::NovelRepository;
+            futures::executor::block_on(novels.apply_batch_guarded_many(&fences, mutations))?;
+        }
+        Ok((outputs, color_tags))
+    })();
+
+    let (outputs, color_tags) = match outputs {
         Ok(result) => result,
         Err(err) => {
             log::report_error(&err.to_string());
@@ -421,22 +503,29 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         }
     };
 
-    let (outputs, auto_color_changed) = outputs;
-
-    if auto_color_changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
-            log::report_error(&err.to_string());
-            return 127;
-        }
+    if !color_tags.is_empty() {
+        tag_colors = match tag_colors::update_tag_colors(
+            &inventory,
+            tag_colors::TagColorUpdate::Ensure {
+                tags: color_tags,
+                default_color: new_tag_color,
+            },
+        ) {
+            Ok(colors) => colors,
+            Err(err) => {
+                log::report_error(&err.to_string());
+                return 127;
+            }
+        };
     }
 
     for output in outputs {
         match output {
             TagOutput::Info(message) => println!("{}", message),
-            TagOutput::Current(tags) => println!(
-                "現在のタグは {} です",
-                render_tags(&tags, &tag_colors, " ", true)
-            ),
+            TagOutput::Current(tags) => {
+                let visible: Vec<_> = tags.into_iter().filter(|tag| visible_tag(tag, visibility)).collect();
+                println!("現在のタグは {} です", render_tags(&visible, &tag_colors, " ", true));
+            }
             TagOutput::Error(message) => log::report_error(&message),
         }
     }
@@ -452,6 +541,26 @@ fn split_words(value: Option<&str>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// Ruby `Database#sort_by` defaults to descending date order. Only
+/// `--latest` flips the normal ascending direction; `--reverse` flips it back.
+fn resolve_list_sort(
+    options: &ListOptions,
+    sort_key: Option<&'static str>,
+) -> narou_rs::platform::NovelSort {
+    use narou_rs::platform::{NovelSort, NovelSortKey};
+
+    let key = match sort_key {
+        Some(key) => NovelSortKey::from_db_key(key).unwrap_or(NovelSortKey::Id),
+        None if options.latest => {
+            NovelSortKey::from_db_key(options.view_date_type()).unwrap_or(NovelSortKey::Id)
+        }
+        None => NovelSortKey::Id,
+    };
+    let mut sort = NovelSort::by(key);
+    sort.reverse = options.reverse ^ (sort_key.is_none() && options.latest);
+    sort
 }
 
 /// `narou list --sort-by` のキー文字列を検証し、内部表現に変換する。
@@ -477,14 +586,9 @@ fn resolve_list_sort_key(raw: Option<&str>) -> Result<Option<&'static str>, Stri
     }
 }
 
-fn valid_tags(record: &NovelRecord, tags: &[String]) -> bool {
-    if tags.is_empty() {
-        return true;
-    }
-    if record.tags.is_empty() {
-        return false;
-    }
-    tags.iter().all(|tag| record.tags.contains(tag))
+fn valid_tags(record: &NovelRecord, tags: &[String], attributes_enabled: bool) -> bool {
+    tags.iter().all(|tag| record.tags.contains(tag)
+        || (attributes_enabled && record.attribute_tag() == Some(tag)))
 }
 
 fn matches_filters(record: &NovelRecord, frozen: bool, filters: &[String]) -> bool {
@@ -570,10 +674,10 @@ fn decorate_line(
     if options.url {
         parts.push(record.toc_url.clone());
     }
-    if options.show_tags() {
-        if let Some(tags) = decorate_tags(&record.tags, tag_colors, colored) {
-            parts.push(tags);
-        }
+    if options.show_tags()
+        && let Some(tags) = decorate_tags(&record.tags, tag_colors, colored)
+    {
+        parts.push(tags);
     }
 
     parts.join(" | ")
@@ -606,10 +710,11 @@ fn decorate_date(record: &NovelRecord, options: &ListOptions, colored: bool) -> 
     let now = Utc::now();
     let limit = Duration::seconds(ANNOTATION_COLOR_TIME_LIMIT);
 
-    if let Some(new_arrival) = new_arrivals_date {
-        if new_arrival >= last_update && new_arrival + limit >= now {
-            return format_date(new_arrival, colored.then_some("magenta"));
-        }
+    if let Some(new_arrival) = new_arrivals_date
+        && new_arrival >= last_update
+        && new_arrival + limit >= now
+    {
+        return format_date(new_arrival, colored.then_some("magenta"));
     }
 
     if last_update + limit >= now {
@@ -731,6 +836,7 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
             return 127;
         }
     };
+    let visibility = attribute_visibility();
 
     let inventory = match Inventory::with_default_root() {
         Ok(inventory) => inventory,
@@ -739,22 +845,26 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
             return 127;
         }
     };
-    let changed = tag_colors::ensure_tag_colors(
-        tag_colors,
-        tag_list.iter().map(|(tag, _)| tag.as_str()),
-    );
-    if changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, tag_colors) {
+    *tag_colors = match tag_colors::update_tag_colors(
+        &inventory,
+        tag_colors::TagColorUpdate::Ensure {
+            tags: tag_list.iter().map(|(tag, _)| tag.clone()).collect(),
+            default_color: tag_colors::configured_new_tag_color(),
+        },
+    ) {
+        Ok(colors) => colors,
+        Err(err) => {
             log::report_error(&err.to_string());
             return 127;
         }
-    }
+    };
 
     println!("タグ一覧");
     println!(
         "{}",
         tag_list
             .iter()
+            .filter(|(tag, _)| visible_tag(tag, visibility))
             .map(|(tag, count)| render_tag_count(tag, *count, tag_colors))
             .collect::<Vec<_>>()
             .join(" ")
@@ -763,40 +873,50 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
 }
 
 fn get_tag_list() -> Result<Vec<(String, usize)>, String> {
-    use narou_rs::db;
+    use narou_rs::native::novel_repository::NativeNovelRepository;
+    use narou_rs::platform::NovelFilter;
 
-    db::with_database(|db| {
-        let mut records = db.all_records().values().collect::<Vec<_>>();
-        records.sort_by_key(|record| record.id);
+    let novels = NativeNovelRepository::new();
+    let ids = novels
+        .scan_ids_sync(&NovelFilter::all(), None, usize::MAX)
+        .map_err(|err| err.to_string())?;
 
-        let mut counts = HashMap::<String, usize>::new();
-        let mut order = Vec::<String>::new();
-        for record in records {
-            for tag in &record.tags {
-                if !counts.contains_key(tag) {
-                    order.push(tag.clone());
-                }
-                *counts.entry(tag.clone()).or_insert(0) += 1;
+    let mut counts = HashMap::<String, usize>::new();
+    let mut order = Vec::<String>::new();
+    let attributes_enabled = attribute_visibility().0;
+    for id in ids {
+        let Ok(Some(record)) = novels.get_current_sync(id) else {
+            continue;
+        };
+        for tag in &record.tags {
+            if !counts.contains_key(tag) {
+                order.push(tag.clone());
             }
+            *counts.entry(tag.clone()).or_insert(0) += 1;
         }
+        if let Some(tag) = record.attribute_tag().filter(|_| attributes_enabled) {
+            if !counts.contains_key(tag) {
+                order.push(tag.to_string());
+            }
+            *counts.entry(tag.to_string()).or_insert(0) += 1;
+        }
+    }
 
-        Ok(order
-            .into_iter()
-            .map(|tag| {
-                let count = counts.get(&tag).copied().unwrap_or_default();
-                (tag, count)
-            })
-            .collect::<Vec<_>>())
-    })
-    .map_err(|err| err.to_string())
+    Ok(order
+        .into_iter()
+        .map(|tag| {
+            let count = counts.get(&tag).copied().unwrap_or_default();
+            (tag, count)
+        })
+        .collect::<Vec<_>>())
 }
 
 fn render_tag_count(tag: &str, count: usize, tag_colors: &TagColors) -> String {
     let text = format!("{}({})", tag, count);
-    if std::io::stdout().is_terminal() {
-        if let Some(color) = tag_colors.color_for(tag) {
-            return paint(&text, color, true);
-        }
+    if std::io::stdout().is_terminal()
+        && let Some(color) = tag_colors.color_for(tag)
+    {
+        return paint(&text, color, true);
     }
     text
 }
@@ -804,10 +924,11 @@ fn render_tag_count(tag: &str, count: usize, tag_colors: &TagColors) -> String {
 fn render_tags(tags: &[String], tag_colors: &TagColors, separator: &str, colored: bool) -> String {
     tags.iter()
         .map(|tag| {
-            if colored && std::io::stdout().is_terminal() {
-                if let Some(color) = tag_colors.color_for(tag) {
-                    return paint(tag, color, true);
-                }
+            if colored
+                && std::io::stdout().is_terminal()
+                && let Some(color) = tag_colors.color_for(tag)
+            {
+                return paint(tag, color, true);
             }
             tag.clone()
         })
@@ -838,61 +959,19 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
 
     for target in download::tagname_to_ids(targets) {
         let Some(data) = download::get_data_by_target(&target) else {
-            eprintln!("{} は存在しません", target);
+            println!("{} は存在しません", target);
             continue;
         };
         let id = data.id;
 
-        let result = db::with_database_mut(|db| {
-            let record = db
-                .get(id)
-                .cloned()
-                .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-            let title = record.title.clone();
-            let mut updated = record;
-            let mut frozen_state = false;
-
-            let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-            let _ = narou_rs::db::inventory::update_locked_yaml_file::<
-                (),
-                std::collections::HashMap<i64, serde_yaml::Value>,
-                _,
-            >(&freeze_path, |mut frozen_list| {
-                    let is_frozen = frozen_list.contains_key(&id);
-                    let should_freeze = if on {
-                        true
-                    } else if off {
-                        false
-                    } else {
-                        !is_frozen
-                    };
-
-                    if should_freeze {
-                        if !is_frozen {
-                            updated.tags.push("frozen".to_string());
-                        }
-                        frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                    } else {
-                        if is_frozen {
-                            updated.tags.retain(|t| t != "frozen");
-                        }
-                        if updated.tags.contains(&"404".to_string()) {
-                            updated.tags.retain(|t| t != "404");
-                        }
-                        frozen_list.remove(&id);
-                    }
-
-                    frozen_state = should_freeze;
-                    db.insert(updated.clone());
-                    Ok((frozen_list, ()))
-            })?;
-            db.save()?;
-            Ok::<(String, bool), narou_rs::error::NarouError>((title, frozen_state))
-        });
-
-        match result {
-            Ok((title, true)) => println!("{} を凍結しました", title),
-            Ok((title, false)) => println!("{} の凍結を解除しました", title),
+        let frozen = if on { Some(true) } else if off { Some(false) } else { None };
+        let write = match narou_rs::native::materialization::capture_write_for_id(id) {
+            Ok(write) => write,
+            Err(error) => { log::report_error(&error.to_string()); continue; }
+        };
+        match narou_rs::compat::set_frozen_state(&write, id, frozen) {
+            Ok(true) => println!("{} を凍結しました", data.title),
+            Ok(false) => println!("{} の凍結を解除しました", data.title),
             Err(e) => eprintln!("  Error: {}", e),
         }
     }
@@ -971,37 +1050,16 @@ pub fn cmd_remove(targets: &[String], yes: bool, with_file: bool, all_ss: bool) 
 }
 
 pub fn freeze_by_target(target: &str) {
-    use narou_rs::db;
-
     let Some(data) = download::get_data_by_target(target) else {
         return;
     };
     let id = data.id;
 
-    let result = db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-        let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        let _ = narou_rs::db::inventory::update_locked_yaml_file::<
-            (),
-            std::collections::HashMap<i64, serde_yaml::Value>,
-            _,
-        >(&freeze_path, |mut frozen_list| {
-                if !updated.tags.contains(&"frozen".to_string()) {
-                    updated.tags.push("frozen".to_string());
-                }
-                frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                db.insert(updated.clone());
-                Ok((frozen_list, ()))
-        })?;
-        db.save()
-    });
+    let result = narou_rs::native::materialization::capture_write_for_id(id)
+        .and_then(|write| narou_rs::compat::set_frozen_state(&write, id, Some(true)));
 
     match result {
-        Ok(()) => println!("  Froze ID: {}", id),
+        Ok(_) => println!("  Froze ID: {}", id),
         Err(e) => eprintln!("  Error: {}", e),
     }
 }
@@ -1023,42 +1081,49 @@ struct RemoveOutcome {
 }
 
 fn remove_novel_by_id(id: i64, with_file: bool) -> Result<RemoveOutcome, String> {
-    use narou_rs::db;
-
-    let result = db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-        let dir = db::existing_novel_dir_for_record(db.archive_root(), &record);
-        remove_novel_files(&dir, with_file).map_err(narou_rs::error::NarouError::Conversion)?;
-        db.remove(id);
-        db.save()?;
-        Ok::<RemoveOutcome, narou_rs::error::NarouError>(RemoveOutcome {
-            title: record.title,
-            removed_path: with_file.then_some(dir),
-        })
-    });
-
-    let outcome = result.map_err(|e| e.to_string())?;
-    let _ = narou_rs::converter::clear_section_convert_cache(id);
-    Ok(outcome)
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let record = novels
+        .get_current_sync(id.into())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("ID: {} は存在しません", id))?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .map_err(|e| e.to_string())?;
+    let dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
+    let inventory = std::sync::Arc::new(narou_rs::db::inventory::Inventory::with_default_root().map_err(|error| error.to_string())?);
+    let services = narou_rs::native::application::NativeAppServices::new(inventory).map_err(|error| error.to_string())?;
+    let result = narou_rs::native::materialization::block_on(async {
+        services.services.novel_actions.remove(&narou_rs::application::RemoveRequest { ids: vec![id.into()], delete_files: with_file })
+            .await.map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))
+    }).map_err(|error| error.to_string())?;
+    if !result.removed.contains(&narou_rs::platform::NovelId(id)) { return Err(format!("ID: {id} は削除されませんでした")); }
+    Ok(RemoveOutcome {
+        title: record.title,
+        removed_path: with_file.then_some(dir),
+    })
 }
 
 fn collect_all_short_story_ids() -> Vec<String> {
-    use narou_rs::db;
+    use narou_rs::native::novel_repository::NativeNovelRepository;
+    use narou_rs::platform::{NovelFilter, NovelQuery, NovelSort, NovelSortKey};
 
-    db::with_database(|db| {
-        let mut ids = db
-            .all_records()
-            .values()
-            .filter(|record| record.novel_type == 2)
-            .map(|record| record.id.to_string())
-            .collect::<Vec<_>>();
-        ids.sort();
-        Ok(ids)
-    })
-    .unwrap_or_default()
+    let novels = NativeNovelRepository::new();
+    let query = NovelQuery::page(
+        NovelFilter {
+            novel_type: Some(2),
+            ..Default::default()
+        },
+        NovelSort::by(NovelSortKey::Id),
+        0,
+        usize::MAX,
+    );
+    let mut ids = novels
+        .query_current_sync(&query)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| record.id.to_string())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
 }
 
 fn load_inventory_ids(name: &str) -> HashSet<i64> {
@@ -1090,59 +1155,18 @@ fn colorize_removed_message(title: &str) -> String {
     }
 }
 
-fn remove_novel_files(dir: &Path, with_file: bool) -> Result<(), String> {
-    if with_file {
-        if dir.exists() {
-            std::fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        return Ok(());
-    }
 
-    let toc_path = dir.join("toc.yaml");
-    if toc_path.exists() {
-        std::fs::remove_file(toc_path).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use tempfile::TempDir;
 
     use super::{
-        ListOptions, TagColors, TagOptions, build_tag_mode, matches_filters, matches_grep,
-        remove_novel_files, resolve_list_sort_key,
+        ListOptions, TagOptions, build_tag_mode, matches_filters, matches_grep, remove_novel_by_id,
+        resolve_list_sort, resolve_list_sort_key,
     };
     use narou_rs::db::novel_record::NovelRecord;
-    use narou_rs::tag_colors;
 
-    #[test]
-    fn remove_without_with_file_only_deletes_toc() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("novel");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("toc.yaml"), "toc").unwrap();
-        std::fs::write(dir.join("section.txt"), "body").unwrap();
-
-        remove_novel_files(&dir, false).unwrap();
-
-        assert!(dir.exists());
-        assert!(!dir.join("toc.yaml").exists());
-        assert!(dir.join("section.txt").exists());
-    }
-
-    #[test]
-    fn remove_with_file_deletes_directory() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("novel");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("toc.yaml"), "toc").unwrap();
-
-        remove_novel_files(&dir, true).unwrap();
-
-        assert!(!dir.exists());
-    }
 
     #[test]
     fn build_tag_mode_rejects_banned_word() {
@@ -1153,30 +1177,6 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, "hotentry は使用禁止ワードです");
-    }
-
-    #[test]
-    fn ensure_tag_colors_rotates_in_insertion_order() {
-        let mut tag_colors = TagColors::default();
-        assert!(tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["fav"],
-            None,
-        ));
-        assert!(tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["later"],
-            None,
-        ));
-        assert!(tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            ["todo"],
-            None,
-        ));
-
-        assert_eq!(tag_colors.color_for("fav"), Some("green"));
-        assert_eq!(tag_colors.color_for("later"), Some("yellow"));
-        assert_eq!(tag_colors.color_for("todo"), Some("blue"));
     }
 
     #[test]
@@ -1233,12 +1233,15 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
     }
 
     #[test]
     fn resolve_list_sort_key_accepts_db_supported_keys() {
+        let _global = crate::test_support::global_state_guard();
         // `narou_rs::db::sort_keys()` の各値をそのまま受理する。
         for key in narou_rs::db::sort_keys() {
             let result = resolve_list_sort_key(Some(*key)).unwrap();
@@ -1253,6 +1256,7 @@ mod tests {
 
     #[test]
     fn resolve_list_sort_key_rejects_unknown_key() {
+        let _global = crate::test_support::global_state_guard();
         let err = resolve_list_sort_key(Some("not_a_key")).unwrap_err();
         assert!(err.contains("not_a_key は正しいキーではありません"));
         // 候補一覧も一緒に表示する (update.rb 互換の挙動)。
@@ -1265,5 +1269,109 @@ mod tests {
     fn list_options_default_has_sort_by_unset() {
         let opts = ListOptions::default();
         assert!(opts.sort_by.is_none());
+    }
+
+    #[test]
+    fn list_latest_sorts_newest_first_and_reverse_flips_direction() {
+        use narou_rs::platform::NovelSortKey;
+
+        for gl in [false, true] {
+            let opts = ListOptions {
+                latest: true,
+                general_lastup: gl,
+                ..Default::default()
+            };
+            let sort = resolve_list_sort(&opts, None);
+            assert_eq!(
+                sort.key,
+                if gl {
+                    NovelSortKey::GeneralLastup
+                } else {
+                    NovelSortKey::LastUpdate
+                }
+            );
+            assert!(sort.reverse, "--latest must be newest first");
+
+            let reversed = resolve_list_sort(
+                &ListOptions {
+                    reverse: true,
+                    ..opts.clone()
+                },
+                None,
+            );
+            assert!(!reversed.reverse, "--latest --reverse must be oldest first");
+        }
+
+        assert!(!resolve_list_sort(&ListOptions::default(), None).reverse);
+        assert!(
+            resolve_list_sort(
+                &ListOptions {
+                    reverse: true,
+                    ..Default::default()
+                },
+                None
+            )
+            .reverse
+        );
+    }
+
+    #[test]
+    fn list_explicit_sort_by_does_not_inherit_latest_direction() {
+        let opts = ListOptions {
+            latest: true,
+            ..Default::default()
+        };
+        assert!(!resolve_list_sort(&opts, Some("title")).reverse);
+        let reversed = ListOptions {
+            reverse: true,
+            ..opts
+        };
+        assert!(resolve_list_sort(&reversed, Some("title")).reverse);
+    }
+
+    #[test]
+    fn guarded_remove_preserves_or_deletes_content_and_rejects_late_writers() {
+        use narou_rs::application::novel_access::{NovelReadLease, NovelWriteGuard};
+        use narou_rs::platform::NovelObjectKeys;
+        struct RestoreDatabase(Option<narou_rs::db::Database>);
+        impl Drop for RestoreDatabase {
+            fn drop(&mut self) { *narou_rs::db::DATABASE.lock() = self.0.take(); }
+        }
+        for sqlite in [false, true] {
+            let _legacy = (!sqlite).then(crate::test_support::legacy_yaml_guard);
+            for with_file in [false, true] {
+                let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-libraries");
+                std::fs::create_dir_all(&base).unwrap();
+                let temp = tempfile::Builder::new().prefix("remove-guarded-").tempdir_in(base).unwrap();
+                let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+                let _database = RestoreDatabase(narou_rs::db::DATABASE.lock().take());
+                std::fs::create_dir(temp.path().join(".narou")).unwrap();
+                if sqlite { std::fs::write(temp.path().join(".narou/storage-backend"), "sqlite").unwrap(); }
+                narou_rs::db::init_database().unwrap();
+                let record = sample_record(1, 1, &[]);
+                narou_rs::db::with_database_mut(|database| database.update_records(|mut records| {
+                    records.insert(record.id, record.clone()); Ok((records, ()))
+                })).unwrap();
+                let stores = narou_rs::native::object_store::NativeStores::for_current_root().unwrap();
+                let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).unwrap();
+                let section = keys.section("1", "第一話");
+                let write = futures::executor::block_on(NovelWriteGuard::capture_for(&stores.objects, Some(&stores.assets), &keys)).unwrap();
+                futures::executor::block_on(async {
+                    write.write_small(&keys.toc(), b"toc".to_vec()).await?;
+                    write.write_small(&section, b"body".to_vec()).await
+                }).unwrap();
+                remove_novel_by_id(record.id, with_file).unwrap();
+                let repository = narou_rs::native::novel_repository::NativeNovelRepository::new();
+                assert!(repository.get_current_sync(record.id.into()).unwrap().is_none());
+                futures::executor::block_on(async {
+                    assert!(write.write_small(&section, b"late".to_vec()).await.is_err());
+                    let mut read = NovelReadLease::admit(&stores.objects, write.prefix(), "removed-content-check").await?;
+                    assert_eq!(read.read_small(&keys.toc()).await?, (!with_file).then(|| b"toc".to_vec()));
+                    assert_eq!(read.read_small(&section).await?, (!with_file).then(|| b"body".to_vec()));
+                    read.release().await
+                }).unwrap();
+                assert_eq!(temp.path().join("小説データ/site/file_title").exists(), !with_file);
+            }
+        }
     }
 }

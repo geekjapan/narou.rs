@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use narou_rs::application::messages::{self, MessageSink, Stream};
 use narou_rs::mail::{
     MAIL_INTERRUPTED_MESSAGE, MailSettingLoadError, ensure_mail_setting_file, load_mail_setting,
     send_target_with_setting_interruptible,
@@ -13,51 +14,55 @@ pub struct MailOptions {
 
 static MAIL_INTERRUPT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
-pub fn cmd_mail(opts: MailOptions) {
-    if let Err(code) = cmd_mail_inner(opts) {
+pub fn cmd_mail(opts: MailOptions, sink: &Arc<dyn MessageSink>) {
+    if let Err(code) = cmd_mail_inner(opts, sink.as_ref()) {
         std::process::exit(code);
     }
 }
 
-fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
+fn cmd_mail_inner(opts: MailOptions, sink: &dyn MessageSink) -> Result<(), i32> {
     if let Err(e) = narou_rs::db::init_database() {
-        eprintln!("Error initializing database: {}", e);
+        sink.emit(Stream::Stderr, &messages::init_db_error(e));
         return Err(1);
     }
 
-    let interrupted = mail_interrupt_flag()?;
+    let interrupted = mail_interrupt_flag(sink)?;
     interrupted.store(false, Ordering::SeqCst);
 
     let setting = match load_mail_setting() {
         Ok(setting) => setting,
         Err(MailSettingLoadError::NotFound(_)) => {
             let path = ensure_mail_setting_file().map_err(|e| {
-                eprintln!("Error: {}", e);
+                sink.emit(Stream::Stderr, &messages::error_line(e));
                 1
             })?;
-            println!("created {}", path.display());
-            println!(
-                "メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。"
+            sink.emit(Stream::Stdout, &messages::mail::mail_setting_created(&path));
+            sink.emit(Stream::Stdout, messages::mail::mail_setting_file_notice());
+            sink.emit(
+                Stream::Stdout,
+                messages::mail::mail_setting_next_update_notice(),
             );
-            println!("注意：次回以降のupdateで新着があった場合に送信可能フラグが立ちます");
             return Ok(());
         }
         Err(e @ MailSettingLoadError::Incomplete(_)) => {
-            eprintln!("{}", e);
+            sink.emit(Stream::Stderr, &e.to_string());
             return Err(127);
         }
         Err(e) => {
-            eprintln!("Error: {}", e);
+            sink.emit(Stream::Stderr, &messages::error_line(e));
             return Err(127);
         }
     };
 
     let send_all = opts.targets.is_empty();
-    let targets = if send_all {
+    let targets = (if send_all {
         collect_all_targets()
     } else {
         expand_targets(&opts.targets)
-    };
+    }).map_err(|error| {
+        sink.emit(Stream::Stderr, &error);
+        127
+    })?;
 
     for target in targets {
         if let Err(e) = send_target_with_setting_interruptible(
@@ -68,10 +73,10 @@ fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
             Some(interrupted.as_ref()),
         ) {
             if e == MAIL_INTERRUPTED_MESSAGE {
-                println!("{}", e);
+                sink.emit(Stream::Stdout, &e);
                 return Err(126);
             }
-            eprintln!("{}", e);
+            sink.emit(Stream::Stderr, &e);
             return Err(127);
         }
     }
@@ -79,7 +84,7 @@ fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
     Ok(())
 }
 
-fn mail_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
+fn mail_interrupt_flag(sink: &dyn MessageSink) -> Result<Arc<AtomicBool>, i32> {
     if let Some(flag) = MAIL_INTERRUPT_FLAG.get() {
         return Ok(flag.clone());
     }
@@ -90,7 +95,7 @@ fn mail_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
         handler_flag.store(true, Ordering::SeqCst);
     })
     .map_err(|e| {
-        eprintln!("Error: {}", e);
+        sink.emit(Stream::Stderr, &messages::error_line(e));
         1
     })?;
 
@@ -98,37 +103,44 @@ fn mail_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
     Ok(flag)
 }
 
-fn collect_all_targets() -> Vec<String> {
-    let frozen_ids = narou_rs::compat::load_frozen_ids().unwrap_or_default();
-    narou_rs::db::with_database(|db| {
-        let mut ids = db.ids();
-        ids.sort_unstable();
-        Ok(ids
-            .into_iter()
-            .filter(|id| {
-                db.get(*id)
-                    .map(|record| !narou_rs::compat::record_is_frozen(record, &frozen_ids))
-                    .unwrap_or(false)
-            })
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>())
-    })
-    .unwrap_or_default()
+fn collect_all_targets() -> Result<Vec<String>, String> {
+    let frozen_ids = narou_rs::compat::load_frozen_ids().map_err(|error| error.to_string())?;
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let mut ids = novels.scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
+        .map_err(|error| error.to_string())?;
+    ids.sort_unstable_by_key(|id| id.0);
+    let records = novels.get_many_current_sync(&ids).map_err(|error| error.to_string())?;
+    Ok(records.into_iter().flatten()
+        .filter(|record| !narou_rs::compat::record_is_frozen(record, &frozen_ids))
+        .map(|record| record.id.to_string()).collect())
 }
 
-fn expand_targets(targets: &[String]) -> Vec<String> {
-    let (tag_index, all_ids) = narou_rs::db::with_database(|db| {
-        Ok::<_, narou_rs::error::NarouError>((db.tag_index(), db.ids()))
-    })
-    .unwrap_or_default();
+fn expand_targets(targets: &[String]) -> Result<Vec<String>, String> {
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let all_ids: Vec<i64> = novels
+        .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
     let mut all_sorted = all_ids;
     all_sorted.sort_unstable();
+    let attributes_enabled = narou_rs::application::attribute_tags::enabled_native();
+    let tag_ids = |tag_name: &str| -> Result<Vec<i64>, String> {
+        let filter = narou_rs::platform::NovelFilter {
+            tag: Some(tag_name.to_string()),
+            attribute_tags_enabled: attributes_enabled,
+            ..Default::default()
+        };
+        novels.scan_ids_sync(&filter, None, usize::MAX)
+            .map(|ids| ids.into_iter().map(|id| id.0).collect())
+            .map_err(|error| error.to_string())
+    };
 
     let mut expanded = Vec::new();
     for target in targets {
         if let Ok(id) = target.parse::<i64>() {
-            let exists =
-                narou_rs::db::with_database(|db| Ok(db.get(id).is_some())).unwrap_or(false);
+            let exists = novels.get_current_sync(id.into()).map_err(|error| error.to_string())?.is_some();
             if exists {
                 expanded.push(id.to_string());
                 continue;
@@ -136,8 +148,8 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
         }
 
         if let Some(tag_name) = target.strip_prefix("^tag:") {
-            if let Some(exclude_ids) = tag_index.get(tag_name) {
-                let exclude: std::collections::HashSet<i64> = exclude_ids.iter().copied().collect();
+            let exclude: std::collections::HashSet<i64> = tag_ids(tag_name)?.into_iter().collect();
+            if !exclude.is_empty() {
                 expanded.extend(
                     all_sorted
                         .iter()
@@ -151,7 +163,8 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
         }
 
         if let Some(tag_name) = target.strip_prefix("tag:") {
-            if let Some(ids) = tag_index.get(tag_name) {
+            let ids = tag_ids(tag_name)?;
+            if !ids.is_empty() {
                 expanded.extend(ids.iter().map(|id| id.to_string()));
             } else {
                 expanded.push(tag_name.to_string());
@@ -159,7 +172,8 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
             continue;
         }
 
-        if let Some(ids) = tag_index.get(target) {
+        let ids = tag_ids(target)?;
+        if !ids.is_empty() {
             expanded.extend(ids.iter().map(|id| id.to_string()));
         } else {
             expanded.push(target.clone());
@@ -167,8 +181,8 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
     }
 
     let mut seen = std::collections::HashSet::new();
-    expanded
+    Ok(expanded
         .into_iter()
         .filter(|target| seen.insert(target.clone()))
-        .collect()
+        .collect())
 }

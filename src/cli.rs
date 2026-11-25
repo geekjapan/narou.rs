@@ -1,15 +1,22 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::path::PathBuf;
 
 use clap::Parser;
 
+/// narou.rb の COMMAND_LIST と同じ順序。ショートカットはこの順で優先度が
+/// 決まる (先に並ぶコマンドほど優先)。Rust 拡張コマンドは末尾に置く。
 const COMMAND_NAMES: &[&str] = &[
     "download", "update", "list", "convert", "diff", "setting", "alias", "inspect", "send",
     "folder", "browser", "remove", "freeze", "tag", "web", "mail", "backup", "csv", "clean", "log",
-    "trace", "help", "version", "init", "illust",
+    "trace", "help", "version", "init",
+    // Rust 拡張 (narou.rb に無いコマンド)。narou.rb コマンドのショートカットを
+    // 奪わないよう末尾に置く。
+    "db", "illust",
 ];
 
+/// narou.rb の `Command::Shortcuts` と同じ規則でショートカットを構築する。
+/// COMMAND_LIST の先頭ほど優先度が高いので、逆順に insert して先頭側で
+/// 上書きされるようにする。
 fn build_shortcuts() -> HashMap<String, &'static str> {
     let mut map = HashMap::new();
     for &name in COMMAND_NAMES.iter().rev() {
@@ -64,7 +71,7 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
                 i += 1;
             }
         } else if arg.starts_with("--user-agent=") {
-            flags.user_agent = Some(arg["--user-agent=".len()..].to_string());
+            flags.user_agent = arg.strip_prefix("--user-agent=").map(|v| v.to_string());
             args.remove(i);
         } else if arg == "-h" || arg == "--help" {
             if i > 0 {
@@ -90,6 +97,16 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
 
     if args.is_empty() {
         args.push("help".to_string());
+    }
+
+    // narou.rb `take_command_name`: .narou が無いディレクトリでは
+    // help/version/init 以外のコマンド名を help に置き換え、トップレベルの
+    // help を表示して正常終了する。
+    if !narou_rs::db::narou_root_exists()
+        && let Some(name) = args.first()
+        && !matches!(name.as_str(), "help" | "version" | "init")
+    {
+        args[0] = "help".to_string();
     }
 
     let args_before_double_dash = args_before_double_dash(args);
@@ -119,7 +136,17 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
     flags
 }
 
-fn resolve_command_shortcut(args: &mut Vec<String>, cmd_index: usize) {
+pub fn parse_error_message(error: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ErrorKind};
+    match error.kind() {
+        ErrorKind::InvalidSubcommand => Some("不明なコマンドです。narou help を確認してください".to_string()),
+        ErrorKind::UnknownArgument => error.get(ContextKind::InvalidArg)
+            .map(|argument| format!("不明なオプションです(invalid option: {argument})")),
+        _ => None,
+    }
+}
+
+fn resolve_command_shortcut(args: &mut [String], cmd_index: usize) {
     let shortcuts = build_shortcuts();
     if let Some(resolved) = shortcuts.get(&args[cmd_index].to_lowercase()) {
         args[cmd_index] = resolved.to_string();
@@ -134,12 +161,18 @@ fn apply_multiple(args: &mut Vec<String>) {
     };
     let rest: Vec<String> = args.drain((cmd_index + 1)..).collect();
     for arg in &rest {
-        for part in arg.split(&delimiter) {
-            let trimmed = part.trim();
-            if !trimmed.is_empty() {
-                args.push(trimmed.to_string());
-            }
+        // Ruby の String#split(delimiter) と同じく前後空白と空要素を保持する。
+        // ただし末尾の空文字だけは Ruby 側で抑制されるため捨てる。
+        // 区切り文字が空文字列のときは文字単位に分割される (Ruby 準拠)。
+        if delimiter.is_empty() {
+            args.extend(arg.chars().map(|ch| ch.to_string()));
+            continue;
         }
+        let mut parts: Vec<&str> = arg.split(delimiter.as_str()).collect();
+        while parts.last().is_some_and(|part| part.is_empty()) {
+            parts.pop();
+        }
+        args.extend(parts.iter().map(|part| part.to_string()));
     }
 }
 
@@ -165,26 +198,7 @@ fn load_multiple_delimiter() -> String {
 }
 
 fn load_global_no_color() -> bool {
-    let home = if cfg!(windows) {
-        std::env::var("USERPROFILE").ok()
-    } else {
-        std::env::var("HOME").ok()
-    };
-    let Some(home) = home else { return false };
-    let path = PathBuf::from(home).join(".narousetting/global_setting.yaml");
-    if !path.exists() {
-        return false;
-    }
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(settings): Result<HashMap<String, serde_yaml::Value>, _> = serde_yaml::from_str(&raw)
-    else {
-        return false;
-    };
-    settings
-        .get("no-color")
-        .and_then(|v| v.as_bool())
+    narou_rs::db::settings::bool_value(narou_rs::setting_core::SettingScope::Global, "no-color")
         .unwrap_or(false)
 }
 
@@ -195,23 +209,15 @@ fn args_before_double_dash(args: &[String]) -> &[String] {
     }
 }
 
-fn has_explicit_positional_args(args: &[String]) -> bool {
-    let rest = args.get(1..).unwrap_or(&[]);
-    match rest.iter().position(|arg| arg == "--") {
-        Some(index) => rest.get(index + 1).is_some(),
-        None => rest.iter().any(|arg| !arg.starts_with('-')),
-    }
-}
-
 pub fn inject_default_args(args: &mut Vec<String>) {
-    if args.len() < 2 {
+    // narou.rb `proc_default_arguments` は「コマンド名以外の argv が完全に空」
+    // のときだけ default_args.<command> を適用する。オプションだけでも argv が
+    // 残っていれば適用しない。
+    if args.len() != 1 {
         return;
     }
     let cmd_name = &args[0];
     if cmd_name.starts_with('-') {
-        return;
-    }
-    if has_explicit_positional_args(args) {
         return;
     }
     if !is_terminal_stdin() {
@@ -253,37 +259,22 @@ fn load_local_setting_value(key: &str) -> Option<String> {
 }
 
 fn load_local_setting_bool(key: &str) -> Option<bool> {
-    match load_local_setting_raw_value(key)? {
-        serde_yaml::Value::Bool(v) => Some(v),
-        serde_yaml::Value::Number(v) => v.as_i64().map(|n| n != 0),
-        serde_yaml::Value::String(v) => parse_bool(&v),
-        _ => None,
-    }
+    load_local_setting_raw_value(key)
+        .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
 }
 
 fn load_local_setting_raw_value(key: &str) -> Option<serde_yaml::Value> {
-    let dir = std::env::current_dir().ok()?;
-    if !dir.join(".narou").exists() {
-        return None;
-    }
-    let inv = narou_rs::db::inventory::Inventory::new(dir);
-    let settings: HashMap<String, serde_yaml::Value> = inv
-        .load(
-            "local_setting",
-            narou_rs::db::inventory::InventoryScope::Local,
-        )
-        .ok()?;
-    settings.get(key).cloned()
+    narou_rs::db::settings::value(narou_rs::setting_core::SettingScope::Local, key)
 }
 
 fn inject_log_defaults(args: &mut Vec<String>) {
     let mut defaults = Vec::new();
 
-    if !has_option(args, "-n", "--num") {
-        if let Some(value) = load_local_setting_value("log.num") {
-            defaults.push("--num".to_string());
-            defaults.push(value);
-        }
+    if !has_option(args, "-n", "--num")
+        && let Some(value) = load_local_setting_value("log.num")
+    {
+        defaults.push("--num".to_string());
+        defaults.push(value);
     }
     if !has_option(args, "-t", "--tail") && load_local_setting_bool("log.tail").unwrap_or(false) {
         defaults.push("--tail".to_string());
@@ -344,14 +335,6 @@ fn has_option(args: &[String], short: &str, long: &str) -> bool {
         .any(|arg| arg == short || arg == long || arg.starts_with(&long_prefix))
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Some(true),
-        "false" | "no" | "off" | "0" => Some(false),
-        _ => None,
-    }
-}
-
 fn is_terminal_stdin() -> bool {
     std::io::stdin().is_terminal()
 }
@@ -360,6 +343,117 @@ fn is_terminal_stdin() -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// upstream `Command::COMMAND_LIST` の並び順 (ショートカットの優先度)。
+    /// 先に並ぶコマンドほど優先される。
+    const NAROU_RB_COMMAND_LIST: &[&str] = &[
+        "download", "update", "list", "convert", "diff", "setting", "alias", "inspect", "send",
+        "folder", "browser", "remove", "freeze", "tag", "web", "mail", "backup", "csv", "clean",
+        "log", "trace", "help", "version", "init",
+    ];
+
+    #[test]
+    fn command_order_matches_narou_rb() {
+        // v0.4.0 では先頭に Rust 拡張の `db` が入り、`narou d` が db に解決されていた。
+        assert_eq!(
+            &COMMAND_NAMES[..NAROU_RB_COMMAND_LIST.len()],
+            NAROU_RB_COMMAND_LIST
+        );
+        assert!(COMMAND_NAMES.len() > NAROU_RB_COMMAND_LIST.len());
+    }
+
+    #[test]
+    fn shortcuts_resolve_like_narou_rb() {
+        let shortcuts = build_shortcuts();
+        // 1文字が衝突する組は upstream と同じ優先順で解決する。
+        for (key, command) in [
+            ("d", "download"),
+            ("do", "download"),
+            ("f", "folder"),
+            ("fr", "freeze"),
+            ("b", "browser"),
+            ("c", "convert"),
+            ("i", "inspect"),
+            ("s", "setting"),
+            ("se", "setting"),
+            ("m", "mail"),
+            ("a", "alias"),
+        ] {
+            assert_eq!(shortcuts.get(key).copied(), Some(command), "{key}");
+        }
+        // 3文字以上はショートカットにしない (`dl` 等は clap 側でエラーになる)。
+        assert!(shortcuts.keys().all(|key| key.chars().count() <= 2));
+    }
+
+    #[test]
+    fn extensions_do_not_take_single_letter_shortcuts() {
+        let shortcuts = build_shortcuts();
+        for extension in ["db", "illust"] {
+            for (key, command) in &shortcuts {
+                if *command == extension {
+                    assert_eq!(key.chars().count(), 2, "{extension} took {key}");
+                }
+            }
+        }
+    }
+
+    /// `.narou` を持つ一時ディレクトリに cwd を移してから `f` を実行する。
+    /// preprocess_args は narou.rb の `Narou.already_init?` 相当として .narou の
+    /// 有無を見るため、通常のコマンド解釈のテストには初期化済みディレクトリが
+    /// 必要になる。
+    fn with_initialized_dir(f: impl FnOnce()) {
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-cli-init-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            f();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shortcut_resolves_through_global_flags() {
+        // グローバルフラグが先頭にあってもコマンド位置の短縮を解決する。
+        with_initialized_dir(|| {
+            let mut args = vec!["--no-color".to_string(), "d".to_string(), "0".to_string()];
+            let flags = preprocess_args(&mut args);
+            assert!(flags.no_color);
+            assert_eq!(args, vec!["download".to_string(), "0".to_string()]);
+        });
+    }
+
+    #[test]
+    fn uninitialized_dir_replaces_command_with_help() {
+        // narou.rb take_command_name: .narou が無いディレクトリでは
+        // help/version/init 以外のコマンド名を help に置き換える。
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-cli-uninit-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            let mut args = vec!["l".to_string(), "0".to_string()];
+            let _flags = preprocess_args(&mut args);
+            assert_eq!(args, vec!["help".to_string(), "0".to_string()]);
+
+            for allowed in ["help", "version", "init"] {
+                let mut args = vec![allowed.to_string()];
+                let _flags = preprocess_args(&mut args);
+                assert_eq!(args[0], allowed);
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn version_flag_becomes_version_command() {
@@ -610,15 +704,17 @@ mod tests {
 
     #[test]
     fn download_targets_after_double_dash_are_not_treated_as_help() {
-        let mut args = vec!["download".to_string(), "--".to_string(), "-h".to_string()];
-        let _flags = preprocess_args(&mut args);
-        assert_eq!(args, vec!["download", "--", "-h"]);
+        with_initialized_dir(|| {
+            let mut args = vec!["download".to_string(), "--".to_string(), "-h".to_string()];
+            let _flags = preprocess_args(&mut args);
+            assert_eq!(args, vec!["download", "--", "-h"]);
 
-        let cli = Cli::try_parse_from(["narou", "download", "--", "-h"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Download { targets, .. } if targets == vec!["-h".to_string()]
-        ));
+            let cli = Cli::try_parse_from(["narou", "download", "--", "-h"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Download { targets, .. } if targets == vec!["-h".to_string()]
+            ));
+        });
     }
 }
 
@@ -633,6 +729,11 @@ pub struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Commands {
+    /// Maintenance operations for the SQLite management database (P2).
+    Db {
+        #[command(subcommand)]
+        action: crate::commands::db::DbAction,
+    },
     Init {
         #[arg(short = 'p', long = "path")]
         aozora_path: Option<String>,
@@ -734,6 +835,21 @@ pub enum Commands {
         all_clean: bool,
         #[arg(long)]
         no_tool: bool,
+        /// P4b: list SQLite version history
+        #[arg(long = "history")]
+        history: bool,
+        /// P4b: show the stored diff of one version id
+        #[arg(long = "show")]
+        show: Option<i64>,
+        /// P4b: restore one version (copy-forward)
+        #[arg(long = "restore")]
+        restore: Option<i64>,
+        /// P4b: merge sections of one version into the working set
+        #[arg(long = "merge-from")]
+        merge_from: Option<i64>,
+        /// P4b: with --merge-from, restrict to these section indexes
+        #[arg(long = "merge-sections")]
+        merge_sections: Option<String>,
     },
     List {
         limit: Option<usize>,
@@ -763,6 +879,9 @@ pub enum Commands {
         sort_by: Option<String>,
         #[arg(long, hide = true)]
         frozen: bool,
+        /// Also show novels/tags hidden by `narou hidden`.
+        #[arg(long = "show-hidden")]
+        show_hidden: bool,
     },
     Tag {
         #[arg(short = 'a', long = "add")]
@@ -851,6 +970,57 @@ pub enum Commands {
         #[arg(short = 'm', long)]
         more: bool,
     },
+    /// Authors whose works are tracked (add/list/remove/check).
+    #[command(after_help = "Examples:\n  narou author add https://mypage.syosetu.com/2842627/\n  narou author list\n  narou author remove 1")]
+    Author {
+        #[command(subcommand)]
+        action: crate::commands::author::AuthorAction,
+    },
+    /// Hide novels, tags, authors, or sites from the list.
+    #[command(after_help = "Examples:\n  narou hidden add 123 --tag 秘密\n  narou hidden add --site kakuyomu.jp\n  narou hidden list\n  narou list --show-hidden")]
+    Hidden {
+        #[command(subcommand)]
+        action: crate::commands::hidden::HiddenAction,
+    },
+    /// Register several novels as one virtual novel (ncode vs_<ID>).
+    #[command(after_help = "Examples:\n  narou virtual add --title \"XXX\" --author \"作者\" --site カクヨム 1 2 3\n  narou virtual list\n  narou virtual order vs_1 2,1,3")]
+    Virtual {
+        #[command(subcommand)]
+        action: crate::commands::virtual_novel::VirtualAction,
+    },
+    /// Login credentials shared with a browser machine (list/import/export/rename/order/clear).
+    Login {
+        #[command(subcommand)]
+        action: crate::commands::login::LoginAction,
+    },
+    /// Bearer tokens for the external API (list/create/delete/info).
+    #[command(after_help = "Examples:\n  narou api list\n  narou api create 表生成\n  narou api delete <ID>\n  narou api info")]
+    Api {
+        #[command(subcommand)]
+        action: crate::commands::api::ApiAction,
+    },
+    /// Write selected novels to a portable ZIP archive.
+    #[command(after_help = "Examples:\n  narou export 1 2 -o novels.zip\n  narou export n9669bk")]
+    Export {
+        targets: Vec<String>,
+        /// Output ZIP path (default: narou-export-<timestamp>.zip in the CWD).
+        #[arg(short = 'o', long = "output")]
+        output: Option<String>,
+    },
+    /// Import novels from a portable ZIP archive.
+    #[command(
+        after_help = "Examples:\n  narou import novels.zip\n  narou import novels.zip --overwrite"
+    )]
+    Import {
+        /// Archive written by `narou export`.
+        archive: String,
+        /// Replace novels that are already in the library.
+        #[arg(long, conflicts_with = "skip")]
+        overwrite: bool,
+        /// Keep novels that are already in the library (default).
+        #[arg(long, conflicts_with = "overwrite")]
+        skip: bool,
+    },
     Illust {
         #[arg(short = 'f', long)]
         force: bool,
@@ -867,4 +1037,10 @@ pub enum IllustSubcommand {
     Migrate,
     FixExt,
     Rebuild,
+    /// 挿絵をローカルから S3 互換ストレージへ写す (既定 dry-run)。
+    S3Push,
+    /// ローカルと S3 の挿絵を突き合わせる。
+    S3Verify,
+    /// 旧 `挿絵/` 配置の S3 オブジェクトを dedup プールへ移し、残ったものを消す。
+    S3Dedup,
 }

@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -19,13 +20,11 @@ pub(crate) struct ConvertedSection {
     pub postscript: String,
 }
 
-pub(crate) fn render_novel_text(
+pub(crate) fn render_novel_header(
     settings: &NovelSettings,
     toc: &TocObject,
     story: &str,
-    sections: &[ConvertedSection],
     record: Option<&NovelRecord>,
-    device: Option<Device>,
 ) -> String {
     let mut output = String::new();
 
@@ -67,8 +66,18 @@ pub(crate) fn render_novel_text(
     }
 
     output.push('\n');
+    output
+}
 
-    for section in sections {
+pub(crate) fn render_novel_section(
+    settings: &NovelSettings,
+    toc: &TocObject,
+    section: &ConvertedSection,
+    device: Option<Device>,
+) -> String {
+    let mut output = String::new();
+    let title = settings.title_for_output(&toc.title);
+
         output.push_str("\u{FF3B}\u{FF03}\u{6539}\u{30DA}\u{30FC}\u{30B8}\u{FF3D}\n");
 
         if !section.chapter.is_empty() {
@@ -155,7 +164,7 @@ pub(crate) fn render_novel_text(
             } else if style == "plain" {
                 output.push_str("\n\u{FF3B}\u{FF03}\u{533A}\u{5207}\u{308A}\u{7DDA}\u{FF3D}\n\n");
                 output.push_str(&trimmed_post);
-                output.push_str("\n");
+                output.push('\n');
             } else {
                 output.push_str(&format!(
                     "\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{5F8C}\u{66F8}\u{304D}\u{FF3D}\n{}\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5F8C}\u{66F8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
@@ -169,12 +178,33 @@ pub(crate) fn render_novel_text(
         if !output.ends_with('\n') {
             output.push('\n');
         }
-    }
+    output
+}
+
+pub(crate) fn render_novel_footer(settings: &NovelSettings) -> String {
+    let mut output = String::new();
 
     if settings.enable_display_end_of_book {
         output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{5730}\u{4ED8}\u{304D}\u{FF3D}\u{FF3B}\u{FF03}\u{5C0F}\u{66F8}\u{304D}\u{FF3D}\u{FF08}\u{672C}\u{3092}\u{8AAD}\u{307F}\u{7D42}\u{308F}\u{308A}\u{307E}\u{3057}\u{305F}\u{FF09}\u{FF3B}\u{FF03}\u{5C0F}\u{66F8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5730}\u{4ED8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
     }
 
+    output
+}
+
+#[cfg(test)]
+pub(crate) fn render_novel_text(
+    settings: &NovelSettings,
+    toc: &TocObject,
+    story: &str,
+    sections: &[ConvertedSection],
+    record: Option<&NovelRecord>,
+    device: Option<Device>,
+) -> String {
+    let mut output = render_novel_header(settings, toc, story, record);
+    for section in sections {
+        output.push_str(&render_novel_section(settings, toc, section, device));
+    }
+    output.push_str(&render_novel_footer(settings));
     output
 }
 
@@ -322,18 +352,32 @@ fn novel_type_text(novel_type: Option<u8>) -> String {
     }
 }
 
+/// Ruby 互換の表紙ファイル名と優先順。保存先に依存せず同じ候補を使う。
+pub const COVER_IMAGE_NAMES: [&str; 3] = ["cover.jpg", "cover.png", "cover.jpeg"];
+
+/// 小説ディレクトリ内の表紙画像 (`cover.jpg` → `cover.png` → `cover.jpeg` の
+/// 順で最初に実在するもの)。
+///
+/// 変換時の挿絵注記の挿入・native CLI の `-c 0` 判定・i文庫 ZIP・EPUB の
+/// オンデマンド生成が同じ探索順を使う。
+pub(crate) fn cover_image_path(dir: &Path) -> Option<PathBuf> {
+    COVER_IMAGE_NAMES
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+}
+
 fn create_cover_chuki(settings: &NovelSettings) -> String {
-    let archive_path = &settings.archive_path;
-    for ext in &[".jpg", ".png", ".jpeg"] {
-        let cover_path = archive_path.join(format!("cover{}", ext));
-        if cover_path.exists() {
-            return format!(
-                "\u{FF3B}\u{FF03}\u{633F}\u{7D75}\u{FF08}cover{}\u{FF09}\u{5165}\u{308B}\u{FF3D}",
-                ext
-            );
-        }
-    }
-    String::new()
+    let Some(cover_path) = cover_image_path(&settings.archive_path) else {
+        return String::new();
+    };
+    let Some(file_name) = cover_path.file_name().and_then(|name| name.to_str()) else {
+        return String::new();
+    };
+    format!(
+        "\u{FF3B}\u{FF03}\u{633F}\u{7D75}\u{FF08}{}\u{FF09}\u{5165}\u{308B}\u{FF3D}",
+        file_name
+    )
 }
 
 pub(crate) fn insert_cover_chuki_for_textfile(settings: &NovelSettings, text: &str) -> String {
@@ -441,6 +485,48 @@ mod tests {
     use crate::db::NovelRecord;
     use crate::{converter::settings::NovelSettings, downloader::TocObject};
 
+    #[test]
+    fn incremental_regions_preserve_the_complete_native_template() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = NovelSettings {
+            archive_path: directory.path().to_path_buf(),
+            enable_add_date_to_title: false,
+            enable_display_end_of_book: true,
+            ..NovelSettings::default()
+        };
+        let toc = TocObject {
+            title: "作品".into(), author: "作者".into(), toc_url: "https://example.test/".into(),
+            story: None, subtitles: Vec::new(), novel_type: Some(1),
+        };
+        let section = ConvertedSection {
+            chapter: "章".into(), subchapter: "節".into(), subtitle: "題".into(),
+            introduction: "前\n".into(), body: "本文\n\n".into(), postscript: "後\n".into(),
+        };
+        assert_eq!(
+            super::render_novel_header(&settings, &toc, "あらすじ", None),
+            concat!(
+                "作品\n作者\n\n［＃区切り線］\nあらすじ：\nあらすじ\n\n掲載ページ:\n",
+                "<a href=\"https://example.test/\">https://example.test/</a>\n［＃区切り線］\n\n",
+            ),
+        );
+        assert_eq!(
+            super::render_novel_section(&settings, &toc, &section, None),
+            concat!(
+                "［＃改ページ］\n［＃ページの左右中央］\n",
+                "［＃ここから柱］作品［＃ここで柱終わり］\n",
+                "［＃３字下げ］［＃大見出し］章［＃大見出し終わり］\n［＃改ページ］\n",
+                "［＃１字下げ］［＃１段階大きな文字］節［＃大きな文字終わり］\n\n",
+                "［＃３字下げ］［＃中見出し］題［＃中見出し終わり］\n\n\n",
+                "［＃ここから前書き］\n前\n［＃ここで前書き終わり］\n\n\n",
+                "本文［＃ここから後書き］\n後\n［＃ここで後書き終わり］\n",
+            ),
+        );
+        assert_eq!(
+            super::render_novel_footer(&settings),
+            "\n［＃ここから地付き］［＃小書き］（本を読み終わりました）［＃小書き終わり］［＃ここで地付き終わり］\n",
+        );
+    }
+
     fn sample_record() -> NovelRecord {
         NovelRecord {
             id: 1,
@@ -467,16 +553,20 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
     }
 
     #[test]
     fn rendered_title_uses_title_date_format_with_title_placeholder() {
-        let mut settings = NovelSettings::default();
-        settings.enable_add_date_to_title = true;
-        settings.title_date_format = "$t (%F) $ns".to_string();
-        settings.title_date_target = "general_lastup".to_string();
+        let settings = NovelSettings {
+            enable_add_date_to_title: true,
+            title_date_format: "$t (%F) $ns".to_string(),
+            title_date_target: "general_lastup".to_string(),
+            ..NovelSettings::default()
+        };
         let toc = TocObject {
             title: "作品".to_string(),
             author: "作者".to_string(),
@@ -495,11 +585,13 @@ mod tests {
 
     #[test]
     fn decorate_title_applies_left_align_end_marker_and_ruby_escape() {
-        let mut settings = NovelSettings::default();
-        settings.enable_add_date_to_title = true;
-        settings.title_date_format = "%F ".to_string();
-        settings.title_date_align = "left".to_string();
-        settings.enable_add_end_to_title = true;
+        let settings = NovelSettings {
+            enable_add_date_to_title: true,
+            title_date_format: "%F ".to_string(),
+            title_date_align: "left".to_string(),
+            enable_add_end_to_title: true,
+            ..NovelSettings::default()
+        };
         let mut record = sample_record();
         record.tags = vec!["end".to_string()];
 
@@ -575,10 +667,12 @@ mod tests {
 
     #[test]
     fn decorate_title_replaces_all_narou_rb_extended_format_symbols() {
-        let mut settings = NovelSettings::default();
-        settings.enable_add_date_to_title = true;
-        settings.title_date_format = "$t $s $ns $ntag $nt".to_string();
-        settings.title_date_target = "general_lastup".to_string();
+        let settings = NovelSettings {
+            enable_add_date_to_title: true,
+            title_date_format: "$t $s $ns $ntag $nt".to_string(),
+            title_date_target: "general_lastup".to_string(),
+            ..NovelSettings::default()
+        };
         let mut record = sample_record();
         record.sitename = "Site".to_string();
         record.novel_type = 2;
@@ -593,8 +687,10 @@ mod tests {
 
     #[test]
     fn rendered_title_strips_prefix_when_enabled() {
-        let mut settings = NovelSettings::default();
-        settings.enable_strip_title_prefix = true;
+        let settings = NovelSettings {
+            enable_strip_title_prefix: true,
+            ..NovelSettings::default()
+        };
         let toc = TocObject {
             title: "《コミカライズ企画進行中》マジカル".to_string(),
             author: "作者".to_string(),

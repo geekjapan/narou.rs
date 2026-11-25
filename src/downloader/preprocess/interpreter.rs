@@ -4,28 +4,99 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use super::ast::*;
+use super::jobs::{MAX_PREPROCESS_JOBS, PreprocessError, PreprocessJobs, PreprocessRequest};
 
 const PREPROCESS_STEP_BUDGET: usize = 100_000;
 const PREPROCESS_MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
 const PREPROCESS_MAX_ARRAY_ITEMS: usize = 100_000;
 
-type PreprocessResult<T> = Result<T, String>;
+type PreprocessResult<T> = Result<T, PreprocessError>;
 
-struct Ctx {
+struct Ctx<'a> {
     vars: HashMap<String, Value>,
     output: Vec<String>,
     match_start: Option<usize>,
     step_budget: usize,
+    /// The page being preprocessed. The DSL reads it (`extract`,
+    /// `extract_json`, `extract_all`) and rewrites it in place
+    /// (`insert_at_match`), so later reads see the rewritten text.
+    source: &'a mut String,
+    /// Results of previously requested URLs, exposed to the DSL as `fetched`.
+    jobs: &'a PreprocessJobs,
+    /// URLs this run asked for, in request order.
+    requested: Vec<PreprocessRequest>,
 }
 
-impl Ctx {
-    fn new() -> Self {
+impl<'a> Ctx<'a> {
+    fn new(jobs: &'a PreprocessJobs, url: &str, source: &'a mut String) -> Self {
+        let mut vars = HashMap::new();
+        vars.insert(
+            "fetched".to_string(),
+            Value::Object(
+                jobs.results()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+        );
+        // The URL this body came from, so definitions can derive follow-up
+        // URLs (Pixiv pages its manga series listings).
+        vars.insert("url".to_string(), Value::String(url.to_string()));
+        vars.insert("has_cookie".to_string(), Value::Bool(jobs.has_cookie()));
         Self {
-            vars: HashMap::new(),
+            vars,
             output: Vec::new(),
             match_start: None,
             step_budget: PREPROCESS_STEP_BUDGET,
+            source,
+            jobs,
+            requested: Vec::new(),
         }
+    }
+
+    /// Record a fetch request. Invalid or already-known URLs are not queued;
+    /// the DSL still gets the URL back so it can look the result up.
+    fn request(&mut self, url: String) -> PreprocessResult<Value> {
+        if !(url.starts_with("http://") || url.starts_with("https://"))
+            || !crate::downloader::security::is_safe_public_url_syntax(&url)
+        {
+            return Ok(Value::Null);
+        }
+        if !self.jobs.contains(&url)
+            && !self.requested.iter().any(|request| request.key() == url)
+            && self.requested.len() < MAX_PREPROCESS_JOBS
+        {
+            self.requested.push(PreprocessRequest::Json { url: url.clone() });
+        }
+        Ok(Value::String(url))
+    }
+
+    fn required_json(&mut self, url: String, missing_statuses: &[u16]) -> PreprocessResult<Value> {
+        if !crate::downloader::security::is_safe_public_url_syntax(&url)
+            || missing_statuses.iter().any(|status| !(400..600).contains(status))
+        {
+            return Err("preprocess: invalid required JSON request".into());
+        }
+        self.jobs.validate_required(&url, missing_statuses)?;
+        if !self.jobs.contains(&url) {
+            if let Some(request) = self.requested.iter_mut().find(|request| request.key() == url) {
+                match request {
+                    PreprocessRequest::JsonRequired { missing_statuses: existing, .. } => {
+                        existing.retain(|status| missing_statuses.contains(status));
+                    }
+                    _ => *request = PreprocessRequest::JsonRequired {
+                        url: url.clone(), missing_statuses: missing_statuses.to_vec(),
+                    },
+                }
+            } else {
+                if self.requested.len() >= MAX_PREPROCESS_JOBS {
+                    return Err("preprocess: required JSON request limit exceeded".into());
+                }
+                self.requested.push(PreprocessRequest::JsonRequired {
+                    url: url.clone(), missing_statuses: missing_statuses.to_vec(),
+                });
+            }
+        }
+        Ok(self.jobs.get(&url).cloned().unwrap_or(Value::Null))
     }
 
     fn get(&self, name: &str) -> Option<&Value> {
@@ -52,13 +123,31 @@ impl Ctx {
         Ok(())
     }
 
-    fn resolve_str_parts(&self, parts: &[StrPart]) -> PreprocessResult<String> {
+    /// Every match of `pattern` in the source, in source order.
+    ///
+    /// The first capture group is used when the pattern has one; a group that
+    /// did not take part in the match becomes null. A pattern without capture
+    /// groups yields the whole match. The first match also becomes the
+    /// `insert_at_match` anchor; a pattern that matches nothing leaves the
+    /// anchor of an earlier match alone.
+    fn extract_all(&mut self, pattern: &str, flags: &str) -> PreprocessResult<Value> {
+        let re = cached_preprocess_regex(pattern, flags)?;
+        let mut budget = self.step_budget;
+        let (items, first_start) = collect_matches(&re, self.source.as_str(), &mut budget)?;
+        self.step_budget = budget;
+        if let Some(start) = first_start {
+            self.match_start = Some(start);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn resolve_str_parts(&mut self, parts: &[StrPart]) -> PreprocessResult<String> {
         let mut s = String::new();
         for part in parts {
             match part {
                 StrPart::Lit(lit) => s.push_str(lit),
-                StrPart::Interp(accessor) => {
-                    let val = self.resolve_accessor(accessor)?;
+                StrPart::Interp(expr) => {
+                    let val = eval_expr(self, expr)?;
                     s.push_str(&val_to_string(&val));
                 }
             }
@@ -67,7 +156,7 @@ impl Ctx {
         Ok(s)
     }
 
-    fn resolve_accessor(&self, acc: &Accessor) -> PreprocessResult<Value> {
+    fn resolve_accessor(&mut self, acc: &Accessor) -> PreprocessResult<Value> {
         let base = match self.vars.get(&acc.base) {
             Some(v) => v.clone(),
             None => return Ok(Value::Null),
@@ -75,7 +164,7 @@ impl Ctx {
         self.walk_accessor(&base, &acc.path)
     }
 
-    fn walk_accessor(&self, val: &Value, path: &[AccessPart]) -> PreprocessResult<Value> {
+    fn walk_accessor(&mut self, val: &Value, path: &[AccessPart]) -> PreprocessResult<Value> {
         let mut current = val.clone();
         for part in path {
             current = match part {
@@ -83,7 +172,8 @@ impl Ctx {
                 AccessPart::Bracket(key) => {
                     let key_val = match key {
                         BracketKey::Str(parts) => Value::String(self.resolve_str_parts(parts)?),
-                        BracketKey::Accessor(acc) => self.resolve_accessor(acc)?,
+                        BracketKey::Expr(expr) => eval_expr(self, expr)?,
+                        BracketKey::Index(index) => Value::Number((*index).into()),
                     };
                     match key_val {
                         Value::String(k) => current.get(&k).cloned().unwrap_or(Value::Null),
@@ -99,6 +189,72 @@ impl Ctx {
         validate_value_limits(&current)?;
         Ok(current)
     }
+}
+
+fn form_pairs(value: Value) -> PreprocessResult<Vec<(String, String)>> {
+    let Value::Array(items) = value else {
+        return Err("preprocess: form fields and headers must be arrays of pairs".into());
+    };
+    if items.len() > MAX_PREPROCESS_JOBS {
+        return Err("preprocess: too many form fields or headers".into());
+    }
+    let scalar = |value| match value {
+        Value::String(value) => Ok(value),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::Bool(value) => Ok(value.to_string()),
+        _ => Err("preprocess: form values must be strings, numbers, or booleans".to_string()),
+    };
+    items.into_iter().map(|item| {
+        let Value::Array(pair) = item else {
+            return Err("preprocess: form entry must be a pair".into());
+        };
+        if pair.len() != 2 {
+            return Err("preprocess: form entry must have two values".into());
+        }
+        let mut values = pair.into_iter();
+        Ok((scalar(values.next().unwrap())?, scalar(values.next().unwrap())?))
+    }).collect()
+}
+
+fn eval_post_form(ctx: &mut Ctx, url: &Expr, fields: &Expr, headers: Option<&Expr>) -> PreprocessResult<Value> {
+    let target = val_to_string(&eval_expr(ctx, url)?);
+    let source = ctx.get("url").and_then(Value::as_str).unwrap_or_default();
+    let origin = url::Url::parse(source).map_err(|_| "preprocess: form source URL is invalid")?;
+    let parsed = url::Url::parse(&target).map_err(|_| "preprocess: form URL is invalid")?;
+    if parsed.origin() != origin.origin()
+        || !crate::downloader::security::is_safe_public_url_syntax(&target)
+        || !parsed.username().is_empty() || parsed.password().is_some()
+    {
+        return Err("preprocess: form requests must stay on the source origin".into());
+    }
+    let fields = form_pairs(eval_expr(ctx, fields)?)?;
+    let headers = match headers {
+        Some(headers) => form_pairs(eval_expr(ctx, headers)?)?,
+        None => Vec::new(),
+    };
+    for (name, value) in &headers {
+        if !crate::platform::http::is_safe_header_name(name)
+            || !crate::platform::http::is_safe_header_value(value)
+            || matches!(name.to_ascii_lowercase().as_str(),
+                "cookie" | "host" | "authorization" | "proxy-authorization"
+                | "content-length" | "content-type" | "transfer-encoding")
+        {
+            return Err("preprocess: unsafe form request header".into());
+        }
+    }
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(fields).finish();
+    validate_string_size(&body)?;
+    let request = PreprocessRequest::form(target, body, headers);
+    if let Some(value) = ctx.jobs.get(request.key()) {
+        return Ok(value.clone());
+    }
+    if !ctx.requested.iter().any(|pending| pending.key() == request.key()) {
+        if ctx.requested.len() >= MAX_PREPROCESS_JOBS {
+            return Err("preprocess: form request limit exceeded".into());
+        }
+        ctx.requested.push(request);
+    }
+    Ok(Value::Null)
 }
 
 fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
@@ -156,35 +312,121 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
             }
             Value::Array(values)
         }
-        Expr::ExtractJson(_, _) | Expr::Regex(_, _) => Value::Null,
+        Expr::Int(value) => Value::Number((*value).into()),
+        Expr::Request(inner) => {
+            let url = val_to_string(&eval_expr(ctx, inner)?);
+            ctx.request(url)?
+        }
+        Expr::FetchJson(inner) => {
+            let url = val_to_string(&eval_expr(ctx, inner)?);
+            let url = val_to_string(&ctx.request(url)?);
+            if url.is_empty() {
+                Value::Null
+            } else {
+                ctx.jobs.get(&url).cloned().unwrap_or(Value::Null)
+            }
+        }
+        Expr::FetchJsonRequired { url, missing_statuses } => {
+            let url = val_to_string(&eval_expr(ctx, url)?);
+            ctx.required_json(url, missing_statuses)?
+        }
+        Expr::PostForm { url, fields, headers } => eval_post_form(ctx, url, fields, headers.as_deref())?,
+        Expr::Arith(left, op, right) => {
+            let left = eval_expr(ctx, left)?;
+            let right = eval_expr(ctx, right)?;
+            match (as_integer(&left), as_integer(&right)) {
+                (Some(a), Some(b)) => Value::Number(
+                    match op {
+                        ArithOp::Add => a.saturating_add(b),
+                        ArithOp::Sub => a.saturating_sub(b),
+                    }
+                    .into(),
+                ),
+                _ => Value::Null,
+            }
+        }
+        Expr::ExtractAll(pattern, flags) => ctx.extract_all(pattern, flags)?,
+        Expr::ExtractJson(_, _) | Expr::Extract(_, _) | Expr::Regex(_, _) => Value::Null,
     };
     validate_value_limits(&value)?;
     Ok(value)
+}
+
+/// Collect every match of `re` in `source`, in source order.
+///
+/// Each match costs one step of the budget and is size-checked before it is
+/// appended, so a runaway pattern cannot build an unbounded array.
+fn collect_matches(
+    re: &regex::Regex,
+    source: &str,
+    budget: &mut usize,
+) -> PreprocessResult<(Vec<Value>, Option<usize>)> {
+    let has_capture = re.captures_len() > 1;
+    let mut items: Vec<Value> = Vec::new();
+    let mut first_start = None;
+    for caps in re.captures_iter(source) {
+        if *budget == 0 {
+            return Err("preprocess: step budget exceeded".into());
+        }
+        *budget -= 1;
+        let whole = caps.get(0).expect("group 0 always participates");
+        if first_start.is_none() {
+            first_start = Some(whole.start());
+        }
+        let value = if has_capture {
+            match caps.get(1) {
+                Some(group) => Value::String(group.as_str().to_string()),
+                // An optional capture that did not take part in this match.
+                None => Value::Null,
+            }
+        } else {
+            Value::String(whole.as_str().to_string())
+        };
+        if let Value::String(text) = &value {
+            validate_string_size(text)?;
+        }
+        validate_array_len(items.len() + 1)?;
+        items.push(value);
+    }
+    Ok((items, first_start))
 }
 
 fn eval_extract_json(
     ctx: &mut Ctx,
     pattern: &str,
     flags: &str,
-    source: &str,
 ) -> PreprocessResult<Option<Value>> {
-    let re = cached_extract_json_regex(pattern, flags)?;
-    let Some(caps) = re.captures(source) else {
-        return Ok(None);
+    let re = cached_preprocess_regex(pattern, flags)?;
+    let (start, value) = {
+        let Some(caps) = re.captures(ctx.source.as_str()) else {
+            return Ok(None);
+        };
+        let Some(json_match) = caps.get(1) else {
+            return Ok(None);
+        };
+        validate_string_size(json_match.as_str())?;
+        let Some(full_match) = caps.get(0) else {
+            return Ok(None);
+        };
+        let value = serde_json::from_str(json_match.as_str()).ok();
+        if let Some(parsed) = &value {
+            validate_value_limits(parsed)?;
+        }
+        (full_match.start(), value)
     };
-    let Some(json_match) = caps.get(1) else {
-        return Ok(None);
-    };
-    validate_string_size(json_match.as_str())?;
-    let Some(full_match) = caps.get(0) else {
-        return Ok(None);
-    };
-    ctx.match_start = Some(full_match.start());
-    let value = serde_json::from_str(json_match.as_str()).ok();
-    if let Some(ref value) = value {
-        validate_value_limits(value)?;
-    }
+    ctx.match_start = Some(start);
     Ok(value)
+}
+
+/// Integers for arithmetic. Numeric strings are coerced (captures are always
+/// strings); anything else yields `None`, which makes the whole expression null
+/// instead of silently concatenating.
+fn as_integer(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<Value> {
@@ -286,6 +528,65 @@ fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<V
                 None => val,
             }
         }
+        Method::GsubRegex { pattern, flags, to } => {
+            let replacement = ctx.resolve_str_parts(to)?;
+            match val.as_str() {
+                Some(s) => {
+                    let re = cached_preprocess_regex(pattern, flags)?;
+                    let replaced = re.replace_all(s, replacement.as_str()).into_owned();
+                    validate_string_size(&replaced)?;
+                    Value::String(replaced)
+                }
+                None => val,
+            }
+        }
+        Method::GsubBlock {
+            pattern,
+            flags,
+            var,
+            body,
+        } => match val.as_str() {
+            Some(text) => {
+                let re = cached_preprocess_regex(pattern, flags)?;
+                let mut replaced = String::with_capacity(text.len());
+                let mut last = 0;
+                for caps in re.captures_iter(text) {
+                    let whole = caps.get(0).expect("group 0 always participates");
+                    replaced.push_str(&text[last..whole.start()]);
+                    let mut groups = Vec::with_capacity(caps.len());
+                    for index in 0..caps.len() {
+                        groups.push(
+                            caps.get(index)
+                                .map(|m| Value::String(m.as_str().to_string()))
+                                .unwrap_or(Value::Null),
+                        );
+                    }
+                    ctx.set(var, Value::Array(groups))?;
+                    replaced.push_str(&val_to_string(&eval_expr(ctx, body)?));
+                    last = whole.end();
+                }
+                replaced.push_str(&text[last..]);
+                validate_string_size(&replaced)?;
+                Value::String(replaced)
+            }
+            None => val,
+        },
+        Method::Field(field) => val.get(field.as_str()).cloned().unwrap_or(Value::Null),
+        Method::Bracket(key) => {
+            let key_val = match key {
+                BracketKey::Str(parts) => Value::String(ctx.resolve_str_parts(parts)?),
+                BracketKey::Expr(expr) => eval_expr(ctx, expr)?,
+                BracketKey::Index(index) => Value::Number((*index).into()),
+            };
+            match key_val {
+                Value::String(key) => val.get(&key).cloned().unwrap_or(Value::Null),
+                Value::Number(number) => {
+                    let index = number.as_u64().unwrap_or(0) as usize;
+                    val.get(index).cloned().unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            }
+        }
         Method::IsArray => Value::Bool(matches!(val, Value::Array(_))),
         Method::Empty => match &val {
             Value::String(s) => Value::Bool(s.is_empty()),
@@ -293,23 +594,55 @@ fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<V
             Value::Null => Value::Bool(true),
             _ => Value::Bool(false),
         },
+        Method::Keys => match &val {
+            Value::Object(map) => Value::Array(
+                map.keys()
+                    .map(|key| Value::String(key.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            Value::Array(items) => Value::Array(
+                (0..items.len())
+                    .map(|index| Value::String(index.to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => Value::Array(Vec::new()),
+        },
+        Method::Size => match &val {
+            Value::String(s) => Value::Number(s.chars().count().into()),
+            Value::Array(a) => Value::Number(a.len().into()),
+            Value::Object(map) => Value::Number(map.len().into()),
+            Value::Null => Value::Number(0.into()),
+            _ => val,
+        },
+        Method::First => match val.as_array() {
+            Some(arr) => arr.first().cloned().unwrap_or(Value::Null),
+            None => val,
+        },
+        Method::Last => match val.as_array() {
+            Some(arr) => arr.last().cloned().unwrap_or(Value::Null),
+            None => val,
+        },
+        Method::Reverse => match val.as_array() {
+            Some(arr) => Value::Array(arr.iter().rev().cloned().collect()),
+            None => val,
+        },
     };
     validate_value_limits(&value)?;
     Ok(value)
 }
 
-fn eval_stmts(ctx: &mut Ctx, stmts: &[Stmt], source: &mut String) -> PreprocessResult<()> {
+fn eval_stmts(ctx: &mut Ctx, stmts: &[Stmt]) -> PreprocessResult<()> {
     for stmt in stmts {
-        eval_stmt(ctx, stmt, source)?;
+        eval_stmt(ctx, stmt)?;
     }
     Ok(())
 }
 
-fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResult<()> {
+fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt) -> PreprocessResult<()> {
     ctx.consume_step()?;
     match stmt {
         Stmt::Guard(guard_text) => {
-            if source.contains(guard_text.as_str()) {
+            if ctx.source.contains(guard_text.as_str()) {
                 ctx.output.clear();
                 ctx.set("__abort__", Value::Bool(true))?;
             }
@@ -320,7 +653,23 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
             }
             let val = match expr {
                 Expr::ExtractJson(pattern, flags) => {
-                    eval_extract_json(ctx, pattern, flags, source)?.unwrap_or(Value::Null)
+                    eval_extract_json(ctx, pattern, flags)?.unwrap_or(Value::Null)
+                }
+                Expr::Extract(pattern, flags) => {
+                    let re = cached_preprocess_regex(pattern, flags)?;
+                    let matched = re.captures(ctx.source.as_str()).map(|captures| {
+                        (
+                            captures.get(0).map(|whole| whole.start()),
+                            captures.get(1).map(|group| group.as_str().to_string()),
+                        )
+                    });
+                    match matched {
+                        Some((start, capture)) => {
+                            ctx.match_start = start;
+                            capture.map(Value::String).unwrap_or(Value::Null)
+                        }
+                        None => Value::Null,
+                    }
                 }
                 _ => eval_expr(ctx, expr)?,
             };
@@ -356,6 +705,11 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
             let val = eval_expr(ctx, expr)?;
             ctx.push_output(val_to_string(&val))?;
         }
+        Stmt::Fail(message) => {
+            if !matches!(ctx.get("__abort__"), Some(Value::Bool(true))) {
+                return Err(format!("preprocess: {}", val_to_string(&eval_expr(ctx, message)?)).into());
+            }
+        }
         Stmt::InsertAtMatch => {
             if ctx.output.is_empty() {
                 return Ok(());
@@ -363,8 +717,8 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
             let block = ctx.output.join("\n");
             validate_string_size(&block)?;
             let pos = ctx.match_start.unwrap_or(0);
-            source.insert_str(pos, &block);
-            validate_string_size(source)?;
+            ctx.source.insert_str(pos, &block);
+            validate_string_size(ctx.source.as_str())?;
             ctx.output.clear();
         }
         Stmt::If {
@@ -377,9 +731,9 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
             }
             let val = eval_expr(ctx, cond)?;
             if is_truthy(&val) {
-                eval_stmts(ctx, body, source)?;
+                eval_stmts(ctx, body)?;
             } else if let Some(else_body) = else_body {
-                eval_stmts(ctx, else_body, source)?;
+                eval_stmts(ctx, else_body)?;
             }
         }
         Stmt::For { var, iter, body } => {
@@ -387,14 +741,13 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
                 return Ok(());
             }
             let iter_val = eval_expr(ctx, iter)?;
-            let arr = match iter_val.as_array() {
-                Some(a) => a.clone(),
-                None => return Ok(()),
+            let Value::Array(arr) = iter_val else {
+                return Ok(());
             };
             validate_array_len(arr.len())?;
             for item in arr {
                 ctx.set(var, item)?;
-                eval_stmts(ctx, body, source)?;
+                eval_stmts(ctx, body)?;
                 if let Some(Value::Bool(true)) = ctx.get("__abort__") {
                     return Ok(());
                 }
@@ -404,22 +757,24 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
     Ok(())
 }
 
-pub(super) fn run_stmts(stmts: &[Stmt], source: &mut String) {
-    if let Err(err) = run_stmts_checked(stmts, source) {
-        panic!("{err}");
-    }
-}
-
-fn run_stmts_checked(stmts: &[Stmt], source: &mut String) -> PreprocessResult<()> {
-    let mut ctx = Ctx::new();
-    eval_stmts(&mut ctx, stmts, source)
+pub(super) fn run_stmts(
+    stmts: &[Stmt],
+    source: &mut String,
+    jobs: &PreprocessJobs,
+    url: &str,
+) -> PreprocessResult<super::PreprocessRun> {
+    let mut ctx = Ctx::new(jobs, url, source);
+    eval_stmts(&mut ctx, stmts)?;
+    Ok(super::PreprocessRun {
+        requested: ctx.requested,
+    })
 }
 
 fn validate_string_size(text: &str) -> PreprocessResult<()> {
     if text.len() > PREPROCESS_MAX_STRING_BYTES {
         return Err(format!(
             "preprocess: string size limit exceeded ({PREPROCESS_MAX_STRING_BYTES} bytes)"
-        ));
+        ).into());
     }
     Ok(())
 }
@@ -428,7 +783,7 @@ fn validate_array_len(len: usize) -> PreprocessResult<()> {
     if len > PREPROCESS_MAX_ARRAY_ITEMS {
         return Err(format!(
             "preprocess: array size limit exceeded ({PREPROCESS_MAX_ARRAY_ITEMS} items)"
-        ));
+        ).into());
     }
     Ok(())
 }
@@ -453,7 +808,9 @@ fn validate_value_limits(value: &Value) -> PreprocessResult<()> {
     }
 }
 
-fn cached_extract_json_regex(pattern: &str, flags: &str) -> PreprocessResult<regex::Regex> {
+/// Compile a DSL regex literal, caching by `(pattern, flags)`. `s` enables
+/// dot-matches-newline, `m` multi-line anchors, `i` case-insensitive matching.
+fn cached_preprocess_regex(pattern: &str, flags: &str) -> PreprocessResult<regex::Regex> {
     static CACHE: OnceLock<Mutex<HashMap<(String, String), regex::Regex>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (pattern.to_string(), flags.to_string());
@@ -467,6 +824,7 @@ fn cached_extract_json_regex(pattern: &str, flags: &str) -> PreprocessResult<reg
     let mut builder = RegexBuilder::new(pattern);
     builder.dot_matches_new_line(flags.contains('s'));
     builder.multi_line(flags.contains('m'));
+    builder.case_insensitive(flags.contains('i'));
     let regex = builder
         .build()
         .map_err(|err| format!("preprocess: invalid regex: {err}"))?;
@@ -479,7 +837,175 @@ mod tests {
     use super::*;
 
     fn run(stmts: &[Stmt], source: &mut String) -> Result<(), String> {
-        run_stmts_checked(stmts, source)
+        run_stmts(stmts, source, &PreprocessJobs::new(), "").map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    /// Compile DSL source, run it over `source`, and return the result.
+    fn run_program(program: &str, source: &str) -> String {
+        let stmts = crate::downloader::preprocess::parser::parse_preprocess(program)
+            .unwrap_or_else(|err| panic!("should parse: {err}\n{program}"));
+        let mut text = source.to_string();
+        run_stmts(&stmts, &mut text, &PreprocessJobs::new(), "")
+            .unwrap_or_else(|err| panic!("{program}: {err}"));
+        text
+    }
+
+    #[test]
+    fn list_helpers_size_first_last_and_index() {
+        let out = run_program(
+            "let a = [10, 20, 30]\n\
+             emit \"size=${a.size}\"\n\
+             emit \"first=${a.first}\"\n\
+             emit \"last=${a.last}\"\n\
+             emit \"index0=${a[0]}\"\n\
+             emit \"index2=${a[2]}\"\n\
+             emit \"oob=${a[9]}\"\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(out, "size=3\nfirst=10\nlast=30\nindex0=10\nindex2=30\noob=");
+    }
+
+    #[test]
+    fn comparisons_keep_their_operator() {
+        // `==` / `!=` が条件から落ちると常に真になるため、両方向で固定する。
+        let out = run_program(
+            "let a = [1, 2, 3]\n\
+             if a.size == 30\n\
+             emit \"BIG\"\n\
+             else\n\
+             emit \"SMALL\"\n\
+             end\n\
+             if a.size == 3\n\
+             emit \"THREE\"\n\
+             end\n\
+             if a.size != 3\n\
+             emit \"NOT-THREE\"\n\
+             end\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(out, "SMALL\nTHREE");
+    }
+
+    #[test]
+    fn chain_steps_keep_their_written_order() {
+        // メソッドが後ろに寄せられると `items.first.name` が解決できなくなる。
+        let out = run_program(
+            "let json = extract_json(/(.+)/s)\n\
+             let items = json.items\n\
+             emit \"first=${items.first.name}\"\n\
+             emit \"last=${items.last.name}\"\n\
+             insert_at_match\n",
+            r#"{"items":[{"name":"one"},{"name":"two"}]}"#,
+        );
+        assert!(out.starts_with("first=one\nlast=two"), "got: {out}");
+    }
+
+    #[test]
+    fn bare_method_names_do_not_swallow_longer_field_names() {
+        let out = run_program(
+            "let json = extract_json(/(.+)/s)\n\
+             emit \"at::${json.lastEpisodePublishedAt}\"\n\
+             insert_at_match\n",
+            r#"{"lastEpisodePublishedAt":"2021-01-12T16:13:02Z"}"#,
+        );
+        assert!(out.starts_with("at::2021-01-12T16:13:02Z"), "got: {out}");
+    }
+
+    #[test]
+    fn regex_gsub_expands_capture_groups() {
+        let out = run_program(
+            "let text = \"a [[rb:漢字>かんじ]] b\"\n\
+             let text = text.gsub(/\\[\\[rb:(.*?)>(.*?)\\]\\]/, \"<ruby>$1<rp>(</rp><rt>$2</rt><rp>)</rp></ruby>\")\n\
+             let text = text.gsub(/a/, \"A\")\n\
+             emit text\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(
+            out,
+            "A <ruby>漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby> b"
+        );
+    }
+
+    #[test]
+    fn gsub_block_receives_the_match_and_replaces_each_occurrence() {
+        let out = run_program(
+            "let text = \"a [pixivimage:11-2] b [pixivimage:22-1]\"\n\
+             let text = text.gsub(/\\[pixivimage:(\\d+)-(\\d+)\\]/) { |m| \"img:${m[1]}:${m[2]}\" }\n\
+             emit text\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(out, "a img:11:2 b img:22:1");
+    }
+
+    #[test]
+    fn arithmetic_coerces_numeric_captures() {
+        let out = run_program(
+            "let a = [\"zero\", \"one\", \"two\"]\n\
+             let text = \"x-2\"\n\
+             let text = text.gsub(/x-(\\d+)/) { |m| a[m[1] - 1] }\n\
+             emit text\n\
+             emit \"sum=${1 + 2}\"\n\
+             emit \"bad=${a - 1}\"\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(out, "one\nsum=3\nbad=");
+    }
+
+    #[test]
+    fn fetch_json_registers_a_request_and_reads_settled_results() {
+        let jobs = PreprocessJobs::new();
+        let program = "let pages = fetch_json(\"https://example.com/illust/11\")\n\
+                       emit \"url=${pages.body[0].urls.original}\"\n\
+                       insert_at_match\n";
+        let stmts = crate::downloader::preprocess::parser::parse_preprocess(program).unwrap();
+        let mut source = String::new();
+        let run = run_stmts(&stmts, &mut source, &jobs, "").unwrap();
+        assert_eq!(run.requested, vec![PreprocessRequest::Json { url: "https://example.com/illust/11".into() }]);
+        assert_eq!(source, "url=");
+
+        // The same program with the job settled sees the value.
+        let mut settled = PreprocessJobs::new();
+        settled.insert(
+            "https://example.com/illust/11".to_string(),
+            serde_json::json!({"body": [{"urls": {"original": "https://i.example/11.jpg"}}]}),
+        );
+        let mut source = String::new();
+        let run = run_stmts(&stmts, &mut source, &settled, "").unwrap();
+        assert!(
+            run.requested.is_empty(),
+            "settled jobs are not re-requested"
+        );
+        assert_eq!(source, "url=https://i.example/11.jpg");
+    }
+
+    #[test]
+    fn request_rejects_urls_that_are_not_fetchable() {
+        let stmts = crate::downloader::preprocess::parser::parse_preprocess(
+            "let a = request(\"file:///etc/passwd\")\n\
+             let b = request(\"http://127.0.0.1/x\")\n\
+             emit \"a=${a} b=${b}\"\n\
+             insert_at_match\n",
+        )
+        .unwrap();
+        let mut source = String::new();
+        let run = run_stmts(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap();
+        assert!(run.requested.is_empty(), "{:?}", run.requested);
+    }
+
+    #[test]
+    fn interpolated_strings_allow_escaped_quotes() {
+        let out = run_program(
+            "let name = \"pixiv\"\n\
+             emit \"site=\\\"${name}\\\"\"\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(out, "site=\"pixiv\"");
     }
 
     #[test]
@@ -504,10 +1030,10 @@ mod tests {
             },
             Stmt::Emit(Expr::String(vec![
                 StrPart::Lit("title::".to_string()),
-                StrPart::Interp(Accessor {
+                StrPart::Interp(Expr::Access(Accessor {
                     base: "title".to_string(),
                     path: vec![],
-                }),
+                })),
             ])),
             Stmt::InsertAtMatch,
         ];
@@ -522,7 +1048,9 @@ mod tests {
     fn guard_stops_reprocessing_when_magic_word_present() {
         let stmts = vec![
             Stmt::Guard("MagicWord".to_string()),
-            Stmt::Emit(Expr::String(vec![StrPart::Lit("should_not_appear".to_string())])),
+            Stmt::Emit(Expr::String(vec![StrPart::Lit(
+                "should_not_appear".to_string(),
+            )])),
             Stmt::InsertAtMatch,
         ];
         let mut source = "MagicWord is here".to_string();
@@ -618,10 +1146,12 @@ mod tests {
                 expr: Expr::Chain {
                     base: Accessor {
                         base: "result".to_string(),
-                        path: vec![AccessPart::Bracket(BracketKey::Accessor(Accessor {
-                            base: "key".to_string(),
-                            path: vec![],
-                        }))],
+                        path: vec![AccessPart::Bracket(BracketKey::Expr(Expr::Access(
+                            Accessor {
+                                base: "key".to_string(),
+                                path: vec![],
+                            },
+                        )))],
                     },
                     methods: vec![],
                 },
@@ -693,7 +1223,8 @@ mod tests {
             Stmt::InsertAtMatch,
         ];
         let mut source =
-            r#"<script id="x" type="application/json">{"items":[{"a":1,"b":[2,3]}]}</script>"#.to_string();
+            r#"<script id="x" type="application/json">{"items":[{"a":1,"b":[2,3]}]}</script>"#
+                .to_string();
         run(&stmts, &mut source).unwrap();
         assert!(source.contains("1"));
         assert!(source.contains("2"));
@@ -725,10 +1256,10 @@ mod tests {
                             var: "tag".to_string(),
                             body: Box::new(Expr::String(vec![
                                 StrPart::Lit("tag::".to_string()),
-                                StrPart::Interp(Accessor {
+                                StrPart::Interp(Expr::Access(Accessor {
                                     base: "tag".to_string(),
                                     path: vec![],
-                                }),
+                                })),
                             ])),
                         },
                         Method::Join(vec![StrPart::Lit("\n".to_string())]),
@@ -781,15 +1312,16 @@ mod tests {
             },
             Stmt::Emit(Expr::String(vec![
                 StrPart::Lit("title::".to_string()),
-                StrPart::Interp(Accessor {
+                StrPart::Interp(Expr::Access(Accessor {
                     base: "work".to_string(),
                     path: vec![AccessPart::Dot("title".to_string())],
-                }),
+                })),
             ])),
             Stmt::InsertAtMatch,
         ];
         let mut source =
-            r#"<script id="x" type="application/json">{"work":{"title":"old"}}</script>"#.to_string();
+            r#"<script id="x" type="application/json">{"work":{"title":"old"}}</script>"#
+                .to_string();
         run(&stmts, &mut source).unwrap();
         assert!(source.contains("title::new_title"));
     }
@@ -890,7 +1422,8 @@ mod tests {
             Stmt::InsertAtMatch,
         ];
         let mut source =
-            r#"<script id="x" type="application/json">{"empty_arr":[],"has_toc":true}</script>"#.to_string();
+            r#"<script id="x" type="application/json">{"empty_arr":[],"has_toc":true}</script>"#
+                .to_string();
         run(&stmts, &mut source).unwrap();
         assert!(source.contains("in_else"));
         assert!(!source.contains("in_then"));
@@ -915,65 +1448,218 @@ mod tests {
                     },
                     methods: vec![],
                 },
-                body: vec![Stmt::Emit(Expr::String(vec![StrPart::Interp(Accessor {
-                    base: "item".to_string(),
-                    path: vec![],
-                })]))],
+                body: vec![Stmt::Emit(Expr::String(vec![StrPart::Interp(
+                    Expr::Access(Accessor {
+                        base: "item".to_string(),
+                        path: vec![],
+                    }),
+                )]))],
             },
             Stmt::InsertAtMatch,
         ];
-        let mut source =
-            r#"<script id="x" type="application/json">{"items":["a","b","c"]}</script>"#.to_string();
+let mut source =
+            r#"<script id="x" type="application/json">{"items":[{"a":1,"b":[2,3]}]}</script>"#
+                .to_string();
         run(&stmts, &mut source).unwrap();
-        assert!(source.contains("a"));
-        assert!(source.contains("b"));
-        assert!(source.contains("c"));
+        assert!(source.contains("1"));
+        assert!(source.contains("2"));
+        assert!(source.contains("3"));
     }
 
-    #[test]
-    fn preprocess_step_budget_is_enforced() {
-        let stmts = vec![
-            Stmt::Emit(Expr::String(vec![StrPart::Lit("x".to_string())]));
-            (PREPROCESS_STEP_BUDGET / 2) + 1
-        ];
-        let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source).unwrap_err();
-        assert_eq!(err, "preprocess: step budget exceeded");
-    }
+    // ---------- extract_all ----------
 
+    /// The author listing a site definition walks: one capture per work, in
+    /// the order the page lists them.
     #[test]
-    fn preprocess_string_limit_is_enforced() {
-        let oversized = "a".repeat((PREPROCESS_MAX_STRING_BYTES / 2) + 1);
-        let stmts = vec![Stmt::Emit(Expr::ValueChain {
-            base: Box::new(Expr::Array(vec![
-                Expr::String(vec![StrPart::Lit(oversized.clone())]),
-                Expr::String(vec![StrPart::Lit(oversized)]),
-            ])),
-            methods: vec![Method::Join(vec![StrPart::Lit(String::new())])],
-        })];
-        let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source).unwrap_err();
-        assert_eq!(
-            err,
-            format!(
-                "preprocess: string size limit exceeded ({PREPROCESS_MAX_STRING_BYTES} bytes)"
-            )
+    fn extract_all_returns_captures_in_source_order() {
+        let html = "<ul>\
+            <li><a href=\"/story/111\">one</a></li>\
+            <li><a href=\"/story/222\">two</a></li>\
+            <li><a href=\"/story/333\">three</a></li>\
+            </ul>";
+        let out = run_program(
+            "for story in extract_all(/href=\"([^\"]*)\"/)\n\
+             emit \"<i>${story}</i>\"\n\
+             end\n\
+             insert_at_match\n",
+            html,
         );
+        let first = out.find("<i>/story/111</i>").expect("first story");
+        let second = out.find("<i>/story/222</i>").expect("second story");
+        let third = out.find("<i>/story/333</i>").expect("third story");
+        assert!(first < second && second < third, "source order: {out}");
     }
 
     #[test]
-    fn preprocess_array_limit_is_enforced() {
-        let stmts = vec![Stmt::Let {
-            var: "items".to_string(),
-            expr: Expr::Array(vec![Expr::Null; PREPROCESS_MAX_ARRAY_ITEMS + 1]),
-        }];
-        let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source).unwrap_err();
-        assert_eq!(
-            err,
-            format!(
-                "preprocess: array size limit exceeded ({PREPROCESS_MAX_ARRAY_ITEMS} items)"
-            )
+    fn extract_all_without_capture_groups_returns_whole_matches() {
+        let out = run_program(
+            "for tag in extract_all(/<b>.+?<\\/b>/)\n\
+             emit \"[${tag}]\"\n\
+             end\n\
+             insert_at_match\n",
+            "<p><b>one</b><b>two</b></p>",
         );
+        assert!(out.contains("[<b>one</b>]"), "{out}");
+        assert!(out.contains("[<b>two</b>]"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_optional_capture_is_null_when_it_did_not_match() {
+        let out = run_program(
+            "let rows = extract_all(/id=\"(\\d+)?-(\\w+)\"/)\n\
+             if rows.is_array && rows.size == 2 && rows[0] == \"7\" && rows[1] == null\n\
+             emit \"optional-capture-valid\"\n\
+             end\n\
+             let compact = rows.compact\n\
+             if compact.size == 1 && compact[0] == \"7\"\n\
+             emit \"compact-valid\"\n\
+             end\n\
+             insert_at_match\n",
+            "<p id=\"7-x\">A</p><p id=\"-y\">B</p>",
+        );
+        assert!(out.contains("optional-capture-valid"), "{out}");
+        assert!(out.contains("compact-valid"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_honours_regex_flags() {
+        let out = run_program(
+            "for card in extract_all(/class=\"([a-z]+)\"/i)\n\
+             emit \"<b>${card}</b>\"\n\
+             end\n\
+             insert_at_match\n",
+            "<div CLASS=\"Card\">A</div><div class=\"card\">B</div>",
+        );
+        assert!(out.contains("<b>Card</b>"), "{out}");
+        assert!(out.contains("<b>card</b>"), "{out}");
+
+        // `s` lets the match span a line break; without it the same pattern
+        // finds nothing.
+        let out = run_program(
+            "let body = extract_all(/<div>(.+?)<\\/div>/s).first\n\
+             emit \"[${body}]\"\n\
+             insert_at_match\n",
+            "<div>\nline1\nline2\n</div>",
+        );
+        assert!(out.contains("line1\nline2"), "{out}");
+        let out = run_program(
+            "let body = extract_all(/<div>(.+?)<\\/div>/).first\n\
+             emit \"[${body}]\"\n\
+             insert_at_match\n",
+            "<div>\nline1\nline2\n</div>",
+        );
+        assert!(out.contains("[]"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_without_matches_is_an_empty_array() {
+        let out = run_program(
+            "let hits = extract_all(/no-such-thing/)\n\
+             if hits.is_array && hits.empty\n\
+             emit \"empty-array\"\n\
+             end\n\
+             insert_at_match\n",
+            "<p>body</p>",
+        );
+        assert!(out.starts_with("empty-array"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_result_can_be_chained() {
+        let out = run_program(
+            "let ids = extract_all(/href=\"([0-9])\"/)\n\
+             let names = ids.map { |id| \"n${id}\" }\n\
+             emit \"${names.join(\",\")}|${ids.size}|${ids.first}|${ids.last}\"\n\
+             insert_at_match\n",
+            "<a href=\"1\">a</a><a href=\"2\">b</a><a href=\"3\">c</a>",
+        );
+        assert!(out.contains("n1,n2,n3|3|1|3"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_works_inside_nested_expressions() {
+        let out = run_program(
+            "for story in extract_all(/story-([0-9])/)\n\
+             let tag = extract_all(/tag-([0-9])/).first\n\
+             emit \"<${story}:${tag}>\"\n\
+             end\n\
+             if extract_all(/story-([0-9])/).size == 2\n\
+             emit \"(two)\"\n\
+             end\n\
+             insert_at_match\n",
+            "<i>story-1</i><b>tag-9</b><i>story-2</i>",
+        );
+        assert!(out.contains("<1:9>"), "{out}");
+        assert!(out.contains("<2:9>"), "{out}");
+        assert!(out.contains("(two)"), "{out}");
+    }
+
+    #[test]
+    fn extract_all_first_match_becomes_the_insert_anchor() {
+        let out = run_program(
+            "let hits = extract_all(/<b>(.*?)<\\/b>/)\n\
+             emit \"[${hits.size}]\"\n\
+             insert_at_match\n",
+            "head<b>one</b><b>two</b>",
+        );
+        assert_eq!(out, "head[2]<b>one</b><b>two</b>");
+    }
+
+    #[test]
+    fn extract_all_without_matches_keeps_the_previous_anchor() {
+        let out = run_program(
+            "let title = extract(/<h1>(.*?)<\\/h1>/)\n\
+             let none = extract_all(/no-such-thing/)\n\
+             emit \"[${title}]\"\n\
+             insert_at_match\n",
+            "head<h1>title</h1>",
+        );
+        assert_eq!(out, "head[title]<h1>title</h1>");
+    }
+
+    #[test]
+    fn extract_all_reads_the_source_after_an_insertion() {
+        let out = run_program(
+            "let hits = extract_all(/<p>(.*?)<\\/p>/)\n\
+             emit \"<i>${hits.first}</i>\"\n\
+             insert_at_match\n\
+             let again = extract_all(/<i>(.*?)<\\/i>/)\n\
+             emit \"<b>${again.first}</b>\"\n\
+             insert_at_match\n",
+            "<p>body</p>",
+        );
+        assert_eq!(out, "<b>body</b><i>body</i><p>body</p>");
+    }
+
+    #[test]
+    fn extract_all_handles_zero_width_matches() {
+        let source = "<p>あ</p>";
+        let out = run_program(
+            "emit extract_all(/(?:)/).size\n\
+             emit \"\"\n\
+             insert_at_match\n",
+            source,
+        );
+        let count: usize = out
+            .lines()
+            .next()
+            .and_then(|count| count.parse().ok())
+            .expect("a finite match count");
+        assert_eq!(count, source.chars().count() + 1, "{out}");
+    }
+
+    #[test]
+    fn extract_all_stops_at_the_step_budget() {
+        let source = "a".repeat(PREPROCESS_STEP_BUDGET + 1);
+        let stmts = crate::downloader::preprocess::parser::parse_preprocess(
+            "let hits = extract_all(/a/)\n\
+             emit \"${hits.size}\"\n",
+        )
+        .unwrap();
+        let mut text = source.clone();
+        let error = run_stmts(&stmts, &mut text, &PreprocessJobs::new(), "")
+            .expect_err("a runaway pattern must not run forever");
+        assert_eq!(error.to_string(), "preprocess: step budget exceeded");
+        assert_eq!(text, source, "a failed run leaves the source alone");
     }
 }

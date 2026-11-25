@@ -1,0 +1,1189 @@
+//! Novel library list service.
+//!
+//! Owns the business logic behind the web UI's novel table: search token
+//! parsing (quoted terms, negation, fielded and OR values), typed filter
+//! construction, paginated query/count, frozen status, site timezone lookup,
+//! and the six-hour new-arrival marker. Rendering (DataTables `draw`,
+//! JSON, HTTP) stays in the web layer.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use chrono::{DateTime, Duration, Utc};
+
+use crate::application::error::ApplicationError;
+use crate::application::events::{FreezeStore, SiteTimezone, SiteTimezoneProvider};
+use crate::db::NovelRecord;
+use crate::platform::repository::{FreezeReadMode, record_is_frozen};
+use crate::platform::{
+    NovelFilter, NovelQuery, NovelRepository, NovelSort, NovelSortKey, SearchField, SearchTerm,
+};
+use crate::platform::clock::Clock;
+
+/// New-arrival marker window: a novel is "new" for six hours after its
+/// new-arrivals date (Ruby `ANNOTATION_COLOR_TIME_LIMIT` semantics).
+pub const NEW_ARRIVALS_TIME_LIMIT_SECS: i64 = 6 * 60 * 60;
+
+/// Default timezone used when a record's site has no configured timezone.
+pub const DEFAULT_SITE_TIMEZONE: &str = "Asia/Tokyo";
+
+/// Sort column of the web table, as a typed enum.
+///
+/// The web layer maps its DataTables column index to this enum; the service
+/// never sees raw column numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibrarySortColumn {
+    Id,
+    LastUpdate,
+    GeneralLastup,
+    LastCheckDate,
+    Title,
+    Author,
+    SiteName,
+    NovelType,
+    GeneralAllNo,
+    Length,
+    AverageLength,
+}
+
+impl LibrarySortColumn {
+    /// Map to the repository's typed sort key.
+    pub fn sort_key(self) -> NovelSortKey {
+        match self {
+            Self::Id => NovelSortKey::Id,
+            Self::LastUpdate => NovelSortKey::LastUpdate,
+            Self::GeneralLastup => NovelSortKey::GeneralLastup,
+            Self::LastCheckDate => NovelSortKey::LastCheckDate,
+            Self::Title => NovelSortKey::Title,
+            Self::Author => NovelSortKey::Author,
+            Self::SiteName => NovelSortKey::SiteName,
+            Self::NovelType => NovelSortKey::NovelType,
+            Self::GeneralAllNo => NovelSortKey::GeneralAllNo,
+            Self::Length => NovelSortKey::Length,
+            Self::AverageLength => NovelSortKey::AverageLength,
+        }
+    }
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibrarySortOrder {
+    Ascending,
+    Descending,
+}
+
+/// Request for a page of the novel library.
+#[derive(Debug, Clone)]
+pub struct LibraryListRequest {
+    /// Free-text search: `filter` and `search[value]` combined as AND terms.
+    /// Quoted phrases, `-`/`^`/`!` negation, `field:value` and `a|b` OR
+    /// values are supported.
+    pub search: Option<String>,
+    /// First row to return (0-based).
+    pub start: usize,
+    /// Maximum rows to return. `None` means "all matching rows".
+    pub length: Option<usize>,
+    /// Sort column.
+    pub sort_column: LibrarySortColumn,
+    /// Sort direction.
+    pub sort_order: LibrarySortOrder,
+    /// 非表示設定。`None` は非表示なし、`Some` は一覧から除外する。
+    pub hidden: Option<crate::hidden::HiddenState>,
+    /// 非表示も表示する (`list --show-hidden` / Web UI のトグル)。
+    pub include_hidden: bool,
+    /// 常に一覧から除外する作品 ID（バーチャル小説のメンバーなど）。
+    pub exclude_ids: Vec<i64>,
+    /// Whether classifications participate in tag search and listing.
+    pub attribute_tags_enabled: bool,
+}
+
+/// One row of the library table: the business fields the web list needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NovelSummary {
+    pub id: i64,
+    pub title: String,
+    pub author: String,
+    pub sitename: String,
+    pub novel_type: u8,
+    pub end: bool,
+    pub last_update: DateTime<Utc>,
+    pub general_lastup: Option<DateTime<Utc>>,
+    pub last_check_date: Option<DateTime<Utc>>,
+    pub new_arrivals_date: Option<DateTime<Utc>>,
+    pub tags: Vec<String>,
+    /// True within the six-hour window after `new_arrivals_date`.
+    pub new_arrivals: bool,
+    /// True when the record is in the freeze inventory or tagged `frozen`.
+    pub frozen: bool,
+    pub suspend: bool,
+    pub length: Option<i64>,
+    pub toc_url: String,
+    /// N-code (なろう系) or the site's numeric work id, when the record has one.
+    pub ncode: Option<String>,
+    /// Link to show for the novel: the page it was registered from, falling
+    /// back to `toc_url` (Pixiv keeps an API endpoint in `toc_url`).
+    pub display_url: String,
+    pub general_all_no: Option<i64>,
+}
+
+/// A page of the library: the filtered rows plus the total counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryPage {
+    /// Total records in the library (unfiltered).
+    pub records_total: u64,
+    /// Records matching the search filter.
+    pub records_filtered: u64,
+    /// The requested page of rows.
+    pub data: Vec<NovelSummary>,
+}
+
+/// Concrete library service.
+///
+/// All dependencies are injected platform ports, so the service is
+/// testable with the platform mocks and usable from both the native web
+/// layer and a future Worker backend.
+pub struct LibraryService {
+    novels: Arc<dyn NovelRepository>,
+    clock: Arc<dyn Clock>,
+    freeze_store: Arc<dyn FreezeStore>,
+    timezones: Arc<dyn SiteTimezoneProvider>,
+}
+
+impl LibraryService {
+    /// Create the service with injected dependencies.
+    pub fn new(
+        novels: Arc<dyn NovelRepository>,
+        clock: Arc<dyn Clock>,
+        freeze_store: Arc<dyn FreezeStore>,
+        timezones: Arc<dyn SiteTimezoneProvider>,
+    ) -> Self {
+        Self {
+            novels,
+            clock,
+            freeze_store,
+            timezones,
+        }
+    }
+
+    pub async fn get(
+        &self,
+        id: crate::platform::NovelId,
+    ) -> Result<Option<NovelRecord>, ApplicationError> {
+        self.novels.get_current(id).await.map_err(ApplicationError::platform)
+    }
+    pub async fn find_by_toc_url(
+        &self,
+        url: &str,
+    ) -> Result<Option<NovelRecord>, ApplicationError> {
+        self.novels
+            .find_by_toc_url_current(url)
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
+    pub async fn find_by_ncode(
+        &self,
+        ncode: &str,
+    ) -> Result<Option<NovelRecord>, ApplicationError> {
+        self.novels
+            .find_by_ncode(ncode)
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
+    pub async fn find_by_title(
+        &self,
+        title: &str,
+    ) -> Result<Option<NovelRecord>, ApplicationError> {
+        self.novels
+            .find_by_title(title)
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
+    /// Resolve a user-facing target (alias / id / URL / ncode / title) through
+    /// the shared ordered plan ([`crate::application::target_lookup`]).
+    ///
+    /// The CLI uses the synchronous mirror (`resolve_target_record_sync`);
+    /// both adapters consume the same [`TargetLookupPlan`], so the update /
+    /// convert / read modes cannot drift apart.
+    ///
+    /// [`TargetLookupPlan`]: crate::application::target_lookup::TargetLookupPlan
+    pub async fn resolve_target(
+        &self,
+        plan: crate::application::target_lookup::TargetLookupPlan,
+        aliases: &HashMap<String, String>,
+        urls: crate::application::target_lookup::UrlSource<'_>,
+        target: &str,
+    ) -> Result<Option<NovelRecord>, ApplicationError> {
+        crate::application::target_lookup::resolve_target_record(
+            plan,
+            aliases,
+            urls,
+            target,
+            &*self.novels,
+        )
+        .await
+        .map_err(ApplicationError::platform)
+    }
+
+
+    pub async fn count(&self) -> Result<usize, ApplicationError> {
+        self.novels
+            .count(&NovelFilter::all())
+            .await
+            .map(|count| count as usize)
+            .map_err(ApplicationError::platform)
+    }
+    pub async fn frozen_ids(&self) -> Result<HashSet<i64>, ApplicationError> {
+        self.freeze_store
+            .frozen_ids()
+            .await
+            .map_err(ApplicationError::platform)
+    }
+    pub async fn records(&self) -> Result<Vec<NovelRecord>, ApplicationError> {
+        self.novels
+            .query_current(&NovelQuery::page(
+                NovelFilter::all(),
+                NovelSort::by(crate::platform::NovelSortKey::Id),
+                0,
+                usize::MAX,
+            ))
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
+    /// Every id matching `filter`, ascending, as an ID projection.
+    ///
+    /// Handlers that only need ids (tag-target expansion, the
+    /// `/api/novels/all_ids` endpoint) must not decode whole records:
+    /// [`NovelRepository::scan_ids`] selects `id` alone, and the D1 backend
+    /// already paginates/filters at the SQL level. A `usize::MAX` limit is
+    /// the same unbounded form [`Self::records`] uses; callers that need a
+    /// bound should call the repository scan directly.
+    pub async fn all_ids(
+        &self,
+        filter: &NovelFilter,
+    ) -> Result<Vec<crate::platform::NovelId>, ApplicationError> {
+        self.novels
+            .scan_ids(filter, None, usize::MAX)
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
+    /// Records for a bounded id list, ascending by id; unknown ids are
+    /// simply absent.
+    ///
+    /// Batch handlers that reorder or verify an explicit selection
+    /// (`sort_ids_from_records`, existence checks) only look at those ids;
+    /// this is the id-filtered form of [`Self::records`] — one filtered
+    /// query instead of a whole-library scan.
+    pub async fn records_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<NovelRecord>, ApplicationError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = NovelFilter {
+            ids: Some(ids.iter().copied().map(crate::platform::NovelId).collect()),
+            ..NovelFilter::default()
+        };
+        self.novels
+            .query_current(&NovelQuery::page(
+                filter,
+                NovelSort::by(crate::platform::NovelSortKey::Id),
+                0,
+                ids.len(),
+            ))
+            .await
+            .map_err(ApplicationError::platform)
+    }
+
+
+    /// Build the same typed filter for leased readers and atomic metadata snapshots.
+    fn prepare_list(
+        &self,
+        request: &LibraryListRequest,
+        frozen_ids: &HashSet<i64>,
+    ) -> (NovelFilter, NovelSort) {
+        let mut filter = self.build_filter_with_ids(request.search.as_deref(), frozen_ids);
+        filter.attribute_tags_enabled = request.attribute_tags_enabled;
+        if !request.include_hidden
+            && let Some(hidden) = &request.hidden
+        {
+            hidden.apply_to_filter(&mut filter);
+        }
+        filter.exclude_ids.extend(request.exclude_ids.iter().copied());
+        let sort = NovelSort {
+            key: request.sort_column.sort_key(),
+            reverse: request.sort_order == LibrarySortOrder::Descending,
+        };
+        (filter, sort)
+    }
+
+    /// Prefer an atomic metadata-only page; otherwise retain the caller's leases.
+    pub async fn list(
+        &self,
+        scope: &mut crate::application::novel_access::NovelReadScope,
+        request: &LibraryListRequest,
+    ) -> Result<LibraryPage, ApplicationError> {
+        let (filter, sort) = self.prepare_list(request, &HashSet::new());
+        let mut query = NovelQuery::page(
+            filter, sort, request.start, request.length.unwrap_or(usize::MAX),
+        );
+        if let Some(snapshot) = self.novels.metadata_page_snapshot(&query)
+            .await.map_err(ApplicationError::platform)?
+        {
+            let data = self.summarize_records_with_frozen(
+                snapshot.records, request.attribute_tags_enabled, &snapshot.frozen_ids,
+            ).await;
+            return Ok(LibraryPage {
+                records_total: snapshot.records_total,
+                records_filtered: snapshot.records_filtered,
+                data,
+            });
+        }
+
+        let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
+        query.filter.frozen_ids = Some(frozen_ids.clone());
+        let (records_total, records_filtered, records) = self
+            .list_records(query.filter, query.sort, request.start, request.length)
+            .await?;
+        let admitted = crate::application::novel_content::NovelContentService::read_discovered_records_from(self.novels.as_ref(), scope, &records).await?;
+        let mut current = Vec::with_capacity(records.len());
+        for (original, record) in records.into_iter().zip(admitted) {
+            let record = record.ok_or_else(|| ApplicationError::platform(crate::error::NarouError::Platform("novel_busy: library row disappeared during admission".into())))?;
+            if record != original { return Err(ApplicationError::platform(crate::error::NarouError::Platform("novel_busy: library selection changed during admission".into()))); }
+            current.push(record);
+        }
+
+        let data = self.summarize_records_with_frozen(current, request.attribute_tags_enabled, &frozen_ids).await;
+
+        Ok(LibraryPage {
+            records_total,
+            records_filtered,
+            data,
+        })
+    }
+
+    /// Project rows from one authoritative metadata snapshot. The reader must
+    /// read the page, counts and admission state atomically and reject a closed
+    /// namespace. No file or mutable reader lease is used after the snapshot.
+    #[cfg(feature = "worker-runtime")]
+    pub async fn list_metadata_snapshot<F>(
+        &self,
+        request: &LibraryListRequest,
+        read: impl FnOnce(NovelQuery) -> F,
+    ) -> Result<LibraryPage, ApplicationError>
+    where
+        F: std::future::Future<Output = Result<crate::platform::repository::NovelMetadataPage, ApplicationError>>,
+    {
+        let (filter, sort) = self.prepare_list(request, &HashSet::new());
+        let query = NovelQuery::page(filter, sort, request.start, request.length.unwrap_or(usize::MAX));
+        let snapshot = read(query).await?;
+        let data = self.summarize_records_with_frozen(
+            snapshot.records, request.attribute_tags_enabled, &snapshot.frozen_ids,
+        ).await;
+        Ok(LibraryPage {
+            records_total: snapshot.records_total,
+            records_filtered: snapshot.records_filtered,
+            data,
+        })
+    }
+
+    /// Project already-admitted authoritative records with the same native and
+    /// Worker timezone, freeze and attribute rules as the ordinary list.
+    pub async fn summarize_records(
+        &self,
+        records: Vec<NovelRecord>,
+        attribute_tags_enabled: bool,
+    ) -> Result<Vec<NovelSummary>, ApplicationError> {
+        let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
+        Ok(self.summarize_records_with_frozen(records, attribute_tags_enabled, &frozen_ids).await)
+    }
+
+    async fn summarize_records_with_frozen(
+        &self, records: Vec<NovelRecord>, attribute_tags_enabled: bool, frozen_ids: &HashSet<i64>,
+    ) -> Vec<NovelSummary> {
+        let now = self.clock.now_utc();
+        let default_timezone = site_timezone(Some(DEFAULT_SITE_TIMEZONE));
+        let mut tz_cache: HashMap<String, SiteTimezone> = HashMap::new();
+        let mut data = Vec::with_capacity(records.len());
+        for record in records {
+            let timezone = if let Some(domain) = record_domain(&record) {
+                if let Some(&cached) = tz_cache.get(domain) {
+                    cached
+                } else {
+                    let resolved = self.domain_timezone(domain, default_timezone).await;
+                    tz_cache.insert(domain.to_string(), resolved);
+                    resolved
+                }
+            } else {
+                default_timezone
+            };
+            let is_new = is_new_arrivals_marker(record.new_arrivals_date, record.last_update, now, timezone);
+            let is_frozen = record_is_frozen(&record, Some(frozen_ids), FreezeReadMode::InventoryOrTag);
+            let display_url = record.display_url().to_string();
+            let attribute_tag = attribute_tags_enabled.then(|| record.attribute_tag().map(str::to_owned)).flatten();
+            let mut tags: Vec<String> = record.tags.into_iter().filter(|tag| !crate::virtual_novel::is_internal_tag(tag)).collect();
+            if let Some(tag) = attribute_tag { tags.push(tag); }
+            data.push(NovelSummary {
+                id: record.id, title: record.title, author: record.author, sitename: record.sitename,
+                novel_type: record.novel_type, end: record.end, last_update: record.last_update,
+                general_lastup: record.general_lastup, last_check_date: record.last_check_date,
+                new_arrivals_date: record.new_arrivals_date, tags, new_arrivals: is_new, frozen: is_frozen,
+                suspend: record.suspend, length: record.length, toc_url: record.toc_url, ncode: record.ncode,
+                display_url, general_all_no: record.general_all_no,
+            });
+        }
+        data
+    }
+
+    /// Fetch one page of records with a caller-built filter.
+    ///
+    /// The external API assembles its own filter (typed conditions, virtual
+    /// novel grouping, hidden state) and needs the raw records rather than
+    /// the web summary rows, so it uses this entry point instead of
+    /// [`Self::list`]. The counts follow the same contract: the unfiltered
+    /// total and the filtered total.
+    pub async fn list_records(
+        &self,
+        filter: NovelFilter,
+        sort: NovelSort,
+        start: usize,
+        length: Option<usize>,
+    ) -> Result<(u64, u64, Vec<NovelRecord>), ApplicationError> {
+        let unrestricted = filter.is_unrestricted();
+        let query = NovelQuery::page(filter.clone(), sort, start, length.unwrap_or(usize::MAX));
+        let records = self.novels.query_current(&query);
+        if start == 0 && length.is_none() {
+            if unrestricted {
+                let records = records.await.map_err(ApplicationError::platform)?;
+                let count = records.len() as u64;
+                return Ok((count, count, records));
+            }
+            let (total, records) = futures::future::try_join(
+                self.novels.count(&NovelFilter::all()), records,
+            ).await.map_err(ApplicationError::platform)?;
+            return Ok((total, records.len() as u64, records));
+        }
+        if unrestricted {
+            let (count, records) = futures::future::try_join(
+                self.novels.count(&NovelFilter::all()), records,
+            ).await.map_err(ApplicationError::platform)?;
+            return Ok((count, count, records));
+        }
+        let (total, filtered, records) = futures::future::try_join3(
+            self.novels.count(&NovelFilter::all()), self.novels.count(&filter), records,
+        ).await.map_err(ApplicationError::platform)?;
+        Ok((total, filtered, records))
+    }
+
+    /// Build the typed filter for a search string.
+    ///
+    /// The search string is split into quoted-aware terms; each term becomes
+    /// a [`SearchTerm`] (fielded, OR values, optional negation) and all terms
+    /// are AND-combined, matching the web UI's `filter`/`search[value]`
+    /// semantics. The frozen id set is attached so `Status`/`Any` terms can
+    /// match the `凍結` status text.
+    pub async fn build_filter(
+        &self,
+        search: Option<&str>,
+    ) -> Result<NovelFilter, ApplicationError> {
+        let frozen_ids = self.freeze_store.frozen_ids().await.map_err(ApplicationError::platform)?;
+        Ok(self.build_filter_with_ids(search, &frozen_ids))
+    }
+
+    /// Build the typed filter from a search string and a caller-provided
+    /// frozen id set (avoids a second freeze-store round trip when the
+    /// caller already loaded the ids).
+    pub fn build_filter_with_ids(
+        &self,
+        search: Option<&str>,
+        frozen_ids: &HashSet<i64>,
+    ) -> NovelFilter {
+        let terms = collect_search_tokens(search)
+            .into_iter()
+            .map(|token| {
+                let field = match token.field.as_deref() {
+                    Some("tag") => SearchField::Tag,
+                    Some("author") => SearchField::Author,
+                    Some("site") | Some("sitename") => SearchField::Site,
+                    Some("title") => SearchField::Title,
+                    Some("status") => SearchField::Status,
+                    _ => SearchField::Any,
+                };
+                SearchTerm::new(field, token.negated, token.values)
+            })
+            .collect::<Vec<_>>();
+        NovelFilter {
+            terms,
+            frozen_ids: Some(frozen_ids.clone()),
+            ..Default::default()
+        }
+    }
+
+    async fn domain_timezone(
+        &self,
+        domain: &str,
+        default_timezone: SiteTimezone,
+    ) -> SiteTimezone {
+        match self.timezones.timezone_for_domain(domain).await {
+            Ok(Some(timezone)) => timezone,
+            _ => default_timezone,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search token parsing (moved from the web layer).
+// ---------------------------------------------------------------------------
+
+/// One parsed search token: a field, OR-combined values, optional negation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchToken {
+    negated: bool,
+    field: Option<String>,
+    values: Vec<String>,
+}
+
+/// Split a search string into quoted-aware terms.
+fn split_search_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+
+    for ch in query.chars() {
+        if ch == '"' {
+            quoted = !quoted;
+            current.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() && !quoted {
+            if !current.trim().is_empty() {
+                terms.push(current.trim().to_string());
+            }
+            current.clear();
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if !current.trim().is_empty() {
+        terms.push(current.trim().to_string());
+    }
+
+    terms
+}
+
+/// Strip surrounding quotes from a value.
+fn strip_search_quotes(value: &str) -> &str {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+/// Split a value on `|` (OR), honoring quotes, lowercasing each part.
+fn split_search_values(value: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+
+    for ch in value.chars() {
+        if ch == '"' {
+            quoted = !quoted;
+            current.push(ch);
+            continue;
+        }
+        if ch == '|' && !quoted {
+            let trimmed = strip_search_quotes(current.trim()).trim().to_lowercase();
+            if !trimmed.is_empty() {
+                values.push(trimmed);
+            }
+            current.clear();
+            continue;
+        }
+        current.push(ch);
+    }
+
+    let trimmed = strip_search_quotes(current.trim()).trim().to_lowercase();
+    if !trimmed.is_empty() {
+        values.push(trimmed);
+    }
+
+    values
+}
+
+/// Parse one raw term into a token: `-`/`^`/`!` negation, `field:value`.
+fn parse_search_token(raw_term: &str) -> SearchToken {
+    let term = raw_term.trim();
+    let negated = matches!(term.chars().next(), Some('-' | '^' | '!'));
+    let body = if negated { &term[1..] } else { term };
+    // A pasted URL is a plain search value, not a "https:" field token.
+    let (field, value) = if body.starts_with("https://") || body.starts_with("http://") {
+        (None, body)
+    } else if let Some(colon) = body.find(':') {
+        let field = body[..colon].trim();
+        if field.is_empty() {
+            (None, body)
+        } else {
+            (Some(field.to_lowercase()), body[colon + 1..].trim())
+        }
+    } else {
+        (None, body)
+    };
+
+    SearchToken {
+        negated,
+        field,
+        values: split_search_values(value),
+    }
+}
+
+/// Parse a search string into tokens, dropping empty ones.
+fn collect_search_tokens(search: Option<&str>) -> Vec<SearchToken> {
+    search
+        .into_iter()
+        .flat_map(split_search_terms)
+        .map(|term| parse_search_token(&term))
+        .filter(|token| !token.values.is_empty())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Frozen status, timezone lookup, new-arrival marker.
+// ---------------------------------------------------------------------------
+
+/// The site domain of a record: the explicit `domain` field, else the
+/// `toc_url` host.
+fn record_domain(record: &NovelRecord) -> Option<&str> {
+    record
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|domain| !domain.is_empty())
+        .or_else(|| {
+            let domain = domain_of(&record.toc_url).trim();
+            (!domain.is_empty()).then_some(domain)
+        })
+}
+
+/// Extract the host from a URL (https:// or http:// prefix, up to the first
+/// `/`). Mirrors `downloader::http_policy::domain_of` without depending on
+/// the downloader module.
+fn domain_of(url: &str) -> &str {
+    let s = url.strip_prefix("https://").unwrap_or(url);
+    let s = s.strip_prefix("http://").unwrap_or(s);
+    s.split('/').next().unwrap_or(s)
+}
+
+/// Parse a timezone name into a [`SiteTimezone`], with the same aliases the
+/// downloader accepts (`JST`, `UTC`, `GMT`, `Z`, `+09:00`, ...).
+fn site_timezone(timezone: Option<&str>) -> SiteTimezone {
+    let configured = timezone
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_SITE_TIMEZONE);
+    parse_site_timezone(configured).unwrap_or_else(default_site_timezone)
+}
+
+fn default_site_timezone() -> SiteTimezone {
+    SiteTimezone::Named(chrono_tz::Asia::Tokyo)
+}
+
+fn parse_site_timezone(value: &str) -> Option<SiteTimezone> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let upper = value.to_ascii_uppercase();
+    let timezone_name = match upper.as_str() {
+        "JST" | "ASIA/TOKYO/JST" => "Asia/Tokyo",
+        "UTC" | "GMT" | "Z" => "UTC",
+        _ => value,
+    };
+    if let Ok(tz) = timezone_name.parse::<chrono_tz::Tz>() {
+        return Some(SiteTimezone::Named(tz));
+    }
+
+    let (sign, rest) = match value.as_bytes().first().copied() {
+        Some(b'+') => (1, &value[1..]),
+        Some(b'-') => (-1, &value[1..]),
+        _ => return None,
+    };
+    let compact = rest.replace(':', "");
+    let (hours, minutes) = match compact.len() {
+        2 => (compact.parse::<i32>().ok()?, 0),
+        4 => (
+            compact[..2].parse::<i32>().ok()?,
+            compact[2..].parse::<i32>().ok()?,
+        ),
+        _ => return None,
+    };
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    chrono::FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60)).map(SiteTimezone::Fixed)
+}
+
+/// True when the record is a new arrival: `new_arrivals_date` is not older
+/// than `last_update` and the six-hour window (in the site's local time)
+/// has not expired.
+fn is_new_arrivals_marker(
+    new_arrivals_date: Option<DateTime<Utc>>,
+    last_update: DateTime<Utc>,
+    now: DateTime<Utc>,
+    timezone: SiteTimezone,
+) -> bool {
+    new_arrivals_date.is_some_and(|nad| {
+        let limit = Duration::seconds(NEW_ARRIVALS_TIME_LIMIT_SECS);
+        let nad = timezone.local_naive_datetime(nad);
+        let last_update = timezone.local_naive_datetime(last_update);
+        let now = timezone.local_naive_datetime(now);
+        nad >= last_update && (nad + limit) >= now
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::events::{EmptySiteTimezoneProvider, SystemFreezeStore};
+    use crate::platform::mocks::MemoryNovelRepository;
+    use crate::platform::clock::Clock;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// Test-only controllable clock.
+    #[derive(Debug, Default)]
+    struct FakeClock(AtomicI64);
+
+    impl Clock for FakeClock {
+        fn now_utc(&self) -> DateTime<Utc> {
+            DateTime::from_timestamp(self.0.load(Ordering::SeqCst), 0).unwrap()
+        }
+        fn advance(&self, duration: std::time::Duration) {
+            self.0
+                .fetch_add(duration.as_secs() as i64, Ordering::SeqCst);
+        }
+    }
+
+    fn sample_record(id: i64) -> NovelRecord {
+        NovelRecord {
+            id,
+            author: "author".into(),
+            title: "title".into(),
+            file_title: "title".into(),
+            toc_url: format!("https://example.com/novel/{id}"),
+            sitename: "example".into(),
+            novel_type: 1,
+            end: false,
+            last_update: chrono::Utc::now(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+            requires_login: false,
+            login_session: None,
+            extra_fields: Default::default(),
+        }
+    }
+
+    fn service(
+        repo: Arc<dyn NovelRepository>,
+        clock: Arc<dyn Clock>,
+    ) -> LibraryService {
+        LibraryService::new(
+            repo,
+            clock,
+            Arc::new(SystemFreezeStore),
+            Arc::new(EmptySiteTimezoneProvider),
+        )
+    }
+
+    fn list(service: &LibraryService, request: &LibraryListRequest) -> Result<LibraryPage, ApplicationError> {
+        let objects: Arc<dyn crate::platform::ObjectStore> = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+        let mut scope = crate::application::novel_access::NovelReadScope::new(&objects, "library-test");
+        futures::executor::block_on(async {
+            let result = service.list(&mut scope, request).await;
+            let released = scope.release_all().await.map_err(ApplicationError::platform);
+            match result { Ok(value) => { released?; Ok(value) }, Err(error) => Err(error) }
+        })
+    }
+
+    fn request(search: Option<&str>, start: usize, length: Option<usize>) -> LibraryListRequest {
+        LibraryListRequest {
+            search: search.map(str::to_string),
+            start,
+            length,
+            sort_column: LibrarySortColumn::Id,
+            sort_order: LibrarySortOrder::Ascending,
+            hidden: None,
+            include_hidden: true,
+            exclude_ids: Vec::new(),
+            attribute_tags_enabled: false,
+        }
+    }
+
+    #[test]
+    fn search_token_parsing_supports_quotes_negation_fields_and_or() {
+        let tokens = collect_search_tokens(Some("title:\"テスト 小説\" -tag:coffee|mystery 完結"));
+        assert_eq!(tokens.len(), 3);
+
+        let title = &tokens[0];
+        assert!(!title.negated);
+        assert_eq!(title.field.as_deref(), Some("title"));
+        assert_eq!(title.values, vec!["テスト 小説".to_string()]);
+
+        let tag = &tokens[1];
+        assert!(tag.negated);
+        assert_eq!(tag.field.as_deref(), Some("tag"));
+        assert_eq!(tag.values, vec!["coffee".to_string(), "mystery".to_string()]);
+
+        let plain = &tokens[2];
+        assert!(!plain.negated);
+        assert_eq!(plain.field, None);
+        assert_eq!(plain.values, vec!["完結".to_string()]);
+    }
+
+    #[test]
+    fn search_token_parsing_preserves_pasted_urls() {
+        let tokens = collect_search_tokens(Some(
+            "https://ncode.syosetu.com/n1980en/ 16818093084718034215",
+        ));
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].field, None);
+        assert_eq!(
+            tokens[0].values,
+            vec!["https://ncode.syosetu.com/n1980en/"]
+        );
+        assert_eq!(tokens[1].field, None);
+        assert_eq!(tokens[1].values, vec!["16818093084718034215"]);
+    }
+
+    #[test]
+    fn list_finds_novels_by_url_ncode_and_numeric_id() {
+        let mut record = sample_record(42);
+        record.toc_url = "https://ncode.syosetu.com/n1980en/".into();
+        record.ncode = Some("n1980en".into());
+        let mut kakuyomu = sample_record(43);
+        kakuyomu.toc_url =
+            "https://kakuyomu.jp/works/16818093084718034215".into();
+        let service = service(
+            Arc::new(MemoryNovelRepository::from_records(vec![record, kakuyomu])),
+            Arc::new(FakeClock::default()),
+        );
+        for query in ["https://ncode.syosetu.com/n1980en/", "n1980en", "42"] {
+            let page = list(&service, &request(Some(query), 0, None)).unwrap();
+            assert_eq!(page.records_filtered, 1, "query={query}");
+            assert_eq!(page.data[0].id, 42, "query={query}");
+        }
+        let page = list(&service, &request(
+            Some("16818093084718034215"),
+            0,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(page.records_filtered, 1);
+        assert_eq!(page.data[0].id, 43);
+    }
+
+    #[test]
+    fn search_token_parsing_drops_empty_values() {
+        let tokens = collect_search_tokens(Some("tag:  -title:"));
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn build_filter_maps_fields_to_typed_search_terms() {
+        let repo = Arc::new(MemoryNovelRepository::new());
+        let service = service(repo, Arc::new(FakeClock::default()));
+        let filter = futures::executor::block_on(service.build_filter(Some(
+            "title:foo -site:bar|baz status:凍結",
+        )))
+        .unwrap();
+
+        assert_eq!(filter.terms.len(), 3);
+        assert_eq!(filter.terms[0].field, SearchField::Title);
+        assert_eq!(filter.terms[0].values, vec!["foo".to_string()]);
+        assert!(!filter.terms[0].negated);
+        assert_eq!(filter.terms[1].field, SearchField::Site);
+        assert_eq!(filter.terms[1].values, vec!["bar".to_string(), "baz".to_string()]);
+        assert!(filter.terms[1].negated);
+        assert_eq!(filter.terms[2].field, SearchField::Status);
+        assert_eq!(filter.terms[2].values, vec!["凍結".to_string()]);
+        assert!(filter.frozen_ids.is_some());
+    }
+
+    #[test]
+    fn list_paginates_and_counts() {
+        let mut records = Vec::new();
+        for id in 1..=5 {
+            let mut record = sample_record(id);
+            record.title = format!("novel {id}");
+            records.push(record);
+        }
+        let repo = Arc::new(MemoryNovelRepository::from_records(records));
+        let service = service(repo, Arc::new(FakeClock::default()));
+
+        for (start, length, expected) in [
+            (1, Some(2), vec![2, 3]), (0, None, vec![1, 2, 3, 4, 5]),
+            (1, None, vec![2, 3, 4, 5]), (0, Some(0), vec![]), (usize::MAX, None, vec![]),
+        ] {
+            let page = list(&service, &request(None, start, length)).unwrap();
+            assert_eq!(page.records_total, 5);
+            assert_eq!(page.records_filtered, 5);
+            assert_eq!(page.data.iter().map(|record| record.id).collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
+    fn list_record_totals_do_not_ignore_selectors_or_hidden_members() {
+        let service = service(
+            Arc::new(MemoryNovelRepository::from_records((1..=5).map(sample_record).collect())),
+            Arc::new(FakeClock::default()),
+        );
+        for (filter, expected) in [
+            (NovelFilter { ids: Some(Vec::new()), ..Default::default() }, vec![]),
+            (NovelFilter { exclude_ids: vec![1, 3], ..Default::default() }, vec![2, 4, 5]),
+            (NovelFilter { exclude_authors: vec!["author".into()], ..Default::default() }, vec![]),
+            (NovelFilter { keyword: Some("missing".into()), ..Default::default() }, vec![]),
+        ] {
+            for length in [None, Some(10), Some(0)] {
+                let (total, filtered, records) = futures::executor::block_on(service.list_records(
+                    filter.clone(), NovelSort::default(), 0, length,
+                )).unwrap();
+                assert_eq!(total, 5);
+                assert_eq!(filtered, expected.len() as u64);
+                let ids: Vec<_> = records.iter().map(|record| record.id).collect();
+                if length == Some(0) { assert!(ids.is_empty()); } else { assert_eq!(ids, expected); }
+            }
+        }
+    }
+
+    #[test]
+    fn records_by_ids_fetches_only_the_selection_in_id_order() {
+        let mut records = Vec::new();
+        for id in 1..=5 {
+            let mut record = sample_record(id);
+            record.title = format!("novel {id}");
+            records.push(record);
+        }
+        let repo = Arc::new(MemoryNovelRepository::from_records(records));
+        let service = service(repo, Arc::new(FakeClock::default()));
+
+        // Batch handlers pass the raw selection: unsorted, possibly repeated
+        // ids and unknown ids must not change the result — the projection is
+        // exactly the selected records, ascending by id.
+        let selected = futures::executor::block_on(service.records_by_ids(&[4, 2, 2, 99])).unwrap();
+        let ids: Vec<i64> = selected.iter().map(|record| record.id).collect();
+        assert_eq!(ids, vec![2, 4]);
+        assert!(
+            futures::executor::block_on(service.records_by_ids(&[]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn all_ids_projects_every_matching_id_without_records() {
+        let mut records = (1..=4).map(sample_record).collect::<Vec<_>>();
+        records[3].tags = vec!["frozen".into()];
+        let repo = Arc::new(MemoryNovelRepository::from_records(records));
+        let service = service(repo, Arc::new(FakeClock::default()));
+
+        let all: std::collections::HashSet<i64> =
+            futures::executor::block_on(service.all_ids(&NovelFilter::all()))
+                .unwrap()
+                .into_iter()
+                .map(|id| id.0)
+                .collect();
+        let expected: std::collections::HashSet<i64> = (1..=4).collect();
+        assert_eq!(all, expected);
+
+        // The exact-match tag filter backs the frozen-tag fallback; it must
+        // return ids only.
+        let frozen = futures::executor::block_on(service.all_ids(&NovelFilter {
+            tag: Some("frozen".to_string()),
+            ..NovelFilter::default()
+        }))
+        .unwrap();
+        assert_eq!(frozen.iter().map(|id| id.0).collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn list_filters_by_search_terms() {
+        let mut records = Vec::new();
+        for id in 1..=3 {
+            let mut record = sample_record(id);
+            record.title = format!("novel {id}");
+            records.push(record);
+        }
+        let repo = Arc::new(MemoryNovelRepository::from_records(records));
+        let service = service(repo, Arc::new(FakeClock::default()));
+
+        let page = list(&service, &request(Some("novel 2"), 0, None))
+            .unwrap();
+        assert_eq!(page.records_total, 3);
+        assert_eq!(page.records_filtered, 1);
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].id, 2);
+    }
+
+    #[test]
+    fn list_marks_frozen_records() {
+        let mut record = sample_record(1);
+        record.tags = vec!["frozen".into()];
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
+        let service = service(repo, Arc::new(FakeClock::default()));
+
+        let page = list(&service, &request(None, 0, None)).unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert!(page.data[0].frozen);
+    }
+
+    #[test]
+    fn new_arrivals_marker_uses_six_hour_window() {
+        let last_update = chrono::Utc::now();
+        let timezone = site_timezone(Some("Asia/Tokyo"));
+
+        assert!(is_new_arrivals_marker(
+            Some(last_update),
+            last_update,
+            last_update + Duration::hours(5),
+            timezone
+        ));
+        assert!(is_new_arrivals_marker(
+            Some(last_update),
+            last_update,
+            last_update + Duration::hours(6),
+            timezone
+        ));
+        assert!(!is_new_arrivals_marker(
+            Some(last_update),
+            last_update,
+            last_update + Duration::hours(7),
+            timezone
+        ));
+    }
+
+    #[test]
+    fn new_arrivals_marker_requires_date_not_older_than_last_update() {
+        let last_update = chrono::Utc::now();
+        let earlier = last_update - Duration::minutes(1);
+        let now = last_update + Duration::minutes(30);
+        assert!(!is_new_arrivals_marker(
+            Some(earlier),
+            last_update,
+            now,
+            site_timezone(Some("Asia/Tokyo"))
+        ));
+    }
+
+    #[test]
+    fn new_arrivals_marker_uses_site_timezone_for_local_order() {
+        let last_update = chrono::DateTime::parse_from_rfc3339("2024-11-03T05:50:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let new_arrivals = chrono::DateTime::parse_from_rfc3339("2024-11-03T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let now = new_arrivals + Duration::minutes(30);
+
+        assert!(is_new_arrivals_marker(
+            Some(new_arrivals),
+            last_update,
+            now,
+            site_timezone(Some("UTC"))
+        ));
+        assert!(!is_new_arrivals_marker(
+            Some(new_arrivals),
+            last_update,
+            now,
+            site_timezone(Some("America/New_York"))
+        ));
+    }
+
+    #[test]
+    fn list_marks_new_arrivals_within_window() {
+        let now = chrono::Utc::now();
+        let mut record = sample_record(1);
+        record.last_update = now - Duration::hours(1);
+        record.new_arrivals_date = Some(now - Duration::hours(1));
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
+        let clock = Arc::new(FakeClock(AtomicI64::new(now.timestamp())));
+        let service = service(repo, clock);
+
+        let page = list(&service, &request(None, 0, None)).unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert!(page.data[0].new_arrivals);
+    }
+
+    #[test]
+    fn list_clears_new_arrivals_after_six_hours() {
+        let now = chrono::Utc::now();
+        let mut record = sample_record(1);
+        record.last_update = now - Duration::hours(7);
+        record.new_arrivals_date = Some(now - Duration::hours(7));
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
+        let clock = Arc::new(FakeClock(AtomicI64::new(now.timestamp())));
+        let service = service(repo, clock);
+
+        let page = list(&service, &request(None, 0, None)).unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert!(!page.data[0].new_arrivals);
+    }
+
+    #[test]
+    fn record_domain_falls_back_to_toc_url_host() {
+        let mut record = sample_record(1);
+        record.domain = None;
+        record.toc_url = "https://ncode.syosetu.com/n1234ab/".into();
+        assert_eq!(record_domain(&record), Some("ncode.syosetu.com"));
+
+        record.domain = Some("kakuyomu.jp".into());
+        assert_eq!(record_domain(&record), Some("kakuyomu.jp"));
+    }
+
+    #[test]
+    fn site_timezone_parses_aliases_and_fixed_offsets() {
+        assert_eq!(
+            site_timezone(Some("JST")),
+            SiteTimezone::Named(chrono_tz::Asia::Tokyo)
+        );
+        assert_eq!(
+            site_timezone(Some("UTC")),
+            SiteTimezone::Named(chrono_tz::UTC)
+        );
+        assert_eq!(
+            site_timezone(Some("+09:00")),
+            SiteTimezone::Fixed(chrono::FixedOffset::east_opt(9 * 3600).unwrap())
+        );
+        assert_eq!(
+            site_timezone(Some("-05:00")),
+            SiteTimezone::Fixed(chrono::FixedOffset::east_opt(-5 * 3600).unwrap())
+        );
+        // Unknown names fall back to the default (Asia/Tokyo).
+        assert_eq!(
+            site_timezone(Some("Not/AZone")),
+            SiteTimezone::Named(chrono_tz::Asia::Tokyo)
+        );
+    }
+}

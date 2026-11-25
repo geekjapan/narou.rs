@@ -158,12 +158,15 @@ pub fn slim_subtitle(text: &str) -> String {
     delete_ruby_tag(text).replace('\n', "")
 }
 
-fn restore_entities(text: &str) -> String {
+/// narou.rb の `Helper.restore_entity` と同じ順序・同じ表で実体を復号する。
+/// TOC キャプチャの復号にも使うため `pub(crate)`。`decode_html_text` は
+/// 順序と集合が異なる (汎用デコーダ) ので、互換性が要る経路ではこれを使う。
+pub(crate) fn restore_entities(text: &str) -> String {
     let mut result = text.to_string();
     let entities: &[(&str, &str)] = &[
         ("&quot;", "\""),
         ("&amp;", "&"),
-        ("&nbsp;", "\u{00A0}"),
+        ("&nbsp;", " "),
         ("&lt;", "<"),
         ("&gt;", ">"),
         ("&copy;", "(c)"),
@@ -196,7 +199,7 @@ pub fn sanitize_text(text: &str) -> String {
     result = restore_entities(&result);
 
     let ws_re = Regex::new(r"\s+").unwrap();
-    result = ws_re.replace_all(&result.trim(), " ").to_string();
+    result = ws_re.replace_all(result.trim(), " ").to_string();
 
     result
 }
@@ -213,6 +216,12 @@ mod tests {
 
         assert!(text.contains("［＃挿絵（挿絵/16-0.jpg）入る］"));
         assert!(!text.contains("［＃斜体］"));
+    }
+
+    #[test]
+    fn nbsp_matches_narou_rb_entity_restoration() {
+        assert_eq!(to_aozora("甲&nbsp;乙"), "甲 乙");
+        assert_eq!(to_aozora("&nbsp;本文&nbsp;"), " 本文 ");
     }
 
     #[test]

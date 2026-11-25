@@ -6,6 +6,15 @@ param(
     [string]$UpdaterBinaryPath,
 
     [Parameter(Mandatory = $true)]
+    [string]$BackupBinaryPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$LoginBinaryPath,
+
+    # MCP (stdIO) 用サブ実行ファイル。未指定なら同梱しない。
+    [string]$McpBinaryPath,
+
+    [Parameter(Mandatory = $true)]
     [ValidateSet("win", "mac", "linux")]
     [string]$Platform,
 
@@ -19,7 +28,20 @@ param(
 
     [string[]]$ResourceDirectories = @("webnovel", "preset"),
 
-    [string]$CommitVersion
+    [string]$CommitVersion,
+
+    # Optional build variant tag appended to the archive name (e.g. "GPL").
+    [string]$Variant = "",
+
+    # When set (release CI, same runner as the build), the transfer WASM
+    # artifact manifest must exist and declare a build id. The artifacts are
+    # embedded into the binary by build.rs; this check proves the packaging
+    # ran on a checkout where they were really produced.
+    [string]$TransferArtifactsManifest,
+
+    # 署名検証を省く。署名できないローカル検証用の抜け道で、
+    # リリース CI では指定しない (未署名のまま配布する事故を防ぐ)。
+    [switch]$SkipSignatureCheck
 )
 
 Set-StrictMode -Version Latest
@@ -31,14 +53,81 @@ if (-not (Test-Path -Path $BinaryPath -PathType Leaf)) {
 if (-not (Test-Path -Path $UpdaterBinaryPath -PathType Leaf)) {
     throw "Updater binary not found: $UpdaterBinaryPath"
 }
+if (-not (Test-Path -Path $BackupBinaryPath -PathType Leaf)) {
+    throw "Backup binary not found: $BackupBinaryPath"
+}
+if (-not (Test-Path -Path $LoginBinaryPath -PathType Leaf)) {
+    throw "Login binary not found: $LoginBinaryPath"
+}
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
 $resolvedBinary = (Resolve-Path -Path $BinaryPath).Path
 $resolvedUpdaterBinary = (Resolve-Path -Path $UpdaterBinaryPath).Path
+$resolvedBackupBinary = (Resolve-Path -Path $BackupBinaryPath).Path
+$resolvedLoginBinary = (Resolve-Path -Path $LoginBinaryPath).Path
+$resolvedMcpBinary = $null
+if (-not [string]::IsNullOrWhiteSpace($McpBinaryPath)) {
+    if (-not (Test-Path -Path $McpBinaryPath -PathType Leaf)) {
+        throw "MCP binary not found: $McpBinaryPath"
+    }
+    $resolvedMcpBinary = (Resolve-Path -Path $McpBinaryPath).Path
+}
 $resolvedOutputDir = (Resolve-Path -Path $OutputDir).Path
-$archiveName = "narou_rs_{0}_{1}.zip" -f $Platform, $Arch
+
+# The binary embeds /assets/transfer/*; when the CI contract passes a manifest
+# path, prove the artifact set was produced on this checkout before shipping.
+if (-not [string]::IsNullOrWhiteSpace($TransferArtifactsManifest)) {
+    if (-not (Test-Path -Path $TransferArtifactsManifest -PathType Leaf)) {
+        throw "Transfer WASM artifact manifest not found: $TransferArtifactsManifest"
+    }
+    $transferManifest = Get-Content -Path $TransferArtifactsManifest -Raw | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace($transferManifest.build_id) -or -not $transferManifest.files) {
+        throw "Transfer WASM artifact manifest is missing build_id/files: $TransferArtifactsManifest"
+    }
+}
+
+# Windows 版は本体とサブ実行ファイルすべてに Authenticode 署名が要る。
+# 署名ジョブが成果物を落とした場合に未署名のまま zip へ入るのを防ぐため、
+# 梱包前に検証する。
+function Assert-WindowsBinarySigned {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $signature = Get-AuthenticodeSignature -FilePath $Path
+    if ($signature.Status -ne "Valid") {
+        throw "Windows binary is not signed: $Path (status: $($signature.Status))"
+    }
+}
+
+if ($Platform -eq "win" -and -not $SkipSignatureCheck) {
+    $windowsBinaries = @(
+        $resolvedBinary,
+        $resolvedUpdaterBinary,
+        $resolvedBackupBinary,
+        $resolvedLoginBinary
+    )
+    if ($resolvedMcpBinary) {
+        $windowsBinaries += $resolvedMcpBinary
+    }
+    foreach ($windowsBinary in $windowsBinaries) {
+        Assert-WindowsBinarySigned -Path $windowsBinary
+    }
+}
+
+$variantSuffix = if ([string]::IsNullOrWhiteSpace($Variant)) { "" } else { "-$Variant" }
+$archiveName = "narou_rs_{0}_{1}{2}.zip" -f $Platform, $Arch, $variantSuffix
 $archivePath = Join-Path -Path $resolvedOutputDir -ChildPath $archiveName
+
+# 同梱するサードパーティライセンス全文。GPL 版は GPL-3.0-only の
+# AozoraEpub3_Lite を含むため GPL 記載のあるノーティスを、非 GPL 版は
+# copyleft を含まないノーティスを選ぶ。どちらもアーカイブ内では
+# Third-Party-License.md という名前で入る。
+$LicenseNoticeSource = if ([string]::IsNullOrWhiteSpace($Variant)) {
+    "Third-Party-License-non-GPL.md"
+}
+else {
+    "Third-Party-License.md"
+}
 
 if (Test-Path -Path $archivePath -PathType Leaf) {
     Remove-Item -Path $archivePath -Force
@@ -76,12 +165,20 @@ function Add-DirectoryToArchive {
         [string]$SourceDir,
 
         [Parameter(Mandatory = $true)]
-        [string]$EntryRoot
+        [string]$EntryRoot,
+
+        # 同梱しないファイル名 (相対パスからのファイル名)。
+        # 利用者が編集する設定ファイルは、セルフアップデートで
+        # 上書きされないよう配布物に入れない (issue #45)。
+        [string[]]$ExcludeFileNames = @()
     )
 
     $resolvedDir = (Resolve-Path -Path $SourceDir).Path
     $files = Get-ChildItem -Path $resolvedDir -Recurse -File
     foreach ($file in $files) {
+        if ($ExcludeFileNames -contains $file.Name) {
+            continue
+        }
         $relative = [System.IO.Path]::GetRelativePath($resolvedDir, $file.FullName)
         $entryPath = Join-Path -Path $EntryRoot -ChildPath $relative
         Add-FileToArchive -Archive $Archive -SourcePath $file.FullName -EntryPath $entryPath
@@ -136,6 +233,30 @@ try {
         -SourcePath $resolvedUpdaterBinary `
         -EntryPath (Join-Path -Path $PackageRoot -ChildPath $updaterEntryName)
 
+    # バックアップ用サブ実行ファイル。本体と同じフォルダに置く。
+    Add-FileToArchive `
+        -Archive $archive `
+        -SourcePath $resolvedBackupBinary `
+        -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedBackupBinary)))
+
+    # ログイン用サブ実行ファイル。本体と同じフォルダに置く。
+    Add-FileToArchive `
+        -Archive $archive `
+        -SourcePath $resolvedLoginBinary `
+        -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedLoginBinary)))
+
+    # MCP (stdIO) 用サブ実行ファイル。指定されたときだけ同梱する。
+    if ($resolvedMcpBinary) {
+        Add-FileToArchive `
+            -Archive $archive `
+            -SourcePath $resolvedMcpBinary `
+            -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedMcpBinary)))
+    }
+
+    # `preset/` の利用者が編集する設定ファイルは同梱しない。編集内容を
+    # 保持するため、複製して既定値 (`.default`) として同梱する。
+    $presetUserFiles = @("AozoraEpub3.ini", "custom_chuki_tag.txt")
+
     foreach ($resourceDir in $ResourceDirectories) {
         if ([string]::IsNullOrWhiteSpace($resourceDir)) {
             continue
@@ -144,25 +265,47 @@ try {
             throw "Required resource directory not found: $resourceDir"
         }
 
+        $exclude = @()
+        if ($resourceDir -eq "preset") {
+            $exclude = $presetUserFiles
+        }
+
         Add-DirectoryToArchive `
             -Archive $archive `
             -SourceDir $resourceDir `
-            -EntryRoot (Join-Path -Path $PackageRoot -ChildPath $resourceDir)
+            -EntryRoot (Join-Path -Path $PackageRoot -ChildPath $resourceDir) `
+            -ExcludeFileNames $exclude
     }
 
     foreach ($extraFile in $ExtraFiles) {
         if ([string]::IsNullOrWhiteSpace($extraFile)) {
             continue
         }
-        if (-not (Test-Path -Path $extraFile -PathType Leaf)) {
+
+        # 同梱するサードパーティライセンス全文はバリアントで異なる。GPL 版は
+        # GPL-3.0-only の AozoraEpub3_Lite を含むため GPL 記載のある
+        # ノーティスを、非 GPL 版は copyleft を含まないノーティスを使う。
+        # アーカイブ内のファイル名はどちらも Third-Party-License.md にする。
+        $entryName = [System.IO.Path]::GetFileName($extraFile)
+        $sourceFile = $extraFile
+        if ($entryName -eq "Third-Party-License.md") {
+            $noticeDir = [System.IO.Path]::GetDirectoryName($extraFile)
+            $sourceFile = if ([string]::IsNullOrWhiteSpace($noticeDir)) {
+                $LicenseNoticeSource
+            }
+            else {
+                Join-Path -Path $noticeDir -ChildPath $LicenseNoticeSource
+            }
+        }
+        if (-not (Test-Path -Path $sourceFile -PathType Leaf)) {
             continue
         }
 
-        $resolvedExtraFile = (Resolve-Path -Path $extraFile).Path
+        $resolvedExtraFile = (Resolve-Path -Path $sourceFile).Path
         Add-FileToArchive `
             -Archive $archive `
             -SourcePath $resolvedExtraFile `
-            -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedExtraFile)))
+            -EntryPath (Join-Path -Path $PackageRoot -ChildPath $entryName)
     }
 
     $commitEntry = $archive.CreateEntry((Join-Path -Path $PackageRoot -ChildPath "commitversion").Replace('\', '/'))

@@ -1,15 +1,24 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::error::Result;
+use crate::platform::{HttpClient, RateLimiter};
 
-use super::fetch::HttpFetcher;
+use super::http_policy;
+use super::preprocess::PreprocessJobs;
 use super::site_setting::SiteSetting;
 use super::types::{MAX_SECTION_CACHE, SectionElement, SubtitleInfo};
-use super::util::{build_section_url, compile_html_pattern, pretreatment_source};
+use super::util::{build_section_url, pretreatment_source_with_jobs};
 
 pub struct SectionCache {
     cache: HashMap<String, SectionElement>,
     order: VecDeque<String>,
+    context: Option<[u8; 32]>,
+}
+
+impl Default for SectionCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SectionCache {
@@ -17,6 +26,16 @@ impl SectionCache {
         Self {
             cache: HashMap::new(),
             order: VecDeque::new(),
+            context: None,
+        }
+    }
+
+    fn bind_policy(&mut self, policy: &http_policy::FetchPolicy) {
+        let context = policy.cache_context();
+        if context.is_none() || self.context != context {
+            self.cache.clear();
+            self.order.clear();
+            self.context = context;
         }
     }
 
@@ -42,23 +61,53 @@ fn section_cache_key(setting: &SiteSetting, toc_url: &str, subtitle: &SubtitleIn
     build_section_url(setting, toc_url, &subtitle.href)
 }
 
-pub fn download_section(
-    fetcher: &mut HttpFetcher,
+pub async fn download_section(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
     cache: &mut SectionCache,
     setting: &SiteSetting,
     subtitle: &SubtitleInfo,
     toc_url: &str,
+    jobs: &mut PreprocessJobs,
 ) -> Result<(SectionElement, String)> {
     let url = section_cache_key(setting, toc_url, subtitle);
+    let policy = http_policy::FetchPolicy::for_site(setting);
+    jobs.bind_policy(&policy, &url);
+    cache.bind_policy(&policy);
     if let Some(cached) = cache.get(&url) {
         return Ok((cached.clone(), String::new()));
     }
 
-    fetcher.rate_limiter.wait_for_url(&url);
-
-    let html_source = fetcher.fetch_text(&url, setting.cookie(), Some(setting.encoding()))?;
-    let mut html_source = html_source;
-    pretreatment_source(&mut html_source, setting.encoding(), Some(setting));
+    let mut html_source = match jobs.json_source(&url) {
+        Some(source) => source,
+        None => http_policy::fetch_text(http, rate_limiter, &url, &policy, Some(setting.encoding())).await?,
+    };
+    pretreatment_source_with_jobs(super::util::PretreatmentRequest {
+        http,
+        rate_limiter,
+        policy: &policy,
+        src: &mut html_source,
+        encoding: setting.encoding(),
+        setting: Some(setting),
+        jobs,
+        url: &url,
+    })
+    .await?;
+    if setting.compiled_error_message_pattern().is_some_and(|pattern| pattern.is_match(&html_source))
+    {
+        return Err(crate::error::NarouError::Http(format!("section is unavailable while fetching {url}")));
+    }
+    if setting.is_login_wall(&html_source) {
+        // ログインページが本文として返された。`login_wall_error: login` の
+        // サイトは認証エラーとして返し、別の保存済みログインで再試行できる
+        // ようにする。既定は従来どおりの失敗。
+        return Err(match setting.login_wall_error {
+            super::site_setting::LoginWallError::Login => setting.login_wall_failure(),
+            super::site_setting::LoginWallError::NotFound => {
+                crate::error::NarouError::Http(format!("section is unavailable while fetching {url}"))
+            }
+        });
+    }
     let (element, raw_html) = parse_section_html(setting, html_source)?;
     cache.insert(url, element.clone());
     Ok((element, raw_html))
@@ -75,37 +124,31 @@ pub fn parse_section_html(
         body: String::new(),
     };
 
-    if let Some(pattern) = setting.introduction_pattern() {
-        if let Ok(re) = compile_html_pattern(pattern) {
-            if let Some(caps) = re.captures(&html_source) {
-                element.introduction = caps
-                    .name("introduction")
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
-            }
-        }
+    if let Some(re) = setting.compiled_introduction_pattern()
+        && let Some(caps) = re.captures(&html_source)
+    {
+        element.introduction = caps
+            .name("introduction")
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
     }
 
-    if let Some(pattern) = setting.postscript_pattern() {
-        if let Ok(re) = compile_html_pattern(pattern) {
-            if let Some(caps) = re.captures(&html_source) {
-                element.postscript = caps
-                    .name("postscript")
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
-            }
-        }
+    if let Some(re) = setting.compiled_postscript_pattern()
+        && let Some(caps) = re.captures(&html_source)
+    {
+        element.postscript = caps
+            .name("postscript")
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
     }
 
-    if let Some(pattern) = setting.body_pattern() {
-        if let Ok(re) = compile_html_pattern(pattern) {
-            if let Some(caps) = re.captures(&html_source) {
-                element.body = caps
-                    .name("body")
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
-            }
-        }
+    if let Some(re) = setting.compiled_body_pattern()
+        && let Some(caps) = re.captures(&html_source)
+    {
+        element.body = caps
+            .name("body")
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
     }
 
     Ok((element, html_source))
@@ -126,6 +169,7 @@ mod tests {
             subdate: String::new(),
             subupdate: None,
             download_time: None,
+            download_revision: 0,
         }
     }
 
@@ -147,10 +191,7 @@ mod tests {
     #[test]
     fn hameln_section_patterns_extract_ruby_body_and_author_notes() {
         let settings = SiteSetting::load_all().unwrap();
-        let setting = settings
-            .iter()
-            .find(|s| s.domain == "syosetu.org")
-            .unwrap();
+        let setting = settings.iter().find(|s| s.domain == "syosetu.org").unwrap();
         let html = r#"
 <div id="maegaki">前書き<ruby><rb>漢字</rb><rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby><br><hr><br></div>
 <div id="honbun"><p>本文<ruby><rb>死線</rb><rp>(</rp><rt>デッドライン</rt><rp>)</rp></ruby></p></div>
@@ -160,8 +201,40 @@ mod tests {
 
         let (section, _) = parse_section_html(setting, html.to_string()).unwrap();
 
-        assert_eq!(section.introduction, "前書き<ruby><rb>漢字</rb><rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>");
-        assert_eq!(section.body, "<p>本文<ruby><rb>死線</rb><rp>(</rp><rt>デッドライン</rt><rp>)</rp></ruby></p>");
+        assert_eq!(
+            section.introduction,
+            "前書き<ruby><rb>漢字</rb><rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>"
+        );
+        assert_eq!(
+            section.body,
+            "<p>本文<ruby><rb>死線</rb><rp>(</rp><rt>デッドライン</rt><rp>)</rp></ruby></p>"
+        );
         assert_eq!(section.postscript, "後書き");
+    }
+
+    #[test]
+    fn akatsuki_body_pattern_extracts_reading_body() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.domain == "www.akatsuki-novels.com").unwrap();
+        let mut html = r#"
+<div class="reading-pane">
+  <div class="ad-slot my-6 text-center">広告</div>
+  <div class="whitespace-pre-line reading-body mt-6">　本文一行目。
+<ruby><rb>扇皇</rb><rp>（</rp><rt>せんおう</rt><rp>）</rp></ruby> ゼンヒ。
+　本文二行目。 </div>
+  <div class="ad-slot my-6 text-center">広告</div>
+</div>
+"#.to_string();
+
+        // 実際の取得経路と同じく前処理を先に通す (生改行を <br> に変換する)。
+        crate::downloader::util::pretreatment_source(&mut html, "UTF-8", Some(setting));
+        let (section, _) = parse_section_html(setting, html).unwrap();
+
+        assert_eq!(
+            section.body,
+            "　本文一行目。<br><ruby><rb>扇皇</rb><rp>（</rp><rt>せんおう</rt><rp>）</rp></ruby> ゼンヒ。<br>　本文二行目。 "
+        );
+        assert!(section.introduction.is_empty());
+        assert!(section.postscript.is_empty());
     }
 }

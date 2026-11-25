@@ -1,0 +1,34 @@
+//! Native platform implementations.
+//!
+//! These adapters implement the `platform` traits on top of OS/runtime
+//! facilities (reqwest/curl/wget, `std::fs`, subprocesses). The domain layer
+//! (`downloader`, `converter`, `db`, `commands`, `web`) must never reference
+//! this module; only the binary entrypoints and the native constructors
+//! (`Downloader::with_user_agent` etc.) wire it in.
+
+pub mod converter;
+pub mod api_tokens;
+pub mod author_store;
+pub mod cookie_store;
+pub mod browser_profile;
+pub mod downloader;
+pub mod favorite_tags;
+pub mod hidden;
+pub mod http;
+pub mod illustrations;
+pub mod login_key;
+pub mod materialization;
+pub mod legacy_persistence;
+pub mod novel_repository;
+pub mod site_definitions;
+pub mod sqlite;
+pub mod application;
+pub mod object_store;
+pub mod s3;
+pub mod tag_sequence;
+pub mod transfer;
+pub mod web_actions;
+pub mod self_update;
+pub mod virtual_novel;
+
+pub use application::non_external_console_target;

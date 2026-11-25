@@ -38,17 +38,53 @@ target
 errors.txt
 
 *.txt
-!preset/custom_chuki_tag.txt
-
-# Claude Code runtime locks (per-session state, must not be tracked)
-.claude/*.lock
+!assets/aozora_lite/*.txt
+# 利用者が作る設定 (配布物には同梱しない / 開発中のローカル上書き)。
+/preset/AozoraEpub3.ini
+/preset/custom_chuki_tag.txt
 # CocoIndex Code (ccc)
 /.cocoindex_code/
 /dist/
 /narou
 
-# Graphify generated working state.
-graphify-out/
+# Python (worker_entry/ci)
+__pycache__/
+*.pyc
 
-# Deprecated local code-intelligence index
+# Cloudflare Workers (worker_entry)
+# 生成物とローカル専用ファイルは追跡しない。
+/worker_entry/build/
+.wrangler/
+/worker_entry/wrangler.ci.toml
+/worker_entry/wrangler.reader.ci.toml
+/worker_entry/wrangler.acquire-*.ci.toml
+# tests/run.mjs が生成する実行用設定
+/worker_entry/wrangler.test.toml
+/worker_entry/.dev.vars
+/scripts/sorahost-proxy/worker/.dev.vars
+# deploy_worker.py が一時的に作る secret ファイル (終了時に消すが念のため)
+/worker_entry/.deploy-secrets-*.json
+/worker_entry/.provision-output
+/worker_entry/public/
+/worker_entry/.asset-version
+
+# ログイン Cookie の書き出しファイル（資格情報を含むため追跡しない）
+/narou_login_export.yaml
+
+# sorahost-cli が保存するデプロイトークン（資格情報を含むため追跡しない）
+.sorahost.json
+
+# 自宅回線リレーの設定 (認証キーを含む)
+/scripts/relay/.env
+
+# SORAHOST のサーバー側に置く設定 (秘密鍵を含む)
+/.env
+
+/geckodriver
+
+# Claude Code runtime locks (per-session state)
+.claude/*.lock
+
+# Local code intelligence output
+graphify-out/
 /.gitnexus/

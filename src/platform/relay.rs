@@ -1,0 +1,1070 @@
+//! 外部取得リレー (`relay/` crate の `narou_relay`) のプロトコル・コーデック。
+//!
+//! Cloudflare Workers の Fetch API が弾かれるサイト (ハーメルン等) を、
+//! 任意の配置先の踏み台から中継取得するためのリクエスト組み立てと
+//! 応答パースだけを提供する。トランスポート (Fetch / `connect()` 生ソケット)
+//! は呼び出し側が持つ。
+//!
+//! プロトコル (`relay/src/server.rs` が受け付ける形):
+//!
+//! ```text
+//! GET|POST /proxy
+//!   GET : ?url=<URL エンコード>&headers=<base64(JSON オブジェクト)>
+//!   POST: {"url": "...", "headers": {...}}
+//! 認証: X-Proxy-Token: <NAROU_RELAY_KEY>
+//! 応答: {"status": 200, "contentType": "...", "location": "...",
+//!        "setCookie": ["..."], "via": "curl", "wafAction": "captcha",
+//!        "body": "<base64>"}
+//! 失敗: {"status": <上流>, "error": "..."} /
+//!       HTTP 403 {"error":"forbidden"} / 500 {"error":"NAROU_RELAY_KEY is not set"}
+//! ```
+//!
+//! 踏み台は 1 リクエストにつき上流を 1 回だけ取得し、リダイレクトは辿らない
+//! (`Location` を `location` に載せて返す)。チェーンを辿る責務は呼び出し側
+//! (Worker) にあり、hop ごとの検証と資格情報の剥がしはそちらの共通規則で
+//! 行う。`curl -L` のような無条件追跡は資格情報を私設アドレスへ運びうるため、
+//! 踏み台側には置かない。
+//!
+//! `headers` はサイト定義 (`FetchPolicy::for_site`) が組み立てた
+//! `Accept` / `Accept-Language` / `Sec-Fetch-*` / `Cookie` 等をそのまま転送する
+//! ためのもの。同じ名前が複数回あるときは値を配列にして順序を保つ
+//! (`{"X": ["a", "b"]}`)。呼び出し側は POST の JSON 本文を使い、
+//! Cookie 等を URL に載せず、配備先の request-line 上限も避ける。
+//!
+//! **ヘッダ名の綴り (大文字小文字) はキーとしてそのまま残す。** HTTP/1.1 の
+//! クライアント (wget 等) は受け取った綴りをそのまま送るため、ここで小文字へ
+//! 正規化すると Cloudflare がブラウザ向けヘッダと認識せず managed challenge
+//! (403) を返すサイトがある (2026-10-21 のハーメルン実測)。同名の重複判定は
+//! 大文字小文字を区別せず、最初に現れた綴りを採用する。
+//!
+//! バイト列と文字列だけを扱う純粋ロジックのためホストでユニットテストできる
+//! (Worker クレートのテストは wasm 専用で実行されない)。外部クレートは
+//! 非 optional の `serde_json` と `url` のみに依存する。
+
+#[path = "relay_stream.rs"]
+mod streaming;
+pub use streaming::{STREAM_CONTENT_TYPE, decode_relay_stream};
+
+use super::http::{HttpRequest, RedirectMode, is_safe_header_name, is_safe_header_value};
+use super::http1::MAX_HTTP1_HEAD;
+
+/// UTF-8 JSON envelope budget, excluding only the base64 body's characters.
+pub const MAX_RELAY_METADATA: usize = MAX_HTTP1_HEAD * 7;
+
+/// Maximum JSON response body on the relay wire. Raw headers can expand
+/// sixfold under JSON escaping; the remaining block covers the envelope and
+/// diagnostics. The outer HTTP response head is bounded independently.
+pub fn response_wire_limit(decoded_body_limit: usize) -> usize {
+    decoded_body_limit.div_ceil(3).saturating_mul(4)
+        .saturating_add(MAX_RELAY_METADATA)
+}
+
+/// 踏み台への認証ヘッダ名。
+pub const TOKEN_HEADER: &str = "x-proxy-token";
+
+/// `download.relay-sites` の値から、取得リレーを試してよい対象サイトを決める。
+///
+/// 値はカンマ区切りのホスト名 (または `auto` / `none`):
+/// - `auto` / 空 / 未設定 … 取得リレーを任意サイトの取得失敗時に試す (既定)。
+/// - `none` … 取得リレーを使わない。
+/// - `host.example` … そのホストとサブドメインだけにリレーを試す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelaySitePolicy {
+    /// 任意の対象で、取得失敗時にリレーを試す (既定)。
+    Auto,
+    /// リレーを使わない。
+    Disabled,
+    /// サイトごとのルール。`fallback` は取得失敗時にだけ、
+    /// `forced` は最初からリレー経由にするホストの一覧
+    /// (いずれも `"*"` で全ホスト、サブドメインも含めて照合)。
+    Scoped {
+        fallback: Vec<String>,
+        forced: Vec<String>,
+    },
+}
+
+impl RelaySitePolicy {
+    /// `download.relay-sites` の生の文字列からポリシーを組み立てる。
+    /// 空・空白のみ・`auto` / `*` は [`RelaySitePolicy::Auto`]。
+    ///
+    /// 各項目はホスト名、`auto` (`*`)、`none` (`off`)、または
+    /// `force:<ホスト名>` / `forced:<ホスト名>` / `relay:<ホスト名>`。
+    /// `none` が 1 つでもあれば [`RelaySitePolicy::Disabled`] が優先される。
+    /// `force:` のないホスト名は「失敗時にだけリレーを試す」対象になる。
+    pub fn parse(value: Option<&str>) -> Self {
+        let Some(raw) = value.map(str::trim).filter(|raw| !raw.is_empty()) else {
+            return Self::Auto;
+        };
+        if raw.eq_ignore_ascii_case("auto") || raw == "*" {
+            return Self::Auto;
+        }
+        if raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("off") {
+            return Self::Disabled;
+        }
+        let normalize = |entry: &str| {
+            entry
+                .trim_start_matches("*.")
+                .trim_end_matches('/')
+                .to_ascii_lowercase()
+        };
+        let mut fallback = Vec::new();
+        let mut forced = Vec::new();
+        for entry in raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+            if entry.eq_ignore_ascii_case("none") || entry.eq_ignore_ascii_case("off") {
+                return Self::Disabled;
+            }
+            if let Some(host) = ["force:", "forced:", "relay:"]
+                .iter()
+                .find_map(|prefix| entry.strip_prefix(prefix))
+            {
+                let host = normalize(host);
+                if !host.is_empty() {
+                    forced.push(host);
+                }
+            } else if entry.eq_ignore_ascii_case("auto") || entry == "*" {
+                fallback.push("*".to_string());
+            } else {
+                let host = normalize(entry);
+                if !host.is_empty() {
+                    fallback.push(host);
+                }
+            }
+        }
+        if fallback.is_empty() && forced.is_empty() {
+            Self::Auto
+        } else {
+            Self::Scoped { fallback, forced }
+        }
+    }
+
+    /// `url` のホストが `hosts` のいずれかと一致するか (`"*"` は全一致、
+    /// 登録したホストのサブドメインも含む)。
+    fn host_in(hosts: &[String], url: &str) -> bool {
+        let Some(host) = url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        else {
+            return false;
+        };
+        hosts
+            .iter()
+            .any(|entry| *entry == "*" || host == *entry || host.ends_with(&format!(".{entry}")))
+    }
+
+    /// 取得失敗時のフォールバックとして、この対象にリレーを試してよいか。
+    pub fn fallback_allowed(&self, url: &str) -> bool {
+        match self {
+            Self::Auto => true,
+            Self::Disabled => false,
+            Self::Scoped { fallback, .. } => Self::host_in(fallback, url),
+        }
+    }
+
+    /// 直接取得を試さず、最初からリレー経由にする対象か (テスト用)。
+    pub fn forced(&self, url: &str) -> bool {
+        match self {
+            Self::Scoped { forced, .. } => Self::host_in(forced, url),
+            _ => false,
+        }
+    }
+}
+
+
+
+/// リレー呼び出しの失敗理由。
+///
+/// 踏み台が上流の取得に失敗した場合 (`Rejected`) と、応答そのものが
+/// プロトコルに合わなかった場合 (`Malformed`) を区別する。呼び出し側は
+/// `Malformed` / 送信失敗なら元の fetch 経路の結果をそのまま使い回せる。
+#[derive(Debug)]
+pub enum RelayError {
+    /// リクエストを組み立てられない (URL・トークン・ヘッダが不正)。
+    InvalidRequest(String),
+    /// 踏み台が呼び出しを拒否したか、踏み台上での上流取得が失敗した。
+    Rejected {
+        /// 踏み台自身の HTTP ステータス (403, 502, …)。
+        http_status: u16,
+        /// エラーオブジェクトが `status` を内包していた場合の上流ステータス。
+        upstream_status: Option<u16>,
+        /// 踏み台が返した `error` メッセージ。
+        message: String,
+    },
+    /// 応答がプロトコルに合わない (JSON でない、必須フィールド欠落など)。
+    Malformed(String),
+}
+
+impl std::fmt::Display for RelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelayError::InvalidRequest(message) => write!(f, "invalid relay request: {message}"),
+            RelayError::Rejected {
+                http_status,
+                upstream_status,
+                message,
+            } => match upstream_status {
+                Some(upstream) => write!(
+                    f,
+                    "relay request rejected (relay HTTP {http_status}, upstream {upstream}): {message}"
+                ),
+                None => write!(f, "relay request rejected (relay HTTP {http_status}): {message}"),
+            },
+            RelayError::Malformed(message) => write!(f, "malformed relay response: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for RelayError {}
+
+impl From<RelayError> for crate::error::NarouError {
+    fn from(error: RelayError) -> Self {
+        crate::error::NarouError::Http(error.to_string())
+    }
+}
+
+/// 外部リレーのベース URL を検証し、オリジン (`scheme://host[:port]`) に正規化する。
+///
+/// リレー呼び出しは `X-Proxy-Token` と取得先の Cookie を運ぶため、平文の経路に
+/// 載せてはいけない。`https` を必須とし、`http` はループバック
+/// (`127.0.0.1` / `::1` / `localhost`) の踏み台だけに許す。スキームの無い値
+/// (`<IP>:<port>`) は以前 `http://` を補っていたが、意図しない平文接続になる
+/// ため受け付けない (利用者にスキームを明示させる)。資格情報 (`user:pass@`) は
+/// ログや転送に載りうるので拒否する。パス・クエリ・フラグメントは捨てて
+/// origin だけを返す。
+///
+/// エラーメッセージに URL 自体は載せない (資格情報入りの値をログへ流さないため)。
+pub fn normalize_relay_base(raw: &str) -> std::result::Result<String, RelayError> {
+    let invalid = |message: String| RelayError::InvalidRequest(message);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid("relay base URL is empty".to_string()));
+    }
+    // スキーム無しの値を url crate へ渡すと (`example.com:8080` のように)
+    // 先頭をスキームとして解釈しうるため、先に明示的に弾く。
+    let has_scheme = trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        || trimmed
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    if !has_scheme {
+        return Err(invalid(
+            "relay base URL must start with https:// (plain http is allowed only for loopback)"
+                .to_string(),
+        ));
+    }
+    let base = url::Url::parse(trimmed)
+        .map_err(|error| invalid(format!("invalid relay base URL: {error}")))?;
+    if !base.username().is_empty() || base.password().is_some() {
+        return Err(invalid(
+            "relay base URL must not contain credentials".to_string(),
+        ));
+    }
+    // ループバック判定。`localhost` は名前解決の結果に関わらず局所として扱う
+    // (ブラウザと同じ規則)。IPv4 は 127.0.0.0/8、IPv6 は ::1 のみ。
+    let loopback = match base.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    match base.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => {
+            return Err(invalid(
+                "relay base URL must be https unless the relay is on loopback \
+                 (127.0.0.1, ::1 or localhost): plain http exposes the proxy token and cookies"
+                    .to_string(),
+            ));
+        }
+        _ => return Err(invalid("relay base URL must be http(s)".to_string())),
+    }
+    let origin = base.origin().ascii_serialization();
+    if origin == "null" {
+        return Err(invalid("relay base URL must have a host".to_string()));
+    }
+    Ok(origin)
+}
+
+/// POST の JSON 本文で送る、組み立て済みのリレー呼び出し。
+pub struct RelayRequest {
+    /// 踏み台のオリジン + `/proxy`。
+    url: String,
+    /// `X-Proxy-Token` に入れるトークン。
+    token: String,
+    /// `POST /proxy` 用の JSON ボディ。
+    body: Vec<u8>,
+}
+
+impl RelayRequest {
+    /// リレー呼び出しを組み立てる。
+    ///
+    /// - `base_url`: 踏み台のベース URL (`http://<IP>:<port>/`)。オリジン
+    ///   (scheme://host:port) だけが使われ、パスがあっても `/proxy` に固定される。
+    /// - `token`: `NAROU_RELAY_KEY`。空・制御文字入りは拒否する。
+    /// - `target_url`: 中継してほしい取得先。`http(s)` 以外は踏み台が 400 を
+    ///   返すため、ここで弾く。
+    /// - `headers`: 取得先に転送するヘッダ (例: `FetchPolicy::headers()`)。
+    ///   同名の値は順序を保ったまま運ぶ (JSON では値の配列になる)。**ヘッダ名の
+    ///   大文字小文字はそのまま保つ** (HTTP/1.1 のクライアントは与えられた綴りで
+    ///   送るため)。同名は大文字小文字を区別せず束ね、最初に現れた綴りを使う。
+    ///   CR/LF 等の制御文字を含む値・RFC トークンでない名前は拒否する。
+    pub fn new(
+        base_url: &str,
+        token: &str,
+        target_url: &str,
+        headers: &[(String, String)],
+    ) -> std::result::Result<Self, RelayError> {
+        let invalid = |message: String| RelayError::InvalidRequest(message);
+
+        let base = url::Url::parse(base_url)
+            .map_err(|e| invalid(format!("invalid relay base URL: {e}")))?;
+        if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
+            return Err(invalid(format!(
+                "relay base URL must be http(s) with a host: {base_url}"
+            )));
+        }
+        let origin = base.origin().ascii_serialization();
+        if origin == "null" {
+            return Err(invalid(format!(
+                "relay base URL must be http(s) with a host: {base_url}"
+            )));
+        }
+
+        // 踏み台は `^https?://` でしか受け付けないので先に弾く。
+        let target = url::Url::parse(target_url)
+            .map_err(|e| invalid(format!("invalid target URL: {e}")))?;
+        if !matches!(target.scheme(), "http" | "https") || target.host_str().is_none() {
+            return Err(invalid(format!(
+                "target URL must be http(s) with a host: {target_url}"
+            )));
+        }
+
+        if token.is_empty() || !is_safe_header_value(token) {
+            return Err(invalid("proxy token is empty or unsafe".to_string()));
+        }
+
+        use std::collections::BTreeMap;
+        use std::io::Write;
+
+        #[derive(serde::Serialize)]
+        #[serde(untagged)]
+        enum HeaderValues {
+            One(String),
+            Many(Vec<String>),
+        }
+        #[derive(serde::Serialize)]
+        struct Payload<'a> {
+            url: &'a str,
+            headers: BTreeMap<String, HeaderValues>,
+        }
+        struct JsonBody(Vec<u8>);
+        impl Write for JsonBody {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0.len().saturating_add(bytes.len()) > MAX_HTTP1_HEAD {
+                    return Err(std::io::Error::other("relay request JSON exceeds 64 KiB"));
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+
+        // 同名ヘッダは大文字小文字を区別せず束ねるが、キーには最初に現れた
+        // 綴りを使う。BTreeMap のキー順で JSON が組み上がるため、出力は入力の
+        // 並びに関係なく決定的になる。
+        let mut grouped: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+        for (name, value) in headers {
+            // RFC トークン名・制御文字無しの値だけを転送する。1 件の unsafe
+            // ヘッダで組立全体を止めると、サイト Cookie 等で relay を試せ
+            // なくなる (fallback が走らない)。
+            if !is_safe_header_name(name) || !is_safe_header_value(value) {
+                continue;
+            }
+            match grouped.entry(name.to_ascii_lowercase()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((name.clone(), vec![value.clone()]));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().1.push(value.clone());
+                }
+            }
+        }
+        let mut header_map = BTreeMap::new();
+        for (_, (name, values)) in grouped {
+            let value = if values.len() == 1 {
+                HeaderValues::One(values.into_iter().next().expect("one value"))
+            } else {
+                HeaderValues::Many(values)
+            };
+            header_map.insert(name, value);
+        }
+        let mut body = JsonBody(Vec::with_capacity(1024));
+        serde_json::to_writer(&mut body, &Payload { url: target_url, headers: header_map })
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(Self {
+            url: format!("{origin}/proxy"),
+            token: token.to_string(),
+            body: body.0,
+        })
+    }
+
+    /// 所有している本文とトークンを移し、1 ホップだけの HTTP 要求にする。
+    pub fn into_request(self) -> HttpRequest {
+        let mut request = HttpRequest::post(self.url, self.body);
+        request.redirect = RedirectMode::Manual;
+        request.trusted_endpoint = true;
+        request.headers = vec![
+            (TOKEN_HEADER.to_string(), self.token),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        request
+    }
+
+    /// Negotiate metadata-first binary framing for bounded asset downloads.
+    pub fn into_stream_request(self) -> HttpRequest {
+        let mut request = self.into_request();
+        request.headers.push(("Accept".to_owned(), STREAM_CONTENT_TYPE.to_owned()));
+        request
+    }
+}
+
+/// 踏み台の JSON 応答をデコードしたもの。
+#[derive(Debug, Clone)]
+pub struct RelayResponse {
+    /// 上流サイトの HTTP ステータス (踏み台自身の応答ではない)。
+    pub status: u16,
+    /// `contentType`。空文字・欠落は `None`。
+    pub content_type: Option<String>,
+    /// `location` (3xx 応答のリダイレクト先。踏み台は辿らない)。
+    pub location: Option<String>,
+    /// `setCookie` の値 (上流が複数返したときは受信順)。
+    ///
+    /// ログインセッションの更新は 1 本も落とせないため、他のヘッダと違って
+    /// 名前つきで運ぶ。
+    pub set_cookie: Vec<String>,
+    /// 踏み台がどのクライアントで取ったか (`curl` / `wget` / 診断情報)。
+    pub via: Option<String>,
+    /// 上流が返したブラウザ確認の種別 (`x-amzn-waf-action`)。
+    ///
+    /// 古い踏み台はこの値を運ばないため `None` になり得る。値は
+    /// [`crate::platform::http::WAF_ACTION_HEADER`] の名前で応答ヘッダに
+    /// 戻され、呼び出し側の判定 (確認要求は終端) に使われる。
+    pub waf_action: Option<String>,
+    /// base64 をデコード済みのレスポンスボディ。
+    pub body: Vec<u8>,
+}
+
+/// Strings borrow the wire envelope when JSON needs no unescaping (in
+/// particular the large base64 body). Non-string optional metadata retains
+/// the protocol's existing ignore semantics.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RelayString<'a> {
+    Text(#[serde(borrow)] std::borrow::Cow<'a, str>),
+    Other(serde::de::IgnoredAny),
+}
+
+impl RelayString<'_> {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text.as_ref()),
+            Self::Other(_) => None,
+        }
+    }
+
+    fn into_nonempty_string(self) -> Option<String> {
+        match self {
+            Self::Text(text) if !text.is_empty() => Some(text.into_owned()),
+            _ => None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RelayEnvelope<'a> {
+    status: Option<serde_json::Value>,
+    #[serde(borrow)]
+    body: Option<RelayString<'a>>,
+    #[serde(borrow)]
+    error: Option<RelayString<'a>>,
+    #[serde(rename = "contentType", borrow)]
+    content_type: Option<RelayString<'a>>,
+    #[serde(borrow)]
+    location: Option<RelayString<'a>>,
+    #[serde(rename = "setCookie")]
+    set_cookie: Option<serde_json::Value>,
+    #[serde(borrow)]
+    via: Option<RelayString<'a>>,
+    /// ブラウザ確認の種別。古い踏み台 (このフィールドを持たないもの) では
+    /// 欠落する。
+    #[serde(rename = "wafAction", borrow)]
+    waf_action: Option<RelayString<'a>>,
+}
+
+impl RelayResponse {
+    /// 踏み台の応答ボディをパースする。`http_status` はトランスポートが観測
+    /// した踏み台自身の HTTP ステータスで、エラーの報告にだけ使う。
+    ///
+    /// `error` フィールドを含む応答は `Rejected`、JSON でない・必須フィールド
+    /// が欠けている応答は `Malformed` を返す。`decoded_body_limit` は base64
+    /// デコード前の長さ判定と、実際の復号バイト列の両方に適用する。
+    pub fn parse(
+        http_status: u16,
+        bytes: &[u8],
+        decoded_body_limit: usize,
+    ) -> std::result::Result<Self, RelayError> {
+        let malformed = |message: String| RelayError::Malformed(message);
+        if bytes.len() > response_wire_limit(decoded_body_limit) {
+            return Err(malformed("relay response envelope exceeds limit".into()));
+        }
+        if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+            return Err(malformed("response is not a JSON object".into()));
+        }
+
+        let envelope: RelayEnvelope<'_> = serde_json::from_slice(bytes)
+            .map_err(|e| malformed(format!("response is not JSON: {e}")))?;
+        let status = envelope.status.as_ref()
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok());
+
+        if let Some(message) = envelope.error.as_ref().and_then(RelayString::as_str) {
+            if bytes.len() > MAX_RELAY_METADATA {
+                return Err(malformed("relay response metadata exceeds limit".into()));
+            }
+            return Err(RelayError::Rejected {
+                http_status,
+                upstream_status: status,
+                message: message.to_string(),
+            });
+        }
+
+        let status = status
+            .ok_or_else(|| malformed("response has no numeric `status`".to_string()))?;
+        let body64 = envelope.body.as_ref()
+            .and_then(RelayString::as_str)
+            .ok_or_else(|| malformed("response has no base64 `body`".to_string()))?;
+        if bytes.len().saturating_sub(body64.len()) > MAX_RELAY_METADATA {
+            return Err(malformed("relay response metadata exceeds limit".into()));
+        }
+
+
+        // `setCookie` は文字列の配列。欠落 (古い踏み台) は空、文字列でない
+        // 要素は無視する。
+        let body = base64_decode(body64, decoded_body_limit)?;
+        let set_cookie = match envelope.set_cookie {
+            Some(serde_json::Value::Array(items)) => items.into_iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::String(value) => Some(value),
+                    _ => None,
+                }).collect(),
+            _ => Vec::new(),
+        };
+
+        Ok(Self {
+            status,
+            content_type: envelope.content_type.and_then(RelayString::into_nonempty_string),
+            location: envelope.location.and_then(RelayString::into_nonempty_string),
+            set_cookie,
+            via: envelope.via.and_then(RelayString::into_nonempty_string),
+            waf_action: envelope.waf_action.and_then(RelayString::into_nonempty_string),
+            body,
+        })
+    }
+}
+
+#[cfg(test)]
+const B64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+#[cfg(test)]
+/// 標準 base64 (padding あり)。踏み台は `btoa` / `Buffer.toString("base64")`
+/// の出力を返すので、URL セーフ変種ではなくこちらを使う。
+fn base64_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let acc = b0 << 16 | b1 << 8 | b2;
+        out.push(B64_ALPHABET[(acc >> 18) as usize & 0x3F] as char);
+        out.push(B64_ALPHABET[(acc >> 12) as usize & 0x3F] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHABET[(acc >> 6) as usize & 0x3F] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHABET[acc as usize & 0x3F] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// `base64_encode` の逆。`=` は末尾のチャンクの位置 2/3 にだけ許す
+/// (`btoa` 出力の形)。空白・不正文字・壊れたパディングは `Malformed`。
+fn base64_decode(input: &str, limit: usize) -> std::result::Result<Vec<u8>, RelayError> {
+    let malformed = |message: String| RelayError::Malformed(message);
+
+    fn sextet(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+            b'a'..=b'z' => Some(u32::from(byte - b'a' + 26)),
+            b'0'..=b'9' => Some(u32::from(byte - b'0' + 52)),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    if bytes.len() > limit.div_ceil(3).saturating_mul(4) {
+        return Err(malformed("decoded relay body exceeds limit".into()));
+    }
+    if !bytes.len().is_multiple_of(4) {
+        return Err(malformed(format!(
+            "base64 length {} is not a multiple of 4",
+            bytes.len()
+        )));
+    }
+    let chunks = bytes.len() / 4;
+    let padding = bytes.iter().rev().take_while(|&&byte| byte == b'=').count();
+    let decoded_len = (chunks * 3).saturating_sub(padding);
+    if decoded_len > limit {
+        return Err(malformed("decoded relay body exceeds limit".into()));
+    }
+    let mut out = Vec::with_capacity(decoded_len);
+    for (index, chunk) in bytes.chunks(4).enumerate() {
+        let data_len = chunk.iter().take_while(|&&b| b != b'=').count();
+        if data_len < 2
+            || !chunk[data_len..].iter().all(|&b| b == b'=')
+            || (data_len < 4 && index + 1 != chunks)
+        {
+            return Err(malformed("invalid base64 padding".to_string()));
+        }
+        let mut acc = 0u32;
+        for (i, &byte) in chunk.iter().enumerate() {
+            let sextet = if i < data_len {
+                sextet(byte).ok_or_else(|| {
+                    malformed(format!("invalid base64 byte 0x{byte:02X}"))
+                })?
+            } else {
+                0
+            };
+            acc = acc << 6 | sextet;
+        }
+        out.push((acc >> 16) as u8);
+        if data_len >= 3 {
+            out.push((acc >> 8) as u8);
+        }
+        if data_len == 4 {
+            out.push(acc as u8);
+        }
+    }
+    if out.len() > limit {
+        return Err(malformed("decoded relay body exceeds limit".into()));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = "http://172.233.91.23:50071/";
+
+
+    #[test]
+    fn request_rejects_unsafe_inputs() {
+        // unsafe なヘッダは要求全体を止めず、その 1 件だけ落とす。
+        let long_name = "x".repeat(65);
+        let bad = [
+            ("Bad\nName".to_string(), "v".to_string()),
+            ("bad name".to_string(), "v".to_string()),
+            ("Ok".to_string(), "v\r\nInjected: x".to_string()),
+            ("Ok".to_string(), "v\u{0}".to_string()),
+            (long_name, "v".to_string()),
+        ];
+        for (name, value) in bad {
+            let headers = vec![(name.clone(), value), ("Accept".to_string(), "text/html".to_string())];
+            let request = RelayRequest::new(BASE, "t", "https://example.com/", &headers)
+                .unwrap()
+                .into_request();
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+            let header_names: Vec<&str> = body["headers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(header_names, ["Accept"], "{name:?} must be dropped");
+        }
+        assert!(matches!(
+            RelayRequest::new(BASE, "to\nken", "https://example.com/", &[]),
+            Err(RelayError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            RelayRequest::new(BASE, "t", "ftp://example.com/", &[]),
+            Err(RelayError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            RelayRequest::new("file:///etc/passwd", "t", "https://example.com/", &[]),
+            Err(RelayError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn response_decodes_utf8_and_binary_bodies() {
+        let utf8 = "こんにちは、世界".as_bytes();
+        let response = format!(
+            r#"{{"status":200,"contentType":"text/html; charset=UTF-8","via":"curl","body":"{}"}}"#,
+            base64_encode(utf8)
+        );
+        let parsed = RelayResponse::parse(200, response.as_bytes(), 1024).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.content_type.as_deref(), Some("text/html; charset=UTF-8"));
+        assert_eq!(parsed.via.as_deref(), Some("curl"));
+        assert_eq!(parsed.body, utf8);
+
+        // 非 UTF-8 (Shift_JIS など) もバイト列として復元できる。
+        let binary: Vec<u8> = (0u8..=255).collect();
+        let response = format!(
+            r#"{{"status":404,"location":"/other","body":"{}"}}"#,
+            base64_encode(&binary)
+        );
+        let parsed = RelayResponse::parse(200, response.as_bytes(), 1024).unwrap();
+        assert_eq!(parsed.status, 404);
+        assert_eq!(parsed.location.as_deref(), Some("/other"));
+        assert_eq!(parsed.body, binary);
+    }
+
+    #[test]
+    fn response_carries_every_set_cookie_and_tolerates_its_absence() {
+        let response = br#"{"status":302,"contentType":"text/html","location":"/login","setCookie":["a=1; Path=/","b=2"],"body":"QQ=="}"#;
+        let parsed = RelayResponse::parse(200, response, 1024).unwrap();
+        assert_eq!(parsed.status, 302);
+        assert_eq!(parsed.location.as_deref(), Some("/login"));
+        assert_eq!(
+            parsed.set_cookie,
+            vec!["a=1; Path=/".to_string(), "b=2".to_string()]
+        );
+
+        // フィールド欠落 (古い踏み台) と非文字列要素は空/無視。
+        let plain = RelayResponse::parse(200, br#"{"status":200,"body":"QQ=="}"#, 1024).unwrap();
+        assert!(plain.set_cookie.is_empty());
+        let mixed =
+            RelayResponse::parse(200, br#"{"status":200,"setCookie":[1,"x=1"],"body":"QQ=="}"#, 1024)
+                .unwrap();
+        assert_eq!(mixed.set_cookie, vec!["x=1".to_string()]);
+    }
+
+    #[test]
+    fn escaped_body_strings_and_nonstring_optional_metadata_keep_protocol_semantics() {
+        let response = RelayResponse::parse(
+            200,
+            br#"{"status":200,"body":"\u0051Q==","contentType":17,"location":{},"via":[],"setCookie":[{},"sid=fresh",1]}"#,
+            1,
+        ).unwrap();
+        assert_eq!(response.body, b"A");
+        assert!(response.content_type.is_none());
+        assert!(response.location.is_none());
+        assert!(response.via.is_none());
+        assert_eq!(response.set_cookie, vec!["sid=fresh"]);
+        assert!(matches!(
+            RelayResponse::parse(403, br#"{"status":{},"error":"forbidden","body":123}"#, 1),
+            Err(RelayError::Rejected { http_status: 403, upstream_status: None, .. }),
+        ));
+    }
+
+    #[test]
+    fn response_carries_the_browser_verification_action() {
+        let response = br#"{"status":405,"wafAction":"captcha","body":"QQ=="}"#;
+        let parsed = RelayResponse::parse(200, response, 1024).unwrap();
+        assert_eq!(parsed.status, 405);
+        assert_eq!(parsed.waf_action.as_deref(), Some("captcha"));
+
+        // フィールド欠落 (古い踏み台) と非文字列は None / 無視。
+        let plain = RelayResponse::parse(200, br#"{"status":200,"body":"QQ=="}"#, 1024).unwrap();
+        assert!(plain.waf_action.is_none());
+        let mixed =
+            RelayResponse::parse(200, br#"{"status":200,"wafAction":7,"body":"QQ=="}"#, 1024).unwrap();
+        assert!(mixed.waf_action.is_none());
+    }
+
+    #[test]
+    fn response_errors_are_reported() {
+        // 踏み台の拒否。
+        match RelayResponse::parse(403, br#"{"error":"forbidden"}"#, 1024) {
+            Err(RelayError::Rejected {
+                http_status: 403,
+                upstream_status: None,
+                message,
+            }) => assert_eq!(message, "forbidden"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        // 上流ステータスを内包するエラー。
+        match RelayResponse::parse(
+            502,
+            br#"{"status":503,"error":"fetch failed: boom"}"#,
+            1024,
+        ) {
+            Err(RelayError::Rejected {
+                http_status: 502,
+                upstream_status: Some(503),
+                ..
+            }) => {}
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        // JSON でない応答 (Cloudflare のチャレンジ HTML 等)。
+        assert!(matches!(
+            RelayResponse::parse(200, b"<html>challenge</html>", 1024),
+            Err(RelayError::Malformed(_))
+        ));
+        // status 欠落・非数値・body 欠落・body 非文字列。
+        for bad in [
+            br#"{"contentType":"text/html","body":"QQ=="}"#.as_slice(),
+            br#"{"status":"200","body":"QQ=="}"#.as_slice(),
+            br#"{"status":200}"#.as_slice(),
+            br#"{"status":200,"body":123}"#.as_slice(),
+        ] {
+            assert!(
+                matches!(RelayResponse::parse(200, bad, 1024), Err(RelayError::Malformed(_))),
+                "{bad:?} should be malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_round_trip_and_rejects_garbage() {
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(base64_encode(b"he"), "aGU=");
+        assert_eq!(base64_decode("aGVsbG8=", 1024).unwrap(), b"hello");
+        assert_eq!(base64_decode("aGU=", 1024).unwrap(), b"he");
+        assert_eq!(base64_decode("", 1024).unwrap(), Vec::<u8>::new());
+
+        for garbage in ["AAA", "A===", "AAAA=AAA", "!!!!", "aGVs bG8=", "aGVsbG8"] {
+            assert!(
+                matches!(base64_decode(garbage, 1024), Err(RelayError::Malformed(_))),
+                "{garbage:?} should be malformed"
+            );
+        }
+        // デコード失敗は parse でも Malformed になる。
+        assert!(matches!(
+            RelayResponse::parse(200, br#"{"status":200,"body":"!!!"}"#, 1024),
+            Err(RelayError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn decoded_body_limit_checks_length_and_padding_before_allocation() {
+        assert!(RelayResponse::parse(200, br#"{"status":200,"body":"QUJDREVG"}"#, 3).is_err());
+        // Three bytes fit the base64 wire length of a two-byte limit, but the
+        // decoded length must still fail rather than rounding the cap upward.
+        assert!(RelayResponse::parse(200, br#"{"status":200,"body":"QUJD"}"#, 2).is_err());
+        assert_eq!(
+            RelayResponse::parse(200, br#"{"status":200,"body":"QUI="}"#, 2).unwrap().body,
+            b"AB",
+        );
+        assert!(RelayResponse::parse(200, br#"{"status":200,"body":"QQ=="}"#, 0).is_err());
+        assert!(RelayResponse::parse(200, br#"{"status":200,"body":""}"#, 0).unwrap().body.is_empty());
+    }
+
+    #[test]
+    fn relay_accepts_exactly_sixteen_mib_of_decoded_bytes() {
+        let limit = 16 * 1024 * 1024;
+        for length in [limit, limit + 1] {
+            let encoded = base64_encode(&vec![b'x'; length]);
+            let wire = format!(r#"{{"status":200,"setCookie":["sid=fresh"],"body":"{encoded}"}}"#);
+            drop(encoded);
+            assert!(wire.len() <= response_wire_limit(limit));
+            let result = RelayResponse::parse(200, wire.as_bytes(), limit);
+            if length == limit {
+                let response = result.unwrap();
+                assert_eq!(response.body.len(), limit);
+                assert!(response.body.iter().all(|&byte| byte == b'x'));
+                assert_eq!(response.set_cookie, vec!["sid=fresh"]);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("exceeds limit"));
+            }
+        }
+    }
+
+    #[test]
+    fn response_metadata_is_bounded_even_when_the_body_is_small() {
+        let envelope_len = r#"{"status":200,"via":"","body":""}"#.len();
+        for length in [MAX_RELAY_METADATA, MAX_RELAY_METADATA + 1] {
+            let via = "x".repeat(length - envelope_len);
+            let wire = format!(r#"{{"status":200,"via":"{via}","body":""}}"#);
+            let result = RelayResponse::parse(200, wire.as_bytes(), 16 * 1024 * 1024);
+            if length == MAX_RELAY_METADATA {
+                assert!(result.unwrap().body.is_empty());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("metadata exceeds limit"));
+            }
+        }
+    }
+
+    #[test]
+    fn relay_base_requires_https_except_on_loopback() {
+        // 公開先は https だけ。パス・クエリ・フラグメントは origin へ落とす。
+        assert_eq!(
+            normalize_relay_base("https://relay.example.com").unwrap(),
+            "https://relay.example.com"
+        );
+        assert_eq!(
+            normalize_relay_base("  https://relay.example.com:8443/proxy?x=1#frag  ").unwrap(),
+            "https://relay.example.com:8443"
+        );
+        // ループバックの踏み台だけ http を許す (自動ポートの常駐リレー)。
+        for (raw, expected) in [
+            ("http://127.0.0.1:50071/", "http://127.0.0.1:50071"),
+            ("http://127.0.0.1:50071", "http://127.0.0.1:50071"),
+            ("http://localhost:8080/proxy", "http://localhost:8080"),
+            ("http://[::1]:9090", "http://[::1]:9090"),
+            ("https://localhost:8443", "https://localhost:8443"),
+        ] {
+            assert_eq!(normalize_relay_base(raw).unwrap(), expected, "{raw}");
+        }
+        // スキーム無しは補完しない (暗黙の平文接続へのフォールバックを避ける)。
+        for raw in [
+            "127.0.0.1:50071",
+            "relay.example.com",
+            "relay.example.com:443/proxy",
+        ] {
+            assert!(
+                matches!(normalize_relay_base(raw), Err(RelayError::InvalidRequest(_))),
+                "{raw} must be rejected"
+            );
+        }
+        // 公開ホストの平文 http は拒否する。
+        for raw in [
+            "http://relay.example.com",
+            "http://172.233.91.23:50071",
+            "http://localhost.example.com:8080",
+        ] {
+            assert!(
+                matches!(normalize_relay_base(raw), Err(RelayError::InvalidRequest(_))),
+                "{raw} must be rejected"
+            );
+        }
+        // 資格情報はログ・転送に載りうるので拒否する。
+        for raw in [
+            "https://user:pass@relay.example.com",
+            "http://user@127.0.0.1:50071",
+        ] {
+            assert!(
+                matches!(normalize_relay_base(raw), Err(RelayError::InvalidRequest(_))),
+                "{raw} must be rejected"
+            );
+        }
+        // 空・スキーム違い。
+        for raw in ["", "   ", "ftp://relay.example.com", "file:///etc/passwd"] {
+            assert!(
+                matches!(normalize_relay_base(raw), Err(RelayError::InvalidRequest(_))),
+                "{raw} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn request_keeps_header_name_casing_and_merges_case_variants() {
+        // サイト定義の綴り (Browser 相当) をそのまま踏み台へ運ぶ。小文字へ
+        // 正規化すると HTTP/1.1 の wget 経路で Cloudflare が 403 にする。
+        let headers = vec![
+            ("Accept".to_string(), "text/html".to_string()),
+            ("Sec-Fetch-Dest".to_string(), "document".to_string()),
+            ("user-agent".to_string(), "agent".to_string()),
+            ("ACCEPT".to_string(), "application/json".to_string()),
+        ];
+        let request = RelayRequest::new(BASE, "t", "https://example.com/", &headers)
+            .unwrap()
+            .into_request();
+        let payload = request.body.as_deref().expect("relay request body");
+        let body: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        let names: Vec<&str> = body["headers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(names, ["Accept", "Sec-Fetch-Dest", "user-agent"]);
+        // 同名 (大文字小文字違い) は最初の綴りのもとへ順序を保って束ねる。
+        assert_eq!(
+            body["headers"]["Accept"],
+            serde_json::json!(["text/html", "application/json"])
+        );
+        assert_eq!(body["headers"]["Sec-Fetch-Dest"], "document");
+        assert_eq!(body["headers"]["user-agent"], "agent");
+    }
+
+    #[test]
+    fn site_policy_defaults_to_auto_when_unset_or_auto() {
+        for raw in [None, Some(""), Some("   "), Some("auto"), Some("AUTO"), Some("*")] {
+            assert_eq!(RelaySitePolicy::parse(raw), RelaySitePolicy::Auto, "{raw:?}");
+        }
+        let policy = RelaySitePolicy::Auto;
+        assert!(policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+        assert!(!policy.forced("https://ncode.syosetu.com/n1/"));
+    }
+
+    #[test]
+    fn site_policy_none_disables_relay() {
+        for raw in ["none", "off", "syosetu.org,none", "ncode.syosetu.com,off"] {
+            let policy = RelaySitePolicy::parse(Some(raw));
+            assert_eq!(policy, RelaySitePolicy::Disabled, "{raw:?}");
+            assert!(!policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+            assert!(!policy.forced("https://ncode.syosetu.com/n1/"));
+        }
+    }
+
+    #[test]
+    fn site_policy_host_list_limits_fallback_to_those_sites() {
+        let policy = RelaySitePolicy::parse(Some("syosetu.org, www.pixiv.net"));
+        assert!(policy.fallback_allowed("https://syosetu.org/novel/1"));
+        // サブドメインも含める (h.syosetu.org)。
+        assert!(policy.fallback_allowed("https://h.syosetu.org/novel/1"));
+        assert!(policy.fallback_allowed("https://www.pixiv.net/novel/show.php?id=1"));
+        assert!(!policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+        assert!(!policy.fallback_allowed("https://notsyosetu.org/"));
+        assert!(!policy.forced("https://syosetu.org/novel/1"));
+    }
+
+    #[test]
+    fn site_policy_force_prefix_sends_host_through_relay_first() {
+        let policy = RelaySitePolicy::parse(Some("syosetu.org, force:ncode.syosetu.com"));
+        assert!(policy.forced("https://ncode.syosetu.com/n1/"));
+        // 強制対象のサブドメインも強制に含める。
+        assert!(policy.forced("https://www.ncode.syosetu.com/n1/"));
+        assert!(!policy.forced("https://syosetu.org/novel/1"));
+        // 強制対象は fallback 対象の判定には載らない (forced 側で使う)。
+        assert!(policy.fallback_allowed("https://syosetu.org/novel/1"));
+        assert!(!policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+    }
+
+    #[test]
+    fn site_policy_force_only_list_keeps_other_sites_off_relay() {
+        let policy = RelaySitePolicy::parse(Some("force:syosetu.org"));
+        assert!(policy.forced("https://syosetu.org/novel/1"));
+        assert!(!policy.fallback_allowed("https://ncode.syosetu.com/n1/"));
+    }
+
+    #[test]
+    fn request_skips_unsafe_headers_without_aborting() {
+        // Cookie 等に制御文字が混ざっても、その 1 件だけ落としてリレー要求を
+        // 組み立てる (組立全体を止めると fallback が走らない)。
+        let headers = vec![
+            ("Accept".to_string(), "text/html".to_string()),
+            ("Cookie".to_string(), "a=1\nb=2".to_string()),
+        ];
+        let request = RelayRequest::new(BASE, "t", "https://example.com/", &headers)
+            .unwrap()
+            .into_request();
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["headers"]["Accept"], "text/html");
+        assert!(body["headers"].get("Cookie").is_none());
+    }
+}

@@ -1,6 +1,8 @@
 mod setting_override;
 
+#[cfg(feature = "native-runtime")]
 use std::path::Path;
+use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,10 @@ pub struct UserConverter {
     pub before_settings: Vec<SettingOverride>,
     #[serde(default)]
     pub after_settings: Vec<SettingOverride>,
+    #[serde(skip)]
+    compiled_before: OnceLock<Vec<CompiledReplaceRule>>,
+    #[serde(skip)]
+    compiled_after: OnceLock<Vec<CompiledReplaceRule>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -54,6 +60,7 @@ struct CompiledReplaceRule {
 }
 
 impl UserConverter {
+    #[cfg(feature = "native-runtime")]
     pub fn load(archive_path: &Path) -> Option<Self> {
         let yaml_path = archive_path.join("converter.yaml");
         if !yaml_path.exists() {
@@ -70,6 +77,20 @@ impl UserConverter {
         Some(converter)
     }
 
+    /// `converter.yaml` の中身から作る (fs を使わない)。
+    ///
+    /// `title` が空ならそのまま、 Novel のタイトルと一致するときだけ適用する
+    /// 規則は [`Self::load_with_title`] と同じ。
+    pub fn from_yaml(yaml: &str, novel_title: &str) -> Option<Self> {
+        let converter: UserConverter = serde_yaml::from_str(yaml).ok()?;
+        if converter.title.is_empty() || converter.title == novel_title {
+            Some(converter)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "native-runtime")]
     pub fn load_with_title(archive_path: &Path, novel_title: &str) -> Option<Self> {
         let converter = Self::load(archive_path)?;
         if converter.title.is_empty() {
@@ -111,9 +132,11 @@ impl UserConverter {
         text_type: TextType,
         _settings: &mut NovelSettings,
     ) -> String {
-        let compiled = Self::compile_rules(&self.before);
+        let compiled = self
+            .compiled_before
+            .get_or_init(|| Self::compile_rules(&self.before));
         let mut result = text.to_string();
-        for rule in &compiled {
+        for rule in compiled.iter() {
             if !rule.text_types.is_empty() {
                 let type_str = text_type_to_str(text_type);
                 if !rule.text_types.iter().any(|t| t == type_str) {
@@ -140,9 +163,11 @@ impl UserConverter {
         text_type: TextType,
         _settings: &mut NovelSettings,
     ) -> String {
-        let compiled = Self::compile_rules(&self.after);
+        let compiled = self
+            .compiled_after
+            .get_or_init(|| Self::compile_rules(&self.after));
         let mut result = text.to_string();
-        for rule in &compiled {
+        for rule in compiled.iter() {
             if !rule.text_types.is_empty() {
                 let type_str = text_type_to_str(text_type);
                 if !rule.text_types.iter().any(|t| t == type_str) {

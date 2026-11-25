@@ -61,7 +61,7 @@ export function persistListState() {
   lsSet(LIST_STATE_KEY, JSON.stringify(payload));
 }
 
-export { lsGet, lsSet, lsBool, lsInt };
+export { lsGet, lsSet, lsRemove, lsBool, lsInt };
 
 export const State = {
   novels: [],
@@ -69,7 +69,8 @@ export const State = {
   frozenIds: new Set(),
   tags: [],
   tagColors: {},
-  notepadObjectId: null,
+  favoriteTags: [],
+  tagSortOrder: 'favorites_first',
   queueStatus: { pending: 0, completed: 0, failed: 0, running: null },
   queueDetailed: { pending: [], running: [], pending_count: 0, running_count: 0 },
   queueRestorePrompted: false,
@@ -79,6 +80,11 @@ export const State = {
   // View flags (persisted to localStorage)
   viewFrozen: lsBool('view-frozen', true),
   viewNonfrozen: lsBool('view-nonfrozen', true),
+  showHidden: lsBool('show-hidden', false),
+  showNovelAttribute: false,
+  showMangaAttribute: true,
+  // 属性タグ機能全体の ON/OFF (`tag.attributes-enabled`)。
+  attributeTagsEnabled: false,
   wideMode: lsBool('wide-mode', false),
   settingNewTab: lsBool('setting-new-tab', false),
   buttonsTop: lsBool('buttons-top', true),
@@ -96,14 +102,14 @@ export const State = {
   // Console
   consoleExpanded: false,
   consoleHistory: [],
+  consoleRevision: 0,
   consolePinned: { main: true, stdout2: true },
   concurrencyEnabled: false,
 
   // Config from server
+  capabilities: null,
   performanceMode: 'auto',
-  tableReloadTiming: 'every',
   debugMode: false,
-  wsPort: null,
   theme: lsGet('theme', 'default'),
   pollIntervalSeconds: 600,
   language: lsGet('language', 'ja'),
@@ -117,11 +123,13 @@ const ELEMENT_IDS = [
   'badge-selecting', 'queue-count', 'queue-count-divider', 'queue-count-convert', 'queue-display', 'queue-sizes',
   'filter-input', 'filter-clear', 'filter-search-icon',
   'console', 'console-stdout2', 'console-col-right',
+  'console-container', 'console-resize-handle',
   'console-cancel', 'console-history',
   'console-trash', 'console-expand', 'console-buttons',
   'main-control-panel', 'footer-control-panel', 'footer-navbar',
   'novel-list-body', 'novel-list', 'novel-list-container',
   'novel-list-length', 'novel-list-info', 'novel-list-pagination-top', 'novel-list-pagination',
+  'novel-list-show-hidden',
   'control-panel',
   'notepad-modal', 'notepad', 'notepad-close', 'save-notepad-button',
   'queue-modal', 'queue-modal-close', 'queue-clear-button', 'queue-reload-button',
@@ -129,16 +137,22 @@ const ELEMENT_IDS = [
   'queue-running-list', 'queue-pending-list', 'queue-modal-running-list', 'queue-modal-pending-list', 'queue-pending-count',
   'queue-restore-modal', 'queue-restore-yes', 'queue-restore-no',
   'tag-list-canvas',
+  'tag-sort-order-select',
   'tag-edit-modal', 'tag-edit-close', 'tag-edit-cancel',
   'tag-editor-summary', 'tag-editor-current', 'new-tag-input', 'add-tag-button',
+  'favorite-tag-button',
   'tag-suggestions',
+  'tag-favorites', 'tag-favorites-list', 'tag-favorites-empty',
   'about-modal', 'about-close', 'about-ok', 'about-version',
   'about-latest-version', 'about-check-latest',
   'about-update', 'about-update-status',
+  'update-variant-modal', 'update-variant-close', 'update-variant-cancel',
+  'update-variant-standard', 'update-variant-gpl',
+  'library-backup-modal', 'library-backup-close', 'library-backup-size',
+  'library-backup-space-warning', 'library-backup-output',
+  'library-backup-dismiss', 'library-backup-create',
   'feature-tour-modal', 'feature-tour-close', 'feature-tour-body',
   'feature-tour-disable-auto', 'feature-tour-ok',
-  'confirm-modal', 'confirm-title', 'confirm-message',
-  'confirm-cancel', 'confirm-ok',
   'register-modal', 'register-modal-close', 'register-url',
   'register-cancel', 'register-ok',
   'remove-modal', 'remove-novel-list', 'remove-with-file',

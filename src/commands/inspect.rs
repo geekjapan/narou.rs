@@ -1,6 +1,3 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-
 use narou_rs::converter::inspector::INSPECT_LOG_NAME;
 use narou_rs::db;
 
@@ -26,10 +23,10 @@ fn cmd_inspect_inner(targets: &[String]) -> Result<(), String> {
         let Some(target) = super::latest_convert_target() else {
             return Ok(());
         };
-        let Some(entry) = resolve_inspect_entry(&target) else {
+        let Some(entry) = resolve_inspect_entry(&target)? else {
             return Ok(());
         };
-        display_log(&entry);
+        display_log(&entry)?;
         return Ok(());
     }
 
@@ -39,71 +36,66 @@ fn cmd_inspect_inner(targets: &[String]) -> Result<(), String> {
             println!("{}", HR_TEXT);
         }
 
-        let Some(entry) = resolve_inspect_entry(target) else {
+        let Some(entry) = resolve_inspect_entry(target)? else {
             log::report_error(&format!("{} は存在しません", target));
             continue;
         };
-        display_log(&entry);
+        display_log(&entry)?;
     }
 
     Ok(())
 }
 
 struct InspectEntry {
-    title: String,
-    archive_path: PathBuf,
+    id: i64,
+    keys: narou_rs::platform::NovelObjectKeys,
 }
 
-fn resolve_inspect_entry(target: &str) -> Option<InspectEntry> {
-    let id = super::resolve_target_to_id(target)?;
-    db::with_database(|db| {
-        Ok(db.get(id).map(|record| InspectEntry {
-            title: record.title.clone(),
-            archive_path: narou_rs::db::existing_novel_dir_for_record(db.archive_root(), record),
-        }))
-    })
-    .ok()
-    .flatten()
+fn resolve_inspect_entry(target: &str) -> Result<Option<InspectEntry>, String> {
+    let Some(id) = super::resolve_target_to_id(target) else { return Ok(None); };
+    let record = narou_rs::native::novel_repository::NativeNovelRepository::new().get_current_sync(id.into()).map_err(|error| error.to_string())?;
+    let Some(record) = record else { return Ok(None); };
+    let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).map_err(|error| error.to_string())?;
+    Ok(Some(InspectEntry { id, keys }))
 }
 
-fn display_log(entry: &InspectEntry) {
-    println!("({} の小説状態調査状況ログ)", entry.title);
-    match read_inspect_log(&entry.archive_path) {
-        Some(content) => {
+fn display_log(entry: &InspectEntry) -> Result<(), String> {
+    match read_inspect_log(entry) {
+        Ok((title, Some(content))) => {
+            println!("({title} の小説状態調査状況ログ)");
             print!("{}", content);
             if !content.ends_with('\n') {
                 println!();
             }
         }
-        None => println!("調査ログがまだ無いようです"),
+        Ok((title, None)) => println!("({title} の小説状態調査状況ログ)\n調査ログがまだ無いようです"),
+        Err(error) => return Err(error.to_string()),
     }
+    Ok(())
 }
 
-fn read_inspect_log(archive_path: &Path) -> Option<String> {
-    let path = archive_path.join(INSPECT_LOG_NAME);
-    fs::read_to_string(path).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::read_inspect_log;
-
-    #[test]
-    fn read_inspect_log_returns_file_content() {
-        let base = std::env::temp_dir().join(format!(
-            "narou-rs-inspect-test-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join(super::INSPECT_LOG_NAME), "sample log\n").unwrap();
-
-        assert_eq!(read_inspect_log(&base).as_deref(), Some("sample log\n"));
-
-        std::fs::remove_dir_all(base).unwrap();
-    }
+fn read_inspect_log(entry: &InspectEntry) -> narou_rs::error::Result<(String, Option<String>)> {
+    let key = entry.keys.prefix().join(INSPECT_LOG_NAME)?;
+    let prefix = entry.keys.prefix().clone();
+    let inventory = narou_rs::db::inventory::Inventory::with_default_root()?;
+    let store = narou_rs::native::materialization::read_store(inventory.root_dir())?;
+    futures::executor::block_on(async {
+        let mut lease = narou_rs::application::novel_access::NovelReadLease::admit(
+            &store, &narou_rs::platform::ObjectPrefix::from(prefix.clone()), "native-inspect",
+        ).await?;
+        let result = async {
+            let record = narou_rs::native::novel_repository::NativeNovelRepository::new().get_current_sync(entry.id.into())?
+                .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", entry.id)))?;
+            let keys = narou_rs::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+            if keys.prefix() != &prefix { return Err(narou_rs::error::NarouError::Platform("novel_busy: inspection prefix changed".into())); }
+            let bytes = lease.read_small(&key).await?;
+            lease.validate().await?;
+            let content = bytes.map(|bytes| String::from_utf8(bytes).map_err(|error| {
+                narou_rs::error::NarouError::Database(format!("調査ログを読めません: {error}"))
+            })).transpose()?;
+            Ok((record.title, content))
+        }.await;
+        let released = lease.release().await;
+        match result { Ok(value) => { released?; Ok(value) }, Err(error) => Err(error) }
+    })
 }

@@ -1,88 +1,70 @@
 use std::collections::HashMap;
 
+use narou_rs::application::target_lookup::{TargetLookupPlan, UrlSource};
 use narou_rs::compat::yaml_value_to_string;
-use narou_rs::downloader::site_setting::SiteSetting;
-use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::queue::{JobType, PersistentQueue};
 
 pub mod alias;
+pub mod api;
 pub mod backup;
 pub mod browser;
 pub mod clean;
 pub mod convert;
+pub mod author;
 pub mod csv;
+pub mod db;
 pub mod diff;
 pub mod download;
 pub mod folder;
 pub mod help;
+pub mod hidden;
 pub mod illust;
 pub mod init;
 pub mod inspect;
 pub mod log;
+pub mod login;
 pub mod mail;
 pub mod manage;
 pub mod send;
 pub mod setting;
 pub mod trace;
+pub mod transfer_archive;
+pub mod virtual_novel;
 pub mod update;
 pub mod version;
 pub mod web;
 
-fn resolve_alias_target(target: &str) -> String {
+/// native `alias.yaml` (Local inventory スコープ) の別名表。
+fn load_alias_map() -> HashMap<String, String> {
     narou_rs::db::with_database(|db| {
-        let aliases: HashMap<String, serde_yaml::Value> =
+        let values: HashMap<String, serde_yaml::Value> =
             db.inventory().load("alias", InventoryScope::Local)?;
-        Ok(aliases.get(target).and_then(yaml_value_to_string))
+        Ok(narou_rs::application::aliases::alias_map_from_values(
+            values,
+        ))
     })
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| target.to_string())
+    .unwrap_or_default()
 }
 
+
+/// convert / clean / folder / illust / inspect / browser の共通ターゲット解決。
+/// 探索順・URL fallback・title→ncode の規則は
+/// `application::target_lookup::TargetLookupPlan::CONVERT` が唯一の定義。
 fn resolve_target_to_id(target: &str) -> Option<i64> {
-    let target = resolve_alias_target(target);
-    if let Ok(i) = target.parse::<i64>() {
-        return narou_rs::db::with_database(|db| Ok(db.get(i).map(|r| r.id)))
-            .ok()
-            .flatten();
-    }
-    match Downloader::get_target_type(&target) {
-        TargetType::Url => {
-            let site_settings = SiteSetting::load_all().ok()?;
-            let setting = site_settings.iter().find(|s| s.matches_url(&target))?;
-            let toc_url = setting
-                .toc_url_with_url_captures(&target)
-                .unwrap_or_else(|| setting.toc_url());
-            narou_rs::db::with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|r| r.id)))
-                .ok()
-                .flatten()
-        }
-        TargetType::Ncode => {
-            let ncode = target.to_lowercase();
-            narou_rs::db::with_database(|db| {
-                Ok(db
-                    .all_records()
-                    .values()
-                    .find(|r| {
-                        r.ncode.as_deref() == Some(ncode.as_str())
-                            || r.toc_url
-                                .to_lowercase()
-                                .trim_end_matches('/')
-                                .ends_with(&format!("/{}", ncode))
-                    })
-                    .map(|r| r.id))
-            })
-            .ok()
-            .flatten()
-        }
-        TargetType::Id => None,
-        TargetType::Other => {
-            narou_rs::db::with_database(|db| Ok(db.find_by_title(&target).map(|r| r.id)))
-                .ok()
-                .flatten()
-        }
-    }
+    let aliases = load_alias_map();
+    let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
+    let lookup = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    narou_rs::application::target_lookup::resolve_target_record_sync(
+        TargetLookupPlan::CONVERT,
+        &aliases,
+        UrlSource::Settings(&site_settings),
+        target,
+        &lookup,
+    )
+    .ok()
+    .flatten()
+    .map(|record| record.id)
 }
 
 fn latest_convert_target() -> Option<String> {
@@ -93,15 +75,16 @@ fn latest_convert_target() -> Option<String> {
     latest.get("id").and_then(yaml_value_to_string)
 }
 
-pub(crate) fn enqueue_web_convert_job(id: i64) -> Result<(), String> {
+pub(crate) fn enqueue_web_convert_job(write: &narou_rs::application::novel_access::NovelWriteGuard, id: i64) -> Result<(), String> {
     let queue_path = std::env::current_dir()
         .map_err(|e| e.to_string())?
         .join(".narou")
         .join("queue.yaml");
     let queue = PersistentQueue::new(&queue_path).map_err(|e| e.to_string())?;
-    queue
-        .push(JobType::Convert, &id.to_string())
-        .map_err(|e| e.to_string())?;
+    let mut meta = serde_yaml::Mapping::new();
+    meta.insert(serde_yaml::Value::String("write_origin".into()), serde_yaml::Value::String(serde_json::to_string(&write.origin()).map_err(|error| error.to_string())?));
+    queue.push_with_legacy(JobType::Convert, &id.to_string(), "convert", vec![serde_yaml::Value::String(id.to_string())], meta)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -138,6 +121,8 @@ mod tests {
             is_narou: true,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
     }
@@ -147,7 +132,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-        std::fs::write(temp.path().join(".narou").join("latest_convert.yaml"), "id: 0\n").unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("latest_convert.yaml"),
+            "id: 0\n",
+        )
+        .unwrap();
 
         assert_eq!(latest_convert_target().as_deref(), Some("0"));
     }
@@ -157,7 +146,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-        std::fs::write(temp.path().join(".narou").join("alias.yaml"), "sample: n9669bk\n").unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("alias.yaml"),
+            "sample: n9669bk\n",
+        )
+        .unwrap();
 
         db::init_database().unwrap();
         db::with_database_mut(|db| {
@@ -167,13 +160,17 @@ mod tests {
                 Some("n9669bk"),
                 "sample title",
             ));
+            db.save()?;
             Ok::<(), NarouError>(())
         })
         .unwrap();
 
         assert_eq!(resolve_target_to_id("0"), Some(0));
         assert_eq!(resolve_target_to_id("n9669bk"), Some(0));
-        assert_eq!(resolve_target_to_id("https://ncode.syosetu.com/n9669bk/"), Some(0));
+        assert_eq!(
+            resolve_target_to_id("https://ncode.syosetu.com/n9669bk/"),
+            Some(0)
+        );
         assert_eq!(resolve_target_to_id("sample"), Some(0));
     }
 }
