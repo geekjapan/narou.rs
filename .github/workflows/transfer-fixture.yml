@@ -1,0 +1,22 @@
+name: Transfer fixture (Cloudflare 128 MiB)
+
+on:
+  push:
+    branches: [develop, 'feature-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    name: Isolated transfer (${{ matrix.case_group }})
+    # Each group keeps its assertions, and owns disposable resources and cleanup.
+    strategy:
+      fail-fast: false
+      matrix:
+        case_group: [metadata, publication, gates]
+    uses: ./.github/workflows/transfer-fixture-case.yml
+    with:
+      case_group: ${{ matrix.case_group }}
+    secrets: inherit

@@ -5,14 +5,20 @@ use axum::{
 };
 use reqwest::header::USER_AGENT;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use crate::application::web_payloads::version_update_available;
+use crate::application::webui::mutations::{MutationNotice, mutation_events};
+use crate::application::webui::notepad::{
+    notepad_conflict_payload, notepad_object_id, notepad_response_value, notepad_saved_payload,
+};
+use crate::application::webui::tag_order::{
+    TagSortOrder, sort_tags,
+};
+use crate::application::webui::tag_views::{tag_count_ordering, tag_list_html};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::compat::{load_local_setting_bool, load_local_setting_string};
 use crate::db::inventory::{Inventory, InventoryScope};
-use crate::db::with_database;
 use crate::version;
 
 use super::AppState;
@@ -30,35 +36,16 @@ pub struct TagListParams {
 pub struct HistoryParams {
     stream: Option<String>,
     format: Option<String>,
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn tag_color_class(color: &str) -> &'static str {
-    match color {
-        "green" => "tag-green",
-        "yellow" => "tag-yellow",
-        "blue" => "tag-blue",
-        "magenta" => "tag-magenta",
-        "cyan" => "tag-cyan",
-        "red" => "tag-red",
-        "white" => "tag-white",
-        _ => "tag-default",
-    }
+    /// これより後の履歴行だけ返す (差分取得のカーソル)。
+    after: Option<u64>,
 }
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    Json(version::version_json())
+    Json(version::version_info().current())
 }
 
 pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let current = version::create_version_string();
+    let info = version::version_info();
     let repo = "Rumia-Channel/narou.rs";
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let client = reqwest::Client::builder()
@@ -75,51 +62,48 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
             let latest = json["tag_name"]
                 .as_str()
                 .or_else(|| json["name"].as_str())
-                .unwrap_or("")
-                .trim()
-                .trim_start_matches('v')
-                .to_string();
-            let current_plain = normalize_version(&current);
-            let develop = !version::commit_version_exists();
-            let local_build = version::is_local_build();
-            let container = version::is_container_runtime();
-            let self_update_supported = version::self_update_unavailable_reason().is_none();
-            Json(serde_json::json!({
-                "success": true,
-                "current_version": current,
-                "latest_version": latest,
-                "update_available": !latest.is_empty() && latest != current_plain,
-                "develop": develop,
-                "local_build": local_build,
-                "container": container,
-                "self_update_supported": self_update_supported,
-                "self_update_unavailable_reason": version::self_update_unavailable_reason(),
-                "url": json["html_url"].as_str().unwrap_or("https://github.com/Rumia-Channel/narou.rs/releases/latest"),
-            }))
+                .map(version::version_core)
+                .unwrap_or_default();
+            let current_plain = version::version_core(&info.version);
+            let update_available = version_update_available(&latest, &current_plain);
+            Json(info.latest(
+                &latest,
+                update_available,
+                json["html_url"]
+                    .as_str()
+                    .unwrap_or("https://github.com/Rumia-Channel/narou.rs/releases/latest"),
+                version::self_update_unavailable_reason(),
+                crate::native::self_update::variant_choice_required(),
+            ))
         }
-        Ok(resp) => Json(serde_json::json!({
-            "success": false,
-            "current_version": current,
-            "message": format!("latest version request failed: {}", resp.status()),
-            "url": "https://github.com/Rumia-Channel/narou.rs/releases/latest",
-        })),
-        Err(e) => Json(serde_json::json!({
-            "success": false,
-            "current_version": current,
-            "message": e.to_string(),
-            "url": "https://github.com/Rumia-Channel/narou.rs/releases/latest",
-        })),
+        Ok(resp) => Json(info.latest_failure(
+            &format!("latest version request failed: {}", resp.status()),
+            "https://github.com/Rumia-Channel/narou.rs/releases/latest",
+        )),
+        Err(e) => Json(info.latest_failure(
+            &e.to_string(),
+            "https://github.com/Rumia-Channel/narou.rs/releases/latest",
+        )),
     }
 }
 
-fn normalize_version(version: &str) -> String {
-    version
-        .trim()
-        .trim_start_matches('v')
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
+/// P2: notepad text lives in app_state('inv','notepad'); the file under
+/// `.narou/` remains only as a legacy import source / pre-DB fallback.
+fn notepad_state() -> Option<crate::native::sqlite::state::StateDb> {
+    #[cfg(feature = "native-runtime")]
+    {
+        if crate::native::sqlite::state::legacy_yaml_active() {
+            return None;
+        }
+        let narou_dir = Inventory::with_default_root()
+            .ok()
+            .map(|inventory| inventory.root_dir().join(".narou"));
+        narou_dir.as_deref().and_then(crate::native::sqlite::state::active_for)
+    }
+    #[cfg(not(feature = "native-runtime"))]
+    {
+        None
+    }
 }
 
 fn notepad_path() -> crate::error::Result<PathBuf> {
@@ -129,6 +113,21 @@ fn notepad_path() -> crate::error::Result<PathBuf> {
         .join("notepad.txt"))
 }
 
+fn read_notepad() -> String {
+    if let Some(state) = notepad_state() {
+        return state
+            .get_raw("inv", "notepad")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    }
+    notepad_path()
+        .ok()
+        .and_then(|path| read_notepad_content(&path).ok())
+        .unwrap_or_default()
+}
+
+
 fn read_notepad_content(path: &Path) -> std::io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(content),
@@ -137,79 +136,127 @@ fn read_notepad_content(path: &Path) -> std::io::Result<String> {
     }
 }
 
-pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let theme = load_local_setting_string("webui.theme").unwrap_or_else(|| "Cerulean".to_string());
-    let performance_mode =
-        load_local_setting_string("webui.performance-mode").unwrap_or_else(|| "auto".to_string());
-    let reload_timing = load_local_setting_string("webui.table.reload-timing")
-        .unwrap_or_else(|| "every".to_string());
-    let debug_mode = load_local_setting_bool("webui.debug-mode");
+pub async fn webui_config(State(state): State<AppState>) -> Response {
 
-    let concurrency_enabled = load_local_setting_bool("concurrency");
+    // 能力宣言 (共有定義)。端末一覧だけは実行時の外部ツール検出値を使う。
+    let detected = tokio::task::spawn_blocking(crate::converter::device::OutputManager::available_devices)
+        .await
+        .unwrap_or_default();
+    let capabilities = crate::application::webui::capabilities::WebUiCapabilities::native(
+        detected
+            .into_iter()
+            .map(|(name, available)| {
+                crate::application::webui::capabilities::DeviceChoice { name: name.into(), available }
+            })
+            .collect(),
+    );
 
-    Json(serde_json::json!({
-        "theme": theme,
-        "performance_mode": performance_mode,
-        "reload_timing": reload_timing,
-        "debug_mode": debug_mode,
-        "ws_port": state.ws_port,
-        "port": state.port,
-        "concurrency_enabled": concurrency_enabled,
-    }))
+    let context = crate::application::webui::config::ConfigContext {
+        capabilities,
+        port: Some(state.port),
+        ws_port: Some(state.ws_port),
+        convert_keep_txt_default: true,
+        queue_max_retries_limit: None,
+    };
+    match crate::application::webui::config::load(&state.services.settings, context).await {
+        Ok(config) => Json(config).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"success": false, "message": "設定を読み込めませんでした"})),
+        ).into_response(),
+    }
 }
 
 pub async fn tag_list(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<TagListParams>,
 ) -> Response {
-    let new_tag_color = crate::tag_colors::configured_new_tag_color();
-    let (tags, tag_colors) = with_database(|db| {
-        let index = db.tag_index();
-        let mut list: Vec<(&String, &Vec<i64>)> = index.iter().collect();
-        list.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-        let tags = list.into_iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
-
-        let inventory = db.inventory();
-        let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
-        if crate::tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            tags.iter().map(String::as_str),
-            new_tag_color.as_deref(),
-        ) {
-            crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+    let unavailable = || (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"success": false, "message": "タグ一覧を読み込めませんでした"})),
+    ).into_response();
+    let config = match crate::application::webui::config::load_tag_list(&state.services.settings).await {
+        Ok(config) => config,
+        Err(_) => return unavailable(),
+    };
+    let inventory = match crate::native::novel_repository::sqlite_tag_inventory(config.attribute_tags_enabled).await {
+        Ok(Some(inventory)) => inventory,
+        Err(_) => return unavailable(),
+        Ok(None) => {
+            let mut records = match state.services.library.records().await {
+                Ok(records) => records,
+                Err(_) => return unavailable(),
+            };
+            crate::application::attribute_tags::project(&mut records, config.attribute_tags_enabled);
+            let mut inventory = crate::native::novel_repository::TagInventory::new();
+            for record in records {
+                for tag in record.tags {
+                    let info = inventory.entry(tag).or_insert((0, record.id));
+                    info.0 += 1;
+                    info.1 = info.1.min(record.id);
+                }
+            }
+            inventory
         }
+    };
+    let mut list: Vec<_> = inventory.iter()
+        .filter(|(tag, _)| !crate::virtual_novel::is_internal_tag(tag))
+        .map(|(tag, (count, _))| (tag.clone(), *count))
+        .collect();
+    // 件数降順、同数はタグ名の昇順 (Worker の SQL と同じ規則 — 新規タグへの
+    // 色割り当ても並び順に依存するため、両ランタイムで一致させる)。
+    list.sort_by(tag_count_ordering);
+    let count_map: std::collections::HashMap<String, usize> =
+        list.iter().cloned().collect();
+    let default_tags: Vec<String> = list.into_iter().map(|(tag, _)| tag).collect();
 
-        Ok((tags, tag_colors.into_map()))
-    })
-    .unwrap_or_default();
+    // 並び順 (お気に入り優先 / アルファベット順 / 件数順 / 登録順) と
+    // お気に入りタグの並びは利用者が選べる。
+    let sort_order = config.sort_order;
+    let favorites = if sort_order == TagSortOrder::FavoritesFirst {
+        match crate::native::favorite_tags::load() {
+            Ok(state) => state.tags,
+            Err(_) => return unavailable(),
+        }
+    } else {
+        Vec::new()
+    };
+    let registered = if sort_order == TagSortOrder::Registered {
+        let sequence = match crate::native::tag_sequence::load() {
+            Ok(sequence) => sequence,
+            Err(_) => return unavailable(),
+        };
+        let library = inventory.into_iter()
+            .filter(|(tag, _)| !crate::virtual_novel::is_internal_tag(tag))
+            .map(|(tag, (_, first))| (tag, first))
+            .collect();
+        crate::application::tag_sequence::registered_ranks(&sequence, &library)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let tags = sort_tags(
+        sort_order,
+        &default_tags,
+        &count_map,
+        &favorites,
+        &registered,
+    );
+    let tag_colors = match state.services.tag_colors
+        .for_tags(default_tags, config.new_tag_color.as_deref()).await
+    {
+        Ok(colors) => colors,
+        Err(_) => return unavailable(),
+    };
 
     if params.format.as_deref() == Some("json") {
         return Json(serde_json::json!({ "tags": tags, "tag_colors": tag_colors })).into_response();
     }
 
-    let mut html = String::from(
-        "<div><span class=\"tag-label tag-default tag-reset\" data-tag=\"\">タグ検索を解除</span></div>\
-<div class=\"text-muted\" style=\"font-size:0.8em\">Altキーを押しながらで除外検索</div>",
-    );
-    for tag in &tags {
-        let escaped_tag = html_escape(tag);
-        let class = tag_color_class(
-            tag_colors
-                .get(tag)
-                .map(|value| value.as_str())
-                .unwrap_or("default"),
-        );
-        html.push_str(&format!(
-            "<div><span class=\"tag-label {}\" data-tag=\"{}\">{}</span> \
-<span class=\"select-color-button\" data-target-tag=\"{}\"><span class=\"tag-label {} tag-fixed-width\">a</span></span></div>",
-            class, escaped_tag, escaped_tag, escaped_tag, class
-        ));
-    }
-    Html(html).into_response()
+    Html(tag_list_html(&tags, &tag_colors)).into_response()
 }
 
 pub async fn tag_change_color(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
     let tag = match super::validate_web_tag_name(body["tag"].as_str().unwrap_or("")) {
@@ -222,57 +269,50 @@ pub async fn tag_change_color(
         }
     };
     let color = body["color"].as_str().unwrap_or("");
-
     if !color.is_empty() && !crate::tag_colors::is_valid_tag_color(color) {
         return Json(ApiResponse {
             success: false,
             message: format!("{}という色は存在しません", color),
         });
     }
-
-    let result = with_database(|db| {
-        let inv = db.inventory();
-        let mut colors = crate::tag_colors::load_tag_colors(inv)?;
-        if color.is_empty() {
-            colors.remove(&tag);
-        } else {
-            colors.set(&tag, color);
-        }
-        crate::tag_colors::save_tag_colors(inv, &colors)?;
-        Ok(())
-    });
-
-    match result {
+    match state
+        .services
+        .tag_colors
+        .set(&tag, (!color.is_empty()).then_some(color))
+        .await
+    {
         Ok(()) => Json(ApiResponse {
             success: true,
             message: "OK".to_string(),
         }),
-        Err(e) => Json(ApiResponse {
+        Err(error) => Json(ApiResponse {
             success: false,
-            message: e.to_string(),
+            message: error.to_string(),
         }),
     }
 }
 
-pub async fn all_novel_ids(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let ids = with_database(|db| {
-        let ids: Vec<i64> = db.all_records().keys().copied().collect();
-        Ok(ids)
-    })
-    .unwrap_or_default();
+pub async fn all_novel_ids(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let ids = state
+        .services
+        .library
+        .records()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| record.id)
+        .collect::<Vec<i64>>();
     Json(serde_json::json!({ "ids": ids }))
 }
 
 pub async fn notepad_read(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let content = notepad_path()
-        .ok()
-        .and_then(|path| read_notepad_content(&path).ok())
-        .unwrap_or_default();
+    let content = read_notepad();
     Json(notepad_response_value(&content))
 }
 
 pub async fn notepad_save(
     State(state): State<AppState>,
+    #[allow(unused_variables)]
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let content = body["content"]
@@ -287,79 +327,34 @@ pub async fn notepad_save(
             "message": message,
         }));
     }
-    let path = match notepad_path() {
-        Ok(path) => path,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "success": false,
-                "message": e.to_string(),
-            }));
-        }
-    };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return Json(serde_json::json!({
-            "success": false,
-            "message": e.to_string(),
-        }));
-    }
-    let current_content = read_notepad_content(&path).unwrap_or_default();
-    let current_object_id = notepad_object_id(&current_content);
     let request_object_id = body["object_id"].as_str().unwrap_or("");
-
-    if request_object_id != current_object_id {
-        return Json(serde_json::json!({
-            "success": false,
-            "conflict": true,
-            "message": "他の画面でメモ帳が更新されたため再読み込みしました。内容を確認してからもう一度保存してください",
-            "content": current_content,
-            "text": current_content,
-            "object_id": current_object_id,
-        }));
-    }
-
-    let result = crate::db::inventory::atomic_write(&path, content);
-    let object_id = notepad_object_id(content);
-    let response = serde_json::json!({
-        "content": content,
-        "text": content,
-        "object_id": object_id,
-    });
-
+    let update = |current: &str| {
+        if request_object_id != notepad_object_id(current) {
+            return Ok((current.to_string(), notepad_conflict_payload(current)));
+        }
+        Ok((content.to_string(), notepad_saved_payload(content)))
+    };
+    let result = if let Some(db) = notepad_state() {
+        db.update_raw("inv", "notepad", update)
+    } else {
+        notepad_path().and_then(|path| {
+            crate::db::inventory::with_locked_file_update(&path, update)
+        })
+    };
     match result {
-        Ok(_) => {
-            state.push_server.broadcast_raw(&serde_json::json!({
-                "type": "notepad.change",
-                "data": response.clone(),
-            }));
-            Json(serde_json::json!({
-                "success": true,
-                "message": "Saved",
-                "content": content,
-                "text": content,
-                "object_id": response["object_id"].clone(),
-            }))
+        Ok((_, payload)) => {
+            if payload["success"] == true {
+                for event in mutation_events(MutationNotice::Notepad { content }) {
+                    state.push_server.broadcast_raw(event);
+                }
+            }
+            Json(payload)
         }
         Err(e) => Json(serde_json::json!({
             "success": false,
             "message": e.to_string(),
         })),
     }
-}
-
-fn notepad_object_id(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-fn notepad_response_value(content: &str) -> serde_json::Value {
-    serde_json::json!({
-        "content": content,
-        "text": content,
-        "object_id": notepad_object_id(content),
-    })
 }
 
 pub async fn recent_logs(
@@ -375,10 +370,23 @@ pub async fn console_history(
     State(state): State<AppState>,
     Query(params): Query<HistoryParams>,
 ) -> Response {
-    let history = state.push_server.get_history_for(params.stream.as_deref());
-    if params.format.as_deref() == Some("json") {
-        return Json(serde_json::json!({ "history": history })).into_response();
+    // `after` があるときは差分だけ返す (WebSocket が使えない環境の補完用)。
+    if let Some(after) = params.after {
+        let (history, cursor) = state
+            .push_server
+            .history_since(params.stream.as_deref(), after);
+        return Json(serde_json::json!({ "history": history, "id": cursor })).into_response();
     }
+    if params.format.as_deref() == Some("json") {
+        // 履歴とカーソルを同じロック内で取得する。別々に取得すると、その隙に
+        // 発行された行が「履歴には無いのにカーソルには含まれる」ことになり、
+        // 以降の差分取得でその行が飛ばされる。
+        let (history, cursor) = state
+            .push_server
+            .history_since(params.stream.as_deref(), 0);
+        return Json(serde_json::json!({ "history": history, "id": cursor })).into_response();
+    }
+    let history = state.push_server.get_history_for(params.stream.as_deref());
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         history,
@@ -449,16 +457,13 @@ pub async fn save_sort_state(
     }
 }
 
-pub async fn validate_url_regexp_list(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    use crate::downloader::site_setting::SiteSetting;
-
-    let patterns: Vec<String> = SiteSetting::load_all()
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|s| s.url_patterns_for_validation())
-        .collect();
-
-    Json(serde_json::json!(patterns))
+pub async fn validate_url_regexp_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!(
+        state
+            .services
+            .site_definitions
+            .url_patterns_for_validation()
+    ))
 }
 
 #[cfg(test)]

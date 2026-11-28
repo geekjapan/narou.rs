@@ -1,0 +1,939 @@
+# Platform Abstraction & Cloudflare Workers 対応設計
+
+> ステータス: Phase 1〜8 実装完了（ローカル D1 / Worker wasm check / release build 検証済み、production binding と実運用 Cron / Queue は未検証、2026-08-10 時点）
+> 対象: narou.rs v0.3.6 以降（2026-08-10 時点の refactor-platform-abstraction）
+> 方針の一次資料: ユーザー提供リファクタリング指示（最重要原則・禁止事項・設計上の優先順位に従う）
+
+## 0. 設計判断の前提
+
+- 外部互換（CLI・設定・`.narou/`・`webnovel/*.yaml`・narou.rb 互換挙動・変換出力）は最優先で守る。抽象化は内部構造の話。
+- 逆方向依存禁止: `core → native` / `core → worker` / `core → reqwest` / `core → std::fs` は作らない。依存は常に `core → traits ← native/worker`。
+- 巨大な万能 `Platform` trait は作らない。小さな capability trait を必要数だけ。
+- 依存注入フレームワークは使わない。手組みのコンストラクタ注入のみ。
+- 途中で常に `cargo build` / `cargo test` が通る状態を保つ。
+
+## 1. 現在の platform 依存一覧（2026-08-08 調査結果）
+
+調査: src/ 全 107 ファイル / 112,776 行を grep で走査（read-only）。以下は主要な箇所。
+
+### 1.1 ファイルシステム（std::fs / File / PathBuf / canonicalize）
+
+| 分類 | 箇所 | 内容 |
+|---|---|---|
+| native 専用として残す | `src/commands/init.rs` | ディレクトリ作成・YAML コピー・AozoraEpub3 設定（~15 sites） |
+| native 専用として残す | `src/bin/updater.rs`, `src/updater_promote.rs` | 自己更新: ファイル置換・rename・permissions（Windows rename 問題、unix PermissionsExt） |
+| native 専用として残す | `src/converter/device.rs` | AozoraEpub3 / kindlegen 実行、epub/zip 組立、tempdir（~17 sites） |
+| native 専用として残す | `src/compat.rs` | dir fsync、backup zip、copy-to、java 解決（~12 sites） |
+| native 専用として残す | `src/web/{update,worker,scheduler,jobs}.rs` | self-reexec、updater spawn、queue worker、filesystem diff compatibility、server.pid |
+| Phase 5 完了 | `src/application/*` | Web use-case、validation、schedule policy、job planning、settings effects、event ports。web/native/framework型を参照しない |
+| 抽象化対象 | `src/db/inventory.rs` | 設定 YAML の atomic write / lock（fs2）/ metadata（~12 sites） |
+| 抽象化対象 | `src/db/database.rs` | `小説データ/` archive root の create_dir_all 等 |
+| Phase 4 完了 | `src/downloader/persistence.rs` | codec + `PersistenceService` は logical `ObjectKey` / async `ObjectStore` 経由。旧 Path API は `src/native/legacy_persistence.rs` の互換ラッパー |
+| Phase 4 完了 | `src/downloader/mod.rs` | TOC・section・raw・cache・illustration保存は注入された store。`DownloadResult.novel_dir` とタイトル移行は native互換境界 |
+| Phase 4 完了 | `src/illustration_store.rs` | pure index操作と `IllustrationStorageService`（AssetStore）を追加。legacy scan/migration API は当面 native CLI互換呼び出し |
+| Phase 4 残存 | `src/downloader/info_cache.rs` | 未使用のnative cache。Worker pathへは持ち込まない |
+| Phase 4 残存 | `src/downloader/site_setting/loader.rs` | bundled/user `webnovel/*.yaml` のnative loader。Phase 5以降にsource abstractionを検討 |
+| Phase 4 残存 | `src/converter/mod.rs` | pure変換は維持。生成txt、section convert cache、既存画像legacy localizationはnative presentation |
+| Phase 4 残存 | `src/converter/{ini,settings,dakuten_font,output,inspector}.rs` | converter設定・外部出力・診断ログのnative I/O |
+| 抽象化対象 | `src/mail.rs` | メール設定 YAML / preset コピー / 添付読込 |
+| 抽象化対象 | `src/queue.rs` | queue.yaml 読込書込（sentinel / atomic write） |
+| 抽象化対象 | `src/logger.rs` | ログファイル append（native のみで良い可能性が高い） |
+| Phase 5 残存 | `src/web/{global_settings,novel_settings,misc,jobs}.rs` | replace.txt / notepad.txt と差分表示の既存 layout 互換。application settings/content serviceへ段階移行中 |
+| 論理キー化 | `src/db/paths.rs` | `novel_dir_from_components` / `novel_dir_for_record` / `ensure_within_archive_root` |
+
+### 1.2 ネットワーク / プロセス / 並行性
+
+| 分類 | 箇所 | 内容 |
+|---|---|---|
+| Phase 2 完了 | `src/downloader/http_policy.rs`, `src/native/http.rs` | HTTP policy と native transport を分離。旧 `fetch.rs` は削除済み |
+| Phase 2 完了 | `src/downloader/narou_api.rs` | 注入 `HttpClient` 経由のなろう API batch |
+| Phase 2 完了 | `src/downloader/novel_info.rs` | 注入 transport 経由の小説情報取得 |
+| Phase 2 完了 | `src/downloader/rate_limit.rs` | platform `RateLimiter` 経由の async rate limit |
+| Phase 5 残存 | `src/commands/update.rs` | CLI互換の general_lastup API 実行は native command boundary |
+| Phase 4 完了 | `src/converter/mod.rs` | 挿絵 fetchは `ConverterCapabilities` の `HttpClient` / `RateLimiter` 経由。native wiringは `src/native/converter.rs` |
+| native 専用 | `src/web/misc.rs`, `src/web/update.rs` | GitHub API / 自己更新ダウンロード（async reqwest）。Worker capabilityは後続フェーズ |
+| native 専用 | `src/compat.rs` | taskkill / where / explorer / xdg-open |
+| native 専用 | `src/commands/{download,update}.rs`, `src/web/{worker,scheduler,jobs}.rs` | 自己 re-exec、relay thread、spawn |
+| native 専用 | `src/mail.rs` | SMTP（lettre）、mpsc による結果受信 |
+| native 専用 | `src/web/web_tray.rs` | Windows タスクトレイ |
+| native 専用 | `src/main.rs` | コンソール wrapper 再実行 |
+
+### 1.3 その他
+
+- `std::thread`: commands/download(28), update(101), send(304), backup(22), mail(384), device(465), fetch(480), web/*(多数), web_tray(14)
+- `std::sync::mpsc`: mail.rs(382), fetch.rs(479), device.rs(464)
+- `std::env`: USERPROFILE/HOME（home 解決）、LOCALAPPDATA/ProgramFiles（Kindle）、JAVA_HOME、NAROU_*（テスト・隠し設定）、HIDE_CONSOLE_ENV、NO_COLOR、COMPUTERNAME/HOSTNAME
+- グローバル状態: `db::DATABASE`（`Mutex<Option<Database>>`）、`rate_limit::STATE`（`LazyLock<Mutex<RateLimitState>>`）、logger、web の AppState
+- socket: `commands/web.rs` の TcpStream（port-wait）、axum bind（`0.0.0.0:port`）
+- tempfile: 本番は `db/inventory.rs`（atomic write 用 temp）、`commands/diff.rs`（diff ビューア）、`converter/device.rs`（AozoraEpub3 scratch dir）の 3 箇所のみ。他はテスト用
+- Clock: `chrono::Utc::now()` / `chrono::Local::now()` がロジック内に直接散在
+
+### 1.4 既に platform 非依存（そのまま core 化できる）
+
+- `src/downloader/preprocess/*`（pest パーサ + インタプリタ）
+- `src/downloader/html.rs`（HTML→青空変換）
+- `src/downloader/site_setting/mod.rs` の compile / 補間ロジック（loader のみ FS 依存）
+- `src/downloader/security.rs`（URL 検証・SSRF 防止）
+- `src/downloader/toc.rs` / `section.rs` の parse 系
+- `src/converter/converter_base/*`（文字変換・行処理・ルビ）※ `render.rs` も pure
+- `src/error.rs` の `NarouError` — ~~reqwest::Error に直接 `#[from]`~~ → Phase 1 で `Platform(String)` 化済み
+- `src/db/novel_record.rs` / `index_store.rs` / `ruby_time.rs`
+- `src/title.rs` のタイトル変換（rename のみ FS）
+
+## 2. 新しい module 構成
+
+既存ツリーに `src/platform/` を追加し、既存 module は原則そのまま残す（無理な引っ越しはしない）。
+
+```text
+src/
+├─ platform/              # 新規: platform abstraction（core から参照可）
+│   ├─ mod.rs             #   モジュール再 export
+│   ├─ http.rs            #   HttpClient trait + 型 + Mock
+│   ├─ clock.rs           #   Clock trait + SystemClock + FakeClock
+│   ├─ object_store.rs    #   ObjectStore trait + ObjectKey + Mock
+│   ├─ rate_limiter.rs    #   RateLimiter trait + 型
+│   ├─ repository.rs      #   NovelRepository trait + NovelQuery（Phase 3 で利用開始）
+│   └─ mocks.rs           #   MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter
+├─ native/                # 新規: native 実装（core から参照しない）
+│   ├─ mod.rs
+│   ├─ http.rs            #   NativeHttpClient（現 HttpFetcher の transport 部分をラップ）
+│   ├─ object_store.rs    #   LocalObjectStore（現 DB/Inventory/downloader persistence をラップ）
+│   ├─ rate_limiter.rs    #   NativeRateLimiter（現 RateLimiter を async 化してラップ）
+│   └─ clock.rs           #   SystemClock（platform::clock と統合するかは Phase 1 で判断）
+├─ cli/                   # （将来）main.rs のコマンド実行層を分離したい場合の行き先。現状は commands/ をそのまま使う
+├─ web/                   # 既存のまま（service 層経由化は Phase 5）
+├─ commands/              # 既存のまま
+├─ downloader/            # 既存のまま（Phase 2 で fetch を trait 利用へ）
+├─ converter/             # 既存のまま（Phase 4 で FS 除去）
+├─ db/                    # 既存のまま（Phase 3 で Repository 化）
+└─ worker_entry/          # （Phase 6）worker build 用エントリ。`worker-runtime` feature でのみコンパイル
+```
+
+依存方向（コンパイル単位）:
+
+```text
+worker_entry ──> platform traits <── native (NativeHttpClient, LocalObjectStore, ...)
+     │                  ▲
+     │                  │
+     └───── core（downloader / converter / db / commands / web のロジック）
+```
+
+- `platform/` は `reqwest` / `curl` / `std::fs` を **持たない**。
+- `native/` は `reqwest` / `curl` / `std::fs` を自由に使える。core からは参照されない。
+- `worker_entry/` は `worker` crate のみ依存し、platform traits を実装した Worker アダプタを置く。
+
+## 3. trait 一覧（Phase 1 で導入するもの）
+
+| trait | ファイル | 責務 |
+|---|---|---|
+| `HttpClient` | platform/http.rs | 最小 HTTP 送受信（GET/POST、redirect は実装任せ、size limit、timeout、status、content-type、bytes/string）。URL 検証は呼び出し側 or 共通ヘルパー |
+| `RateLimiter` | platform/rate_limiter.rs | `async fn acquire(scope) -> Result<()>`。サイト間隔制御の抽象 |
+| `Clock` | platform/clock.rs | `now_utc()`。テストで固定時刻を注入可能に |
+| `ObjectStore` | platform/object_store.rs | 論理キーによる read/write/exists/delete/list（Phase 4 で本格利用。Phase 1 では型のみ） |
+| `NovelRepository` | platform/repository.rs | 小説レコード CRUD + query（Phase 3 で本格利用。Phase 1 では型のみ） |
+
+将来 phase で追加予定: `JobQueue`, `MailSender`, `ProcessRunner`, `TempStorage`, `Scheduler`（cron/durable object 用）, `PlatformCapabilities`。
+
+## 4. 各 trait の責務（詳細）
+
+### HttpClient
+
+```rust
+pub struct HttpRequest {
+    pub url: String,
+    pub method: HttpMethod,          // Get | Post
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,       // POST 用
+    pub redirect: RedirectMode,      // Follow (default) | Manual
+}
+
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,               // bytes 完結（デコードは core 側）
+}
+
+pub trait HttpClient: Send + Sync {
+    fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>>;
+}
+```
+
+- 「reqwest API のコピー」にしない。narou.rs が必要とする最小仕様（GET/POST + headers + body + status + timeout + size limit）。
+- `HttpRequest` は所有型（`spawn_blocking` へ move できる）。`RedirectMode::Manual` は 3xx をそのまま返し、`resolve_final_url` が `Location` を追跡する。
+- `HttpResponse` は bytes のみ。文字デコード（Shift_JIS 等）は core の `downloader::http_policy::decode_with_encoding` が行う。
+- ステータス→ドメインエラー変換（404→NotFound / 503→SuspendDownload、既知のブラウザ確認→Login）は `http_policy` に一元化する。`platform::http::browser_challenge` は `202 + x-amzn-waf-action: challenge` / `405 + ...: captcha` だけを認識する追加メモリ割り当てのない共通判定で、transport は元のステータスとヘッダを保持する。本文が空の 202、必須 JSON 取得、ストリームでも確認画面を成功データとして扱わない。
+- 将来の future は `Send`（`tokio::spawn` で並列 update を駆動するため）。wasm32 では全型が自動 Send なので Workers は影響なし。
+- ブラウザ確認は通信手段の障害ではない。Native はこの応答で tier を打ち切り、Worker の socket / relay でも元の 403 より優先して返す。Cookie 候補の選択・目次の再評価・本文の再試行は downloader の私有 `AuthState` が担う。資格情報は必要時に一度だけ読み、候補は常にサイトの設定 Cookie から組み直す。通常の成功ページごとに資格情報を再読込せず、認証以外の失敗を追加試行しない。
+- 取得済みの部分一覧を補うログイン試行は任意であり、その候補の 404・通信エラー・後続目次のログイン壁で採用済み一覧を無効にしない。改善できなければ一覧と資格情報を一緒に元へ戻す。利用可能な一覧を一度も得られなかった場合だけ、元のエラーを返す。
+- AWS WAF の公式 [`getToken()`](https://docs.aws.amazon.com/waf/latest/developerguide/waf-js-challenge-api-get-token.html) はトークン取得・再利用の API であり、CAPTCHA を解くものではない。Cookie の存在だけで通過成功や有効期間を推定せず、実際の取得結果で判定する。YAML の `browser_token` は HTTPS SDK URL・関数パス・Cookie 名を指定し、`narou_rs_login --browser-token` が隔離ブラウザ内で正規 SDK を実行する。SDK の値やサイト名は Rust に固定せず、常駐更新・CAPTCHA の自動解読・ブラウザ識別情報の書き換えは行わない。
+
+- Native の必要時更新は `NAROU_RS_BROWSER_TOKEN=1` の明示 opt-in と `CookieStore::refresh_browser_token` capability に分離する。確認要求を受けた時だけ同梱 helper と一時ブラウザを起動し、トークンだけの私有 JSON をサイズ・期限つきで受け取る。値や子プロセスの出力をログへ流さず、同じログイン ID のトークンだけを原子的に更新し、並行する削除・トークン変更を巻き戻さない。実際の再試行は元のアカウント Cookie を保持する。目次の一連の取得では 1 回、本文は各話につき 1 回まで更新でき、成功ページごとの資格情報再読込は増やさない。既定・Worker の capability は未対応 (`None`) でブラウザを起動しない。
+- Chromium は [`--remote-debugging-port=0` で `navigator.webdriver` を true にする](https://developer.mozilla.org/en-US/docs/Web/API/Navigator/webdriver)。既定のログイン方式は維持し、明示したトークンモードでは空き非 0 ポートを使う。接続先は起動したブラウザ自身の stderr が通知した Browser GUID と照合する。ポート確保後に競合した場合も別プロセスの資格情報を取得せず失敗する。これはトークン有効性やサイト側の個別ルールを断定するものではない。
+- SDK 実行は起動直後の既知の execution-context 切替だけを元の期限内で待ち直し、同じ要求を別オリジンへ持ち越さない。SDK 要求のパラメータは再利用し、CDP の返答も所有権を移して処理する。ブラウザ終了後の Windows ファイル共有違反は有界に待つが、権限エラーや別種の削除エラーは再試行しない。
+
+### RateLimiter
+
+```rust
+pub struct RateLimitScope { pub site: String, pub narou: bool }  // サイトキー（ホスト名）+ なろう系フラグ
+
+pub trait RateLimiter: Send + Sync {
+    fn acquire<'a>(&'a self, scope: &'a RateLimitScope) -> BoxFuture<'a, Result<()>>;
+}
+```
+
+- 現行 `RateLimiter::wait_for_url` / `wait_async_for_url` / `wait` を `acquire` に写像した。native 実装は現行 STATE（ホスト別 next_allowed）を内部に保持。
+- `scope.narou` が true のとき native 実装は `normalize_wait_steps(.., true)`（既定 10）を適用する。なろう系サイトの礼儀を維持するため、downloader は `setting.is_narou` を http_policy ヘルパーへ渡す。
+- core の downloader は `self.rate_limiter.wait_for_url(url)` を直接呼ばず、注入された trait 経由にする（Phase 2 で完了）。
+
+### Clock
+
+```rust
+pub trait Clock: Send + Sync {
+    fn now_utc(&self) -> chrono::DateTime<chrono::Utc>;
+}
+```
+
+- 既存の `chrono::Utc::now()` をすべて置き換えるわけではない（Phase 1 では trait を定義し、テスト容易性が必要な箇所から注入）。
+- `SystemClock` は native / worker 共通で使える（chrono は wasm32 でも動作する）。
+
+### ObjectStore / AssetStore（Phase 4 完了）
+
+```rust
+pub trait ObjectStore: PlatformService {
+    fn stat<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<Option<ObjectMetadata>>>;
+    fn exists<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<bool>>;
+    fn read_small<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<Option<Vec<u8>>>>;
+    fn write_small<'a>(&'a self, key: &'a ObjectKey, data: Vec<u8>)
+        -> PlatformFuture<'a, Result<()>>;
+    fn delete<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<()>>;
+    fn list_page<'a>(&'a self, request: &'a ObjectListRequest)
+        -> PlatformFuture<'a, Result<ObjectListPage>>;
+}
+
+pub trait AssetStore: PlatformService {
+    fn stat<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<Option<ObjectMetadata>>>;
+    fn read_stream<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<Option<AssetStream>>>;
+    fn write_stream<'a>(&'a self, key: &'a ObjectKey, body: AssetStream)
+        -> PlatformFuture<'a, Result<()>>;
+    fn delete<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<()>>;
+    fn copy<'a>(&'a self, source: &'a ObjectKey, destination: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<()>>;
+    fn move_or_copy<'a>(&'a self, source: &'a ObjectKey, destination: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<()>>;
+}
+```
+
+- `ObjectKey` は `/` 区切りのUTF-8 logical key。`Path` / `PathBuf` / Windows drive / UNC は入れない。
+- `read_small` / `write_small` は制御ファイル専用。画像、EPUB、ZIP、PDF等は `AssetStore` の bounded chunk stream を使う。
+- `ObjectListRequest` は prefix + cursor + bounded limit。Novel一覧のsource of truthは `NovelRepository` であり、LIST/HEADをmetadata DBの代わりに使わない。
+- `NativeObjectStore` は `novels/<site>/<subdir>/<title>/...` を既存 `小説データ/<site>/<subdir>/<title>/...` へ写像する。`.narou` Inventoryは対象外。
+- native adapterは `ensure_within_archive_root`、canonicalization、reparse-point検査を維持する。atomic writeとtemp/renameはadapter内部だけで行う。
+- Worker実装は同じlogical keyをS3-compatible keyへ写像できる。moveはcopy+deleteへ実装可能。
+- `GeneratedAssetKey` は将来のtxt/EPUB等の論理identityであり、native subprocess outputのPathをdomain identityにしない。
+
+### NovelRepository（Phase 3 完了）
+
+`NovelRepository` は `PlatformService` を継承し、target-aware な `PlatformFuture` を返す。検索条件はクロージャではなく値として表現するため、将来の D1 実装で SQL の `WHERE` / `ORDER BY` に直接変換できる。
+
+```rust
+pub struct NovelFilter {
+    pub ids: Option<Vec<NovelId>>,
+    pub keyword: Option<String>,
+    pub site: Option<String>,
+    pub domain: Option<String>,
+    pub tag: Option<String>,
+    pub ncode: Option<String>,
+    pub is_narou: Option<bool>,
+    pub suspend: Option<bool>,
+    pub novel_type: Option<u8>,
+    pub end: Option<bool>,
+    pub terms: Vec<SearchTerm>,       // AND; values は OR
+    pub frozen_ids: Option<HashSet<i64>>, // native の freeze inventory hint
+}
+
+pub enum NovelSortKey {
+    Id, LastUpdate, GeneralLastup, LastCheckDate, Title, Author,
+    SiteName, NovelType, Tags, GeneralAllNo, Length, Status, TocUrl,
+    NewArrivalsDate,
+}
+
+pub struct NovelQuery {
+    pub filter: NovelFilter,
+    pub sort: NovelSort,
+    pub offset: usize,
+    pub limit: usize,                // 0 は無効。全件 sentinel には使わない
+}
+
+pub enum NovelMutation {
+    Upsert(NovelRecord),
+    Remove(NovelId),
+}
+
+pub trait NovelRepository: PlatformService {
+    fn get(&self, id: NovelId) -> PlatformFuture<Result<Option<NovelRecord>>>;
+    fn find_by_toc_url(&self, url: &str)
+        -> PlatformFuture<Result<Option<NovelRecord>>>;
+    fn find_by_title(&self, title: &str)
+        -> PlatformFuture<Result<Option<NovelRecord>>>;
+    fn find_by_ncode(&self, ncode: &str)
+        -> PlatformFuture<Result<Option<NovelRecord>>>;
+    fn count(&self, filter: &NovelFilter) -> PlatformFuture<Result<u64>>;
+    fn query(&self, query: &NovelQuery)
+        -> PlatformFuture<Result<Vec<NovelRecord>>>;
+    fn scan_ids(&self, filter: &NovelFilter, after_id: Option<NovelId>, limit: usize)
+        -> PlatformFuture<Result<Vec<NovelId>>>;
+    fn allocate_id(&self) -> PlatformFuture<Result<NovelIdReservation>>;
+    fn release_id(&self, reservation: NovelIdReservation)
+        -> PlatformFuture<Result<()>>;
+    fn apply_batch(&self, mutations: Vec<NovelMutation>)
+        -> PlatformFuture<Result<()>>;
+}
+```
+
+- 表示系は `NovelQuery::page(filter, sort, offset, limit)` を使う。`scan_ids` は `id > after_id ORDER BY id LIMIT n` の keyset pagination で、バックグラウンド一括処理のために使う。
+- `allocate_id` は ID と世代番号を持つ `NovelIdReservation` を返す。呼び出し側で `max(id) + 1` を計算せず、登録前の失敗・キャンセルでは所有する予約を `release_id` へ渡す。解放済みの未登録 ID だけを再利用し、既存レコードや過去に登録された ID を詰め直さない。世代の違う古い解放要求は無効とし、並行取得中の予約を保護する。
+- `apply_batch` は複数の upsert/remove を一回の保存として永続化し、upsert した ID の予約を確定する。SQLite / D1 はレコード公開と予約の削除を同じ transaction / batch で行う。公開済みか曖昧な失敗でもレコードがある ID は再利用しない。
+- `find_by_title` は IndexStore の完全一致を先に使い、見つからない場合は大文字小文字を無視した完全一致へフォールバックする。`find_by_ncode` は `ncode` と legacy な `toc_url` suffix の双方を受理する。
+- Web の検索トークンは `SearchTerm`（field / negated / OR values）へ変換し、AND 条件として repository へ渡す。任意 predicate や `serde_yaml::Value` 条件は使わない。
+
+## 5. native implementation（Phase 1-3 完了）
+
+| 実装 | ファイル | 内容 |
+|---|---|---|
+| `NativeHttpClient` | `src/native/http.rs` | `HttpClient` trait。3-tier（curl→reqwest→wget）・redirect・UA・cookie を維持し、blocking transport は `spawn_blocking` へ隔離 |
+| `RateLimiter` | `src/downloader/rate_limit.rs` | `platform::RateLimiter::acquire` / `complete` を実装。本文受信完了・通信失敗から次の許可まで待機し、なろう系の既定 wait-steps も維持 |
+| `NativeNovelRepository` | `src/native/novel_repository.rs` | stateless adapter。`db::DATABASE` 内の単一 `Database` を共有し、YAML を二重ロードしない。async trait は runtime 内で `spawn_blocking`、CLI は `_sync` entry point を使う |
+
+`NativeNovelRepository` の record 操作は `get` / `find_*` / `count` / `query` / `scan_ids` / `allocate_id` / `release_id` / `apply_batch` に限定する。`IndexStore` の toc URL・タイトル索引は既存 `Database` 経由で維持する。`apply_batch` は一回の `database.yaml` 更新と index flush を行い、unknown fields、`raw_title`、nilable bool、日時型をそのまま保存する。
+
+`Database::id_allocator` は共有 DB ロック内で未登録予約・解放済み ID・世代番号・新規 ID の上限を管理する。Memory repository も同じ allocator を使い、`refresh` は有効な予約を保持して登録済み ID だけを除外する。SQLite / D1 adapter は migration 0013 の `novel_id_reservations` と共通 SQL を atomic transaction / batch で更新する。Downloader は登録に至らない結果から予約を解放し、リダイレクト先が既存作品だった場合も未使用の予約を戻す。
+
+**Phase 2 の注意**: `HttpFetcher`（`src/downloader/fetch.rs`）は削除済み。core の downloader は `Arc<dyn HttpClient>`、`Arc<dyn RateLimiter>`、`Arc<dyn NovelRepository>` を注入され、`http_policy` と repository trait 経由でのみ platform 実装へ触れる。
+
+### Phase 3 で native-only に残したもの
+
+- `Inventory` の設定ファイル、`archive_root`、freeze/lock YAML との atomic 複合更新は Phase 4 の設定/ObjectStore 抽象化対象。`compat::set_frozen_state`、`mark_not_found_and_freeze`、`commands/manage.rs` の freeze 操作は、freeze YAML と record を同時更新するため現時点では native-only のまま。
+- `db::refresh()` は Web の subprocess 実行後に native の共有メモリを再読込するため残す。
+- `remove_migrated_novel_dir` の path 参照判定は `scan_ids` と `get` を使うが、実ファイル削除自体は Phase 4 の ObjectStore 対象。
+
+## 6. Worker implementation（Phase 6 skeleton / Phase 7 adapters / Phase 8 execution）
+
+| 実装 | 技術 | 状態 |
+|---|---|---|
+| portable core crate | `narou_rs` の `worker-runtime` feature | 完了。native-only modules は feature gate |
+| `worker_entry` composition root | `AppServices` + D1 adapters | 完了。production bindings are required |
+| fetch / scheduled / queue handlers | `workers-rs` `0.8.5` event macros | 完了。queue consumerはD1 ledgerとbounded retryを使用 |
+| `worker-build` / Wrangler | `worker_entry/wrangler.toml` | 完了。D1 migrations / Queue producer・consumer / DLQを定義 |
+| `WorkerHttpClient` | Workers Fetch API | 完了。bounded response body、trait future、redirect policyを維持 |
+| `D1ObjectStore` / `AssetStore` | D1 `objects`/`object_chunks` (BLOB + brotli + crc32) | 完了。logical key、paged LIST、small/streaming境界を維持。Wasabi は撤去 |
+| `D1NovelRepository` | D1 prepared statements + migrations | 完了。typed filter/sort、keyset scan、batch mutationをSQLへ変換 |
+| authenticated read-only API | `/health/*`, `/api/novels*` | 完了。`NAROU_ADMIN_TOKEN`をconstant-time比較 |
+
+Production binding setup keeps credentials out of the repository. `worker_entry/wrangler.toml` declares the `DB` binding and `migrations_dir`; set the remote D1 `database_id` in an environment-specific Wrangler configuration before deployment. Object payloads live in the D1 `objects`/`object_chunks` tables (migration 0008), so no external bucket is required. Define `NAROU_ADMIN_TOKEN` as a secret.
+
+`worker_entry/` は fetch / scheduled / queue の3エントリだけを持つ。`composition.rs` が唯一のサービス構成点であり、Worker固有型を application/platform coreへ持ち込まない。
+変換・旧取得 Queue の入口は v2 の `WorkerJobEnvelope { version, job_id }`、取得専用 Queue は v3 の `AcquisitionEnvelope { version, job_id, lane, dispatch_token }` を運ぶ。計画本体は D1 にだけ保存する。旧 v1/v2 の取得配信は取り込み専用の入口から新しいレーンへ移し、旧 Worker 上で取得を続行する互換実行経路は持たない。未知 version・不正 payload は台帳へ記録して安全に ack する。
+
+D1 supports SQLite FTS5, but this adapter intentionally keeps the current
+`instr`-based folded-column search. Native compatibility requires substring,
+field, negation, and status semantics that are not a direct FTS5 mapping, and
+Cloudflare database export requires virtual FTS tables to be recreated. FTS5
+remains an optional later index, not the metadata source of truth.
+
+Shared Downloader portability is preserved at the capability boundary:
+`Downloader::with_platform` consumes the same `HttpClient`, `RateLimiter`,
+`NovelRepository`, and storage traits on native and Worker targets. Worker queue
+execution constructs a fresh Downloader per invocation; bundled site definitions
+are loaded from the Worker bundle rather than a second HTTP stack.
+
+Animated illustrations (Pixiv うごイラ) are assembled by
+`src/illustration_animation.rs`, which decodes JPEG/PNG frames and reads the
+frame archive. Both the `image` codecs and the ZIP reader sit behind the
+`illustration-animation` feature, which `native-runtime` and `worker-runtime`
+both enable. `zip` is pinned to `default-features = false` with the pure-Rust
+`deflate-flate2-zlib-rs` backend, because its default features pull in
+C-backed compressors (bzip2/zstd/lzma) that do not build for
+wasm32-unknown-unknown; with that pinning the assembly runs on the Worker too.
+A build without the feature keeps the downloaded archive and reports the
+archive as unsupported.
+
+Local D1 verification (`wrangler d1 migrations apply narou-rs --local`) applies
+all six migrations. Local smoke checks cover atomic job claiming, retryable
+transition clearing the lease, scheduler generation ownership, and rejection of
+`EXPLAIN QUERY PLAN` uses `novels_ncode_fold_idx` for ncode lookup; status
+search still performs a correlated tag subquery by design.
+This keeps the current search semantics explicit until a derived status key is
+introduced.
+
+Status sorting now uses the derived `novels.status_sort` column from
+`0003_status_sort.sql`; upsert and freeze mutations refresh it in the same D1
+batch. A local `EXPLAIN QUERY PLAN` confirms `novels_status_sort_idx` is used
+for status ordering, while status text search intentionally retains its
+correlated compatibility expression.
+
+`worker-build --release` completes successfully; generated artifacts under
+`worker_entry/build/` are not git-managed.
+- Panic policy: application/platform APIs return `Result`; `worker_entry` does not add a blanket `catch_unwind` or convert panics into success. Runtime event wrappers own rejected-event behavior; HTTP handlers reserve explicit 401/404/405/503 responses for boundary failures.
+- `.github/workflows/platform.yml` は native check/test/clippy、worker-runtime の wasm check、`worker-build --release` を分離して実行する。Clippy は既存コードに多数の警告が残るため、警告は既存 baseline として扱い、段階的に解消する。
+
+検証コマンド:
+
+```text
+npx wrangler dev（cwd: worker_entry、ローカル確認時）
+cargo check --workspace --all-targets
+cargo check -p narou_worker --target wasm32-unknown-unknown
+worker-build --release（cwd: worker_entry）
+```
+
+## 7. data flow（目標形）
+
+```text
+CLI (main.rs)
+  └─ command 層 (commands/) ──> core service (Downloader / Converter / NovelService)
+                                    │  │  │  │
+                          HttpClient  ObjectStore  NovelRepository  RateLimiter  Clock
+                                    │  │  │  │
+                    ┌───────────────┘  │  │  └─────────────┐
+              native impl        worker impl           mock impl (tests)
+
+Worker (worker_entry)
+  └─ fetch / scheduled / queue ──> 同じ core service
+```
+
+- `update_novel` の business logic は core に一つだけ（`Downloader::download_novel_with_force` を service 化するのは Phase 2-3）。
+- download の flow: `parse → fetch（trait 経由）→ diff（core）→ persist（ObjectStore / Repository 経由）`。
+
+## 8. dependency direction
+
+```text
+禁止: core → native / worker / reqwest / curl / std::fs / std::process
+許可: core → platform (traits) / serde / chrono / regex / pest / tracing / thiserror
+許可: native → platform + reqwest + curl + std::fs ...
+許可: worker → platform + worker crate + aws sdk ...
+```
+
+- `platform/` から native 固有型（`reqwest::Response`, `curl::Easy`, `std::path::Path`）を trait interface に漏らさない。
+- `NarouError` は `reqwest::Error` の直接 `#[from]` をやめ、`Platform(String)` + context に置き換えた (Phase 1 で実施済み)。
+
+## 9. migration phases
+
+| Phase | 内容 | 完了条件 |
+| 1（完了） | `src/platform/`（traits + mocks）作成、`NarouError` の reqwest 直依存除去、native ラッパ | build / test / clippy 通過。外部挙動変化なし |
+| 2（完了） | downloader を trait 利用へ（fetch_text/fetch_bytes/resolve_final_url を HttpClient 経由に） | downloader から blocking HTTP 直呼びを排除（native 実装内部を除く） |
+| 3（完了） | async `NovelRepository`、typed filter/sort/query、keyset `scan_ids`、atomic ID reservation、batch mutation | native YAML compatibility、Memory/mock、Downloader injection、Web list pagination-ready |
+| 4（完了） | async `ObjectStore`/`AssetStore`、logical key、NativeObjectStore、downloader persistence、illustration/converter境界 | native compatibility、Memory/native persistence tests、core主要content FS除去 |
+| 5（完了） | Web UI service 層化 | Web固有のDB/FSアクセスがapplication service経由 |
+| 6（skeleton 完了） | Worker backend skeleton（`worker_entry` + feature 分離 + Wrangler） | workspace native check、portable wasm check、`worker-build --release` が通る |
+| 7（完了） | D1 NovelRepository / D1 ObjectStore / Worker fetch | authenticated read-only API、D1 prepared query/mutation、D1 object storage |
+| 8（実装完了） | Queues / crawler / scheduling（Cron + Durable Object） | D1 ledger lease、bounded retry、論理 generation cursor、section checkpoint resume、サイト単位 rate limit |
+
+各 Phase 終了時: `cargo build && cargo test && cargo clippy`。
+
+### Phase 4 実装メモ
+
+- `src/downloader/persistence.rs`: pure codec (`serialize_*` / `deserialize_*` / hash / default text) と `PersistenceService` に分離。section、TOC、raw、setting、replace、cacheをObjectStoreへ保存する。保存時刻は `Clock` 注入。
+- `src/native/object_store.rs`: `novels/<site>/<subdir>/<title>/...` を既存 archive root 以下へ写像。small objectは16 MiB上限、assetは64 KiB chunkのstream。root traversal、絶対/UNC、reparse-point escapeを拒否する。
+- `src/native/legacy_persistence.rs`: CLI/WebのPath互換API、legacy filename scan、atomic file wrapperをnative-onlyへ隔離。既存layoutの移行は不要。
+- `src/illustration_store.rs`: `IllustrationIndex`（透明serdeでlegacy cacheをbyte-compatibleに保つpure metadata型）と `IllustrationStorageService` を追加。blob write成功後にcache indexを更新し、未知画像ごとのexists/HEAD loopを要求しない。既知cache mappingは欠損blobをrepairするため単一statを許可する。legacy `IllustrationStore` のmigration/orphan scanはnative compatibility APIとして残る。
+- `src/converter/mod.rs`: pure変換は維持。生成txt、section convert cache、既存画像legacy localizationはnative presentation。illustration localizationを使う場合は`ConverterCapabilities`へ`HttpClient`、`RateLimiter`、`ObjectStore`、`AssetStore`、pure `IllustrationIndex`、logical prefix、必要なら`NovelRecord` resolverを明示注入する。
+- `src/native/converter.rs`: zero-argument `NovelConverter::new` / `with_user_converter` のnative capability wiringを隔離。converter coreからNativeHttpClientを参照しない。
+- `src/native/downloader.rs`: `Downloader::new` / `with_user_agent` / `with_platform` のnative HTTP、repository、ObjectStore wiringを隔離。coreのfilesystem-free constructorは`with_platform_and_storage_and_settings`。
+- 通常download/update pathのObjectStore callsiteは `PersistenceService::{load_toc,save_toc,load_section,save_section,save_raw}` と `IllustrationStorageService::store_bytes`。`exists`をsection loopの判定に使わず、TOC metadata + section readで解決する。`list_page`はNative compatibility testと将来のmaintenance用途のみ。
+- `MemoryObjectStore` はasync small API、paged list、delete、chunked AssetStore fakeを提供する。`NativeObjectStore` compatibility testsはTOC/section/raw/setting/replace/cache/illustrationと既存legacy sectionを確認する。
+- Inventory/settings、site definition loader、Web固有Path API、downloader info cache、converter/settings/ini/inspector/user-converter/section-convert-cache、converter/device subprocess/tempdir、backup/update/loggerはObjectStoreへ統合しない。これらはconfigurationまたはnative-only capabilityであり、Phase 5/6の境界として明示する。
+
+### Phase 8 実装境界（Worker Queue / crawler / scheduler）
+
+- Queue は1メッセージを1つの台帳 job ID として扱う。取得は v3 の lane / dispatch token で配信先を fence し、変換は既存の v2 envelope を維持する。複数小説を1 payloadへ詰めず、サイズ上限と再試行回数を明示する。
+- D1のjob ledgerをsource of truthとし、enqueue前にidempotency keyを確定する。`pending` / `running` / `succeeded` / `retryable` / `partial` / `permanent` / `blocked` を永続化し、再配信はledger遷移で冪等化する。
+- 取得用 consumer は結果・継続・再試行予定を D1 へ永続化してから現在の配信を ack し、実行枠・メモリ枠の解放後に共通 dispatcher が次の v3 配信を予約する。通常の失敗回数と回復回数を混同しない。
+- 有効な実行の重複配信・古い dispatch token は取得を始めず ack する。別の所有者の予約・リースは変更しない。DLQ は運用上の退避先で、通常 consumer が中身を直接取り出さない。
+- 同一サイトの取得間隔はサイト単位の Durable Object へ集約する。実際の送信前に許可を確認し、本文の受信完了・通信失敗後に `RateLimiter::complete` で次回許可時刻を更新・保存する。caller は `worker::Delay` 後に再確認し、通信時間を待機時間に含めない。`SiteRateLimiter` 自身は alarm を使用しない。別サイトの許可と作品間の開始基準の `update.interval` は独立して進める。
+- Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。Cron発火時刻をgenerationとして保存せず、D1が管理する論理generationとkeyset cursorをplanner lease付きで再開する。
+- Worker crawler は話の開始前と未取得画像の直前で実行予算を確認する。画像取得中の中断では挿絵索引を保存し、section 単位の checkpoint は未完了の話を指す。次回 claim 時に checkpoint の job/novel identity を検証し、完了した話の prefix を ObjectStore から復元する。同じ話の保存済み画像は索引で読み飛ばして残りを取得する。prefix が欠損する場合は section 0 から安全に再開する。
+- Budget による話・画像境界の yield は失敗 retry ではない。checkpoint を D1 へ保存して同じ job を `pending` へ戻し、本文処理・実行枠・メモリ枠の解放後に新しい配信トークンで再割当する。`attempts` を消費せず、旧配信による二重実行は台帳の予約・token で防ぐ。
+- 継続通知の送信は既存 job ID の envelope 再送だけとし、台帳への新規 enqueue は行わない。yield の記録と送信の間に clear/cancel が入っても tombstone を保持し、別 ID の実行を作らない。滞留回収は `attempts > max_retries` だけを上限超過と扱い、初回を含む失敗回数と追加 retry の回数を混同しない。
+- HTTP 等の通常の retryable エラーも最新の話境界を保存してから失敗記録へ進む。境界は 100 話未満でも保持し、非同期の定期保存を回収してから execution token で fenced な最終書込みを await する。予算による yield とは区別し、通常の attempts / retry-backoff を消費する。破損 prefix から再開始するときも旧保存を回収し、位置 0 と同じ実行文脈を以後のダウンローダへ渡す。本文に続いて dirty な挿絵索引も通常エラー時に保存するため、再試行は保存済みデータを再利用できる。
+- `Convert` / `Send` / `Mail` / `Backup` の重いnative処理はWorkerで実行せず、blockedとしてledgerへ記録する。Worker APIは既存read APIと分離し、認証・binding readiness・失敗分類を明示する。
+
+### Phase 8 運用ポリシー
+
+- 取得用 Queue は4つの専用 script に分離し、各 script の batch / concurrency は1とする。D1 の空きレーン予約が最大4系列を選び、同一系列・同一作品の予約と実行を排他する。管理・変換・EPUB 配信の isolate と取得のメモリ枠を共有しない。
+- 一時エラーは台帳の `attempts` を増やし、`queue.max-retries` と `queue.retry-backoff` に従った期限まで待機する。取得の再試行は物理 Queue の retry ではなく、期限後の新しいレーン割当で行う。上限到達後は `permanent` にする。
+- `worker_acquisition_lanes` の配信リースが失効した場合、実行側にも有効な lease が無いことを確認してから予約を回収する。実行・配信喪失は独立した `recovery_attempts` を消費し、checkpoint の実際の進展だけで予算を戻す。キャンセル後も生きている実行から枠を奪わない。
+- 未 claim の予約 (`pending` / `retryable` かつ execution token 無し) は、待機取消の tombstone と同じ D1 batch 内で解放する。配信済みメッセージの再到着を待たず、単体取消後は空き枠を再配信する。実行中・中止処理中の所有権には触れず、古い v3 配信は token で拒否する。
+- 変換の v2 Queue は既存の bounded retry / 滞留回収を維持する。cron の一般回収は取得レーンの予約行に干渉せず、古い回収スナップショットによる CAS も新しい予約を上書きしない。
+- cron の重い計画・回収中は変換を再配信しない。失われた変換配信は D1 の admission 待機へ戻し、計画が失敗した場合もメモリ枠を解放してから共通の待機変換 dispatcher を呼ぶ。cron 中に届いて容量待ちへ戻された変換を、次の cron でも同じ状態へ戻し続けない。
+- 待機前に系列と正規化対象を保存する。`GET /api/jobs/:id` は任意の診断項目 `site_key`・`normalized_target`・`waiting_reason`・`acquisition_lane` を返し、サイト排他待ち・空き枠待ち・配信待ち・容量待ちを区別できる。配信 token は公開しない。
+- 移行順は D1 migration `0020_acquisition_lanes.sql` → 同じ成果物の4取得 script → 管理 script → 配信 script。既存の旧 Queue / DLQ / Secret は削除せず、残った取得配信は取り込み専用 consumer が新レーンへ移す。
+- 初回は共有 DO 所有者が未作成なので、CI が非公開・consumer / cron 無しの管理 script を同じ成果物で bootstrap してから4取得 script を配備する。既存の管理 script は置換しない。[Script Settings API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/settings/methods/get/) の 404 かつ Workers の未存在コード `10007` だけを未配備と扱い、認証失敗・通信失敗・不明な応答は中止する。bootstrap 設定は終了時に削除する。
+- Worker のサイト単位 rate limiter は Durable Object 1 instance をサイトごとに
+  使用する。`acquire` の許可後、実 HTTP 試行の本文受信完了・失敗で `complete`
+  を通知し、次回許可までの間隔を完了時点から計算する。リダイレクトと
+  Fetch / socket / relay の切替も試行ごとにこの境界を通り、完了通知の保存に
+  失敗した場合は次の送信へ進めない。`SiteRateLimiter` は alarm を使わず、
+  caller が `worker::Delay` 後に再確認する。設定の `download.interval` /
+  `download.wait-steps` とサイトの `min_interval` は native と同じ規則を使う。
+- Worker の `Downloader` は `DownloaderSettings` を Inventory から読めないため、
+  `with_platform_and_storage_and_settings` に bundled site definitions と空の
+  hash cache を注入する。`download.use-subdirectory`、`guard-spoiler` などの
+  利用者設定を Worker へ移植する場合は、D1 settings の明示的な読み取りと
+  composition 層での注入を追加し、native の global/local 設定を暗黙に参照しない。
+
+## 10. breaking internal APIs（許可された破壊的変更）
+
+- `NarouError::Http(#[from] reqwest::Error)` → 廃止。`Platform(String)` 等へ。`#[from]` を外すため `?` での暗黙変換は消え、`map_err` が必要になる箇所が増える。
+- `NativeHttpClient` のcurl/reqwest/wget tier fallback stateはnative transport内に閉じ、coreから直接参照しない。
+- `db::with_database` / `with_database_mut` / `all_records` は core の NovelRecord 操作では使わない。native repository 内部、Inventory/settings、archive-root、freeze YAML との atomic 複合操作、テスト fixture のみ残る。
+- `RateLimiter::wait()` 等の同期メソッドは native 内部用として維持し、core は async trait 経由にする。
+
+## 11. preserved external compatibility（守るもの）
+
+- CLI コマンド・引数・エラー文・終了コード（narou.rb 互換）
+- `.narou/` 配下の全ファイル形式（database.yaml / local_setting.yaml / queue.yaml / alias.yaml / freeze.yaml / tag_colors.yaml / latest_convert.yaml / notepad.txt / section_hash_cache）
+- `webnovel/*.yaml`（ユーザー編集可能な site 定義）
+- `小説データ/` ディレクトリレイアウト（`novel_dir_for_record` のまま）
+- converter 出力（byte-for-byte parity fixture: カクヨム 25,273 行等）
+- Web UI の外部仕様（API エンドポイント・レスポンス形式）
+- hidden setting 群
+
+## 12. unresolved issues
+
+1. **~~`HttpFetcher` の tier fallback をどこに置くか~~（解決）**: transport（trait 実装）と policy（core）を分離した。tier fallback のステート（`tier_failures` / `prefer_curl`）は `NativeHttpClient`（`src/native/http.rs`）の `Arc` 共有フィールドとして native 側に残る。core は `http_policy` ヘルパー経由でしか HTTP に触れない。
+2. **`NarouError` の variant 追加方針**: `reqwest::Error` を String 化すると原因追跡が落ちる。`Platform { context: String, source: Option<String> }` 的な形を検討。curl の `Error` / wget の `io::Error` も同様に String 化してよいか要判断。
+3. **~~`std::thread` / `mpsc` の扱い~~（一部解決）**: core からは排除した。update.rs の domain 別並列 worker は `tokio::spawn` に移行済み。mail.rs は native 専用として残す。
+4. **`Clock` の導入範囲**: 全 `chrono::Utc::now()` を置き換えると変更が膨大になる。テスト容易性が必要な箇所（crawler / scheduler / 更新判定）から段階的に注入する。
+5. **~~wasm32 での chrono~~（解決）**: `worker_entry` は `chrono` + `chrono-tz` のまま wasm32-unknown-unknown で `worker-build --release` まで通っている (worker_entry/Cargo.toml)。
+6. **~~`webnovel/*.yaml` の loader~~（判断済み）**: loader (`site_setting/loader.rs`) は trait 化せず native のまま。Worker ではバンドルされたサイト定義を Worker bundle から読む (`composition.rs` 側)。
+7. **`illustration_store.rs` の扱い**: 現行legacy filesystem APIはnative互換層として維持し、新規binary保存は`IllustrationStorageService` + `AssetStore`へ移行した。pure index型の完全分離は既存cache APIとの互換制約が残るため、後続で段階的に分離する。
+8. **queue.yaml の atomic write**: `db::inventory` の atomic write は native の fs2 lock + tempfile に依存。Worker では D1 + Queues が置き換えるため、queue 永続化層は Phase 8 で再設計。
+9. **logger**: tracing subscriber は native / worker で切り替える。`logger.rs` のファイル出力は native 専用にできる。Phase 1 では触らない。
+10. **`converter/mod.rs` のcurl直接使用**: 解消済み。挿絵fetchは`ConverterCapabilities`の`HttpClient` / `RateLimiter`経由へ移行し、native wiringは`src/native/converter.rs`に隔離した。
+11. **`web/misc.rs` / `web/update.rs` の async reqwest**: 自己更新・GitHub API は native 専用パスとして残置（Phase 2 の対象外）。
+
+## 共有層（native と Worker で 1 実装）
+
+外部挙動を揃えるため、native 専用層にあったロジックを可搬層 (`src/application/`, `src/login/`, `src/downloader/`) へ
+移し、両ビルドから同じコードを呼ぶ。現行の共有境界:
+
+| 共有モジュール | 共有しているもの |
+|---|---|
+| `application::settings_view` | 設定ページの JSON（タブ・項目メタデータ・置換設定・`object_id` ではなく表示用の値） |
+| `application::web_payloads` | 一覧 API の入出力型（`ListParams` / `NovelListResponse` / `NovelListItem` / `ApiResponse`） |
+| `application::version_compare` | バージョン比較（自己更新と `/api/version/*`） |
+| `login::transfer` / `login::crypto` | ログイン書き出しの解析・グループ化・Argon2id 復号・鍵解釈（`parse_key_base64` は 32 バイトそのまま／16 バイト以上は SHA-256 展開） |
+| `downloader::resolve_user_agent` | UA 解決（native はランダム、Worker は既定ブラウザ UA） |
+| `application::messages` + `MessageSink` | ジョブ実行系コマンドの文言。native は stdout/stderr、Worker は PushHub への `echo` に流す（失敗行は両方 `  Error: …`） |
+| `application::aliases` | エイリアス解決（表の読み込みだけが native=Inventory / Worker=app_state と異なる） |
+| `author` / `application::authors` | URL → サイト名の保存 codec、`AuthorStore` port、登録・一覧・URL 単位の解除、実効 YAML による作者認識と管理済み作品の除外。native は Inventory 原子更新、Worker は primary D1 の全 snapshot CAS |
+| `NovelRepository::contains_toc_urls` | 入力順を保持した管理済み URL 判定。native は共有 DB 索引、D1 は `json_each` と URL 索引による bounded batch を使い、作者確認のために全作品レコードをロードしない |
+| `platform::*` + `downloader::http_policy` | HTTP の decode/status/redirect ポリシー（アダプタは transport だけを持つ） |
+| `platform::http1` | HTTP/1.1 のリクエスト生成と応答解析（Byte 指向・依存なし）。wasm 専用クレート内のテストは実行されないため可搬層に置き、Worker のソケット transport が使う。native は curl/reqwest があるため未使用 |
+| `HttpClient::send_paced` / `HttpPacing` / `RedirectChain` | リダイレクトの方式・資格情報・リクエスト本文の規則と、実送信ごとのサイト待機。transport の切替でも permit を省略しない |
+| `ObjectStore::update_small` / `application::novel_settings` | 新しい保存値に対する原子的 INI patch と正確な保存 ACK。native FS のロック、SQLite の transaction、D1 の全 raw snapshot CAS はアダプタで実装する |
+| `application::settings` / `setting_core` | 変更項目の初期値照合、型変換、部分保存、device 派生設定。JSON の整数表記と浮動小数設定の比較も同じ規則で扱う |
+| `application::retry_policy` / `application::push_events` | リトライ設定と backoff、ジョブ進捗・終端・設定変更イベントの JSON |
+| `application::messages::MessageContext` / `progress` | future の poll ごとに出力・詳細ログをジョブへ結び、操作 ID と更新番号で並列進捗を分離する |
+| `epub_lite::EpubPreparation` / `EpubBuild` | 入力解釈、逐次 `AssetPlan`、画像処理条件、連番への参照書換え、表紙、メタデータ、CSS / フォント資産と書き出し |
+
+### Worker の取得段（2026-09-27）
+
+`worker_entry/src/http.rs` は `fetch` を第一段とし、**403 を返した GET に限り** `connect()`
+（`cloudflare:sockets`）で取り直す。理由は実測で、`fetch` は Cloudflare の公開 IP レンジから、
+`connect()` は公開レンジ外のプレフィックス（実測 `104.28.157.13`）から出るため、Cloudflare の
+レンジを弾くサイト（例: CloudFront 配信のカクヨム）でも後者なら 200 が返る。ソケット側で
+2xx/3xx または既知のブラウザ確認応答が得られたときに採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。確認応答を元の 403 で隠さない。
+**全アドレスが Cloudflare の公開レンジ内にあるサイト（例: ハーメルン）は `connect()` 自体が
+ランタイムに拒否される**ため、別の出口 IP を持つ外部の踏み台（取得リレー）が別途必要。
+
+#### 3 段目: 外部リレー
+
+Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト向けに、外部の取得リレーを
+3 段目に持つ。リレーのホスティングと配置・更新は、本体の CI から独立して管理する。
+
+- リレーはワークスペース crate **`relay/`** のバイナリ **`narou_relay`**（Rust）。
+  旧 Node 実装 (`scripts/relay/*.mjs` / `relay.js` / `worker/`) は削除した。
+- プロトコルは旧版と同一で、クライアント側は `src/platform/relay.rs`。`POST /proxy` の
+  JSON 本文で `url` と `headers` を送り、`X-Proxy-Token` で認証する。GET も受け付けるが、
+  Cookie 等を URL に載せない。応答は `{status, contentType, location?, setCookie, via, body(base64), wafAction?}`、
+  エラーは `{"error": "..."}`。`GET /health` は認証不要で
+  `{"ok":true,"fetch":"curl,wget"}`（実際の解決済み取得順）を返す。任意の `wafAction` は JSON と NRS1 の両形式で同じ `x-amzn-waf-action` を伝える。フィールドが無い旧応答も読めるが、旧リレーが落としたヘッダはクライアントだけの更新では復元できないため、この判定を使う配備ではリレーも更新する。
+- `worker_entry/src/http.rs` は既存の `with_relay` と、Worker の通常の fetch サブリクエスト
+  （`send_fetch_hop`）で送信する。サイト定義のヘッダを転送し、返ったリダイレクトは
+  呼び出し側の共通 `RedirectChain` が検証する。
+- 応答の JSON/base64、全 `Set-Cookie`、ステータス、本文・メタデータの上限は従来どおり。
+  踏み台自身はリダイレクトを追跡せず、本文の途中切れを成功として返さない。
+- Worker の設定は `NAROU_RELAY_ENDPOINT` と `NAROU_RELAY_KEY`。両方が揃ったときだけ有効。
+  接続先は `https` を必須とし (ループバック `127.0.0.1` / `::1` / `localhost` のみ `http` 可)、
+  スキーム省略は受け付けない。パスを含んでもオリジンに正規化して `/proxy` へ送る。
+  未設定・不正値ならリレー段は無効 (fail closed) で、取得できないサイトが残り得る。
+
+#### リレーのトランスポート
+
+リレー自身は TLS / HTTP の実装を持たず、**システムの `curl` / `wget`** に委ねる
+（Node の HTTP クライアントによる代替経路と fetch ランタイム版は廃止）。
+
+- 取得順は `NAROU_RELAY_FETCH`（`curl` / `wget` のカンマ区切り、既定 `curl,wget`）。
+  使えない wget は起動時に外れ、`/health` の `fetch` と起動ログに出る。未知の名前は起動エラー。
+- `curl` は検証済みアドレスへ `--resolve` で接続先を固定する。
+- `wget` は HTTPS のみ。検証済み IP へ接続する使い捨て CONNECT プロキシを 127.0.0.1 に立て、
+  TLS の SNI・証明書検証は wget に任せる（`--resolve` 相当が無いため）。HTTP 対象は curl が扱う。
+- **セキュリティ不変条件**（旧版から維持）: 許可ホストの完全一致のみ、DNS 応答の全アドレス検証と
+  接続先固定、リダイレクトを追わない、TLS は curl / wget が検証（任意の `NAROU_RELAY_CACERT` で
+  既定ストアを置換）、起動時の CA バンドル検証は fail closed（`relay/src/ca.rs` の SHA-256 指紋
+  デナイリスト）、1 リクエストにつき上流取得 1 回、全体 75 秒の期限とクライアント切断で
+  curl / wget の子プロセスを中断。
+- **サーバー側の防御**: 認証は本文読み取りより先に行い、未認証・`/proxy` 以外・不正メソッドは
+  本文を読まずに 4xx で閉じる（75 秒期限まで接続を保持させない）。同時接続数には上限
+  （128）を設け、完了した接続タスクは accept ごとに回収する（`JoinSet` の無制限保持を防ぐ）。
+  wget 経路はローカル CONNECT プロキシのトンネル確立を確認してから応答を採用する。
+  `NAROU_RELAY_CACERT` 未設定時は起動時に、侵害ルート検査が無効である旨を警告する。
+- 外部 npm 依存は無い。ビルドは `cargo build --release -p narou_relay`。
+
+#### デプロイ先
+
+- **VPS リレー**: [`relay.md`](../relay.md)（現行デプロイ `relay.rumia-ch.uk`）と
+  [`vps-relay.md`](vps-relay.md)（一般手順）。systemd で `target/release/narou_relay` を常駐させる。
+- **自宅回線リレー**: [`home-relay.md`](home-relay.md) と `scripts/relay/home-relay.ps1`。
+  Windows で `narou_relay` と cloudflared クイックトンネルをまとめて起動する。
+- Cloud Run / SORAHOST へのリレー配備は 2026-10-21 に非推奨として廃止し、配備スクリプト・
+  ドキュメント（`scripts/relay/bootstrap.mjs` / `deploy-sorahost.mjs` / `relay.js` /
+  `docs/cloud-run-relay.md` / `docs/sorahost-relay.md`）も削除した。
+- 本体 CI はリレーのホスト作成・配備・認証確認を行わない。
+
+**配備先ごとの差はコードに持ち込まない。** 待受と `.env` の解決は `relay/src/config.rs` が
+吸収する（`PORT` → `SERVER_PORT`、`NAROU_RELAY_HOST` の既定は `K_SERVICE` の有無で
+`0.0.0.0` / `127.0.0.1`、`.env` は `NAROU_RELAY_ENV_FILE` → 実行時 CWD → バイナリの隣 →
+`$HOME`。既存の環境変数が最優先）。サーバー実装にホスト固有の分岐は足さない。
+
+GitHub の `Cloudflare` 環境には同名の Secret `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` を置く。`RELAY_DOMAIN`（例 `relay.example.com`）を置いた場合は `NAROU_RELAY_ENDPOINT` より優先して `https://<RELAY_DOMAIN>` を Worker secret に使う（`worker_entry/ci/deploy_worker.py`）。
+本体 CI はこれらを Worker に渡すだけで、リレーのホスト作成・配備・認証確認は実行しない。
+旧 `SORAHOST_PROXY_*` からの別名参照は無いため、切り替え前に新名へ設定する。
+既存のサービス・Secret・ローカル資格情報は、ソース変更によって自動削除しない。
+
+#### リレーの認証と手動確認
+
+| 向き | 設定・契約 |
+| --- | --- |
+| Worker → リレー | `NAROU_RELAY_ENDPOINT` のオリジンへ `X-Proxy-Token: <NAROU_RELAY_KEY>` を送る |
+| リレー側 | 同じ `NAROU_RELAY_KEY` と照合。不一致は 403。リレーは鍵未設定なら起動しない |
+| 死活確認 | 鍵を設定して起動したリレーの `GET /health` は認証なしで 200 `{"ok":true,"fetch":"<取得順>"}` |
+
+合言葉がずれるとリレーは拒否し、Worker は元の取得結果へ戻るため、一部サイトの取得失敗として
+現れる。配置後は接続先と合言葉を環境に設定して手元で確認する:
+
+```sh
+python3 scripts/relay/verify_auth.py
+```
+
+このコマンドは `/health`、誤った合言葉での 403、正しい合言葉での取得を確認する。
+取得先は `NAROU_RELAY_PROBE_URL`（未指定なら `NAROU_RELAY_ALLOWED_HOSTS` の先頭ホスト）、
+制限秒数は `NAROU_RELAY_TIMEOUT` で変更できる。
+到達不能・想定外のステータスは fail closed（exit 1）として扱い、3xx は追跡しない
+（`X-Proxy-Token` を別オリジンへ再送しないため）。公開エンドポイントは `https://` のみ受け付け、
+平文 HTTP は loopback のローカル確認だけ許可する。
+
+リレーのテストは Rust で、`cargo test -p narou_relay`（ワークスペース CI は
+`cargo test --workspace`）が実 HTTP 契約・許可リスト・DNS・認証・TLS・上限・中断を検証する。
+旧 `node tests/run-relay.mjs` と `tests/relay*.mjs` は削除した。
+手動の単体起動は鍵と許可リストを設定して `cargo run --release -p narou_relay` を使う。
+平文 HTTP では認証・Cookie も平文で流れるため、公開運用では HTTPS を使う。
+
+### 操作ごとのメッセージ（native CLI / Worker Web コンソール）
+
+文言は `src/application/messages.rs`（および `messages::jobs`）が唯一の出所。native は端末へ、
+Worker は `PushHubSink` 経由で Web コンソールの `#console` へ流す。**通常のメッセージもエラー行も
+`Stream::Stdout`**（native がエラーを stdout に出しているのに合わせる。Web UI は `target_console`
+が `stdout` 以外だと 2 番目のコンソールへ回すため）。
+
+Worker の重い処理から出す進捗は、容量制限付きの送信処理を `await` して順序を保つ。
+行ごとに独立した `spawn_local` を増やす方式は使わず、受信側が遅ければ生産側も待つ。
+ジョブ境界の `drain()` は残りを送り、ジョブの終端イベントより先にコンソール行を届ける。
+行を捨てたり、完了まで全件を蓄積したりして容量を抑える方式にはしない。
+
+| 操作 | メッセージ（例） | native | Worker | タイミング |
+|---|---|---|---|---|
+| download | `ID:n <title> のDL開始` / `第N部分 <subtitle> (n/m)` / `… のDL完了` | ✅ | ✅ `emit_download_result_lines` | DL開始・各話・完了 |
+| update | `更新を開始します（N件を…で処理）` / `… を更新しました` / `更新はありません` / 中断・失敗行 | ✅ | ✅（開始は API の enqueue 時、結果はジョブ実行時） | 開始・結果 |
+| convert | `変換処理開始: …` / `[1/1] 処理中: …` / `novel.txt を出力しました` / `変換処理完了: …` | ✅ | ✅ `emit_convert_item_lines` | 開始・進捗・完了 |
+| ダウンロード後の自動変換 | 再変換の通知（`前回変換失敗した小説の再変換…` 等）／enqueue 失敗行 | ✅ | ✅ | 変換ジョブ投入時 |
+| 予算切れ・チェックポイント無効 | `budget_expired_partial` / `resume_checkpoint_invalid` | ✅ | ✅ | ジョブ中断時 |
+| auto-update（スケジューラ） | `自動アップデートが予定されています` / catch-up 実行 | ✅ | ❌ 文言は `messages::jobs::*` に用意済みだが、Worker の planner には投稿点が無い（既知の差分） | 予約・実行 |
+| send / mail / backup | 各種 | ✅ | ❌ Worker では実行不可（サブプロセス・シリアルメール前提） | — |
+
+### 意図的に分ける I/O アダプタ
+
+| 境界 | native | Worker | 共通規則 |
+|---|---|---|---|
+| HTTP transport | curl / reqwest / wget と DNS 検証 | Fetch / connect / リレーと egress | URL 構文・リダイレクト・実送信の待機・応答解釈 |
+| 管理・本文・設定の永続化 | Inventory / FS / SQLite | 管理・目次・本文参照は D1、本文・履歴は話単位の圧縮 S3（移行までは旧 D1） | typed repository、設定 patch、codec、CAS、保存 ACK |
+| 大きな挿絵 | FS ミラーまたは S3 | S3 または D1 | logical key、bounded AssetStore、画像計画・処理 |
+| ジョブの配送 | PersistentQueue / 子プロセス | Queues / D1 ledger | 計画・retry policy・操作メッセージ・push payload |
+| 外部プロセスとローカル操作 | device / send / mail / folder 等 | capability と 501 で拒否 | 対応状況と UI の実行制限を明示 |
+| ログと画面への配送 | lib の logger / ConsoleSink | PushHubSink / Durable Object | MessageContext、操作 ID、順序、コンソール履歴の表示世代 |
+
+## SQL アクセスの調査・最適化（2026-11-03）
+
+### 実測と修正
+
+本番 D1 の Query Insights では、24 時間の読み取り約 60.7 億行のうち約 58.5 億行が
+`worker_ledger::select_waiting` に集中していた（5,768 回、平均約 2.3 秒）。
+管理 API の読み取りも D1 の CPU 超過リセット（7429）で失敗し、Worker tail では
+`asset_backend` の読み取り失敗による Queue invocation の例外を確認した。
+個々のリセットを起こした SQL の実行ログまで結び付いたものではないが、この待機選択が
+主要な負荷源であることは読み取り統計とローカル再現の双方で確認している。
+
+| 経路 | 問題 | 修正・維持する契約 |
+|---|---|---|
+| Worker の待機選択・claim | 各候補の相関サブクエリが過去の permanent 行まで再走査 | 所有者を `AS MATERIALIZED` で一度取得し、`worker_jobs(status,execution_token,lease_until)` で token のない履歴を除外。サイト・作品の排他と中断中の token / lease を維持 |
+| Worker 待機の作品 ID 解決 | URL / N コード候補と所有者の組み合わせごとに全作品を走査 | URL・N コード・任意の `/` 区切り URL suffix を SQL 内で一度 materialize し、一時索引で照合。複数一致時の最小 ID、数値 ID、末尾 slash の解釈を維持 |
+| Native / D1 オブジェクト一覧 | 全件取得後にメモリでページを切り出す。Native は任意 prefix の OR で全索引走査 | `db::object_query::LIST_PAGE_SQL` に exact key と子キーの索引範囲・cursor・limit + 1 を集約。DB 優先の FS 統合を維持 |
+| 共通タグ検索・非表示 | 作品ごとの相関タグ照合。既存索引は case-folded タグ用 | タグから ID を選択。`novel_tags(tag,novel_id)` / `novels(attribute_tag,id)` を追加。完全一致と属性有効設定を維持 |
+| Native 作品保存 | 1 件の編集でも全作品とタグを再書き込み | SQL の NULL-safe 比較で未変更 upsert を省略し、タグ・status の再構築も変更行だけに限定。予約確定は省略しない |
+| Native 本文ミラー | 毎変換で全 section link を DELETE / INSERT | 削除した idx だけを除去し、subtitle / body_hash の変わった行だけを UPSERT。本文 dedup と履歴復元の transaction を維持 |
+| Worker 仮想属性 | 複数の参照から同じ分類 CTE を再評価 | 分類 CTE を一度だけ materialize。混合作品の手動属性と欠落メンバー時の値を保持 |
+
+制御したローカル SQLite fixture での計測（VM ステップは約数、D1 の課金行数とは別物）:
+
+| 条件 | 修正前 | 修正後 |
+|---|---:|---:|
+| 終了履歴 30,000 件・待機 1,000 件、待機選択 1 回 | 150,074,000 ステップ | 67,000 ステップ |
+| 他 prefix 30,000 件・対象 1,000 件、後半の 21 件取得 | 284,000 ステップ・1,000 行取得 | 500 ステップ・21 行取得 |
+| 30,000 作品のうち 1 作品だけの完全一致タグ | 360,000 ステップ | 100 ステップ未満 |
+| 2,000 メンバー × 20 仮想小説の属性整合 | 643,000 ステップ | 322,000 ステップ |
+
+Native の索引追加は migration `0015_query_indexes.sql`、Worker は `0016_query_indexes.sql`。
+削除や形式変更ではなく索引の追加で、Native は通常起動時、D1 は配備時の既存 migration 経路で適用する。
+Native の作品スナップショットは全件を読む従来 API のままであり、全件読み取りそのものを
+廃止したわけではない。省くのは変更のない行と索引の再書き込みである。
+
+### 実データでの追加検証
+
+本番 D1 から `novels` / `novel_tags` / `worker_jobs` だけを読み取り専用で export し、
+1,849 作品・11,933 タグ行・17,013 ジョブ（排他待ち 2,694 件、実行中 5 件）を
+隔離したローカル D1 に取り込んだ。認証情報を含む `app_state` は取り込まない。
+終了履歴の materialize だけでは作品 ID 解決の反復走査が残ることを、この実データで確認した。
+
+| 同一スナップショットの待機選択 1 回 | 終了履歴の修正のみ | 作品 ID 対応表も materialize |
+|---|---:|---:|
+| SQLite VM ステップ（約数） | 173,974,000 | 780,000 |
+| ローカル workerd D1 の実行時間 | 4,704 ms | 23 ms |
+
+選択結果は一致し、実行中の 5 件をコピー上で 1 件ずつ完了にした全段階でも
+選ばれるジョブ ID が一致した。実 D1 エンジンの実行計画でも対応表への
+`AUTOMATIC COVERING INDEX (target=?)` を確認した。これはローカル実測であり、
+本番の実行時間や課金行数を保証する数値ではない。
+
+Native は実ライブラリの整合したバックアップを workspace 内へ複製して検証した。
+16 作品の schema 13 → 15 移行直後に本文・オブジェクト・履歴の全行ハッシュが一致し、
+3,315 オブジェクトの全キーと祖先（3,376 prefix、4,174 cursor page）で一覧結果が一致した。
+実 CLI のタグ追加・削除は対象 ID だけを更新し、同じタグの再追加では
+作品・タグ・本文参照の書き込みがゼロ。保存済みの 1 作品を Lite で変換し、
+生成 EPUB の ZIP 整合性と全 19 XHTML の構文も確認した。
+同じ作品の再変換でも作品・タグ・本文参照の書き込みはゼロだった。
+
+元の実ライブラリと本番 D1 は変更していない。本番は追加修正の未配備版であり、
+API 復旧・配備後の継続負荷は未確認。検証コピーの結果と本番復旧を混同しない。
+
+### 調査したその他の経路と境界
+
+- 単一レコード・設定・凍結・予約: 主キーまたは既存索引による検索と transaction / CAS を維持する。
+- Native 本文 / バージョン: 本文はハッシュ集合を bounded batch で照合し、読み取りは owner key と body hash の JOIN。履歴ヘッドは `(novel_id,id)` 索引を使う。版全体の出力・差分計算は対象版の全本文が必要なので、行数だけを減らして出力を変えない。
+- D1 本文参照 / CAS / 一覧: object key / blob key の索引と、UNION の範囲への条件 pushdown を実行計画で確認。S3 公開の予約・削除許可・照合を省略しない。
+- キューの履歴件数・タグ頻度: 正確な全体集計なので対象集合の走査は残る。直列化されていない別カウンタや、更新を見逃すキャッシュで見かけの負荷を下げない。
+- 部分文字列検索と legacy N コードの URL suffix 照合: 現在の互換検索を維持する。FTS の単語検索や完全一致だけへ置き換えない。
+- GC の `julianday(not_before)` への式索引は採用しない。SQLite は `now` 等を持つ行の更新を非決定的な索引式として拒否し、既存の publication 回帰ケースが失敗した。既存の日時解釈・upload 保護を壊す最適化を入れない。
+
+回帰テストは `application::jobs::tests::claim_sql`、`db::object_query::tests`、
+`native::sqlite::repository::tests`、`native::sqlite::content::tests`、
+`worker_entry/tests/test_sql_access_paths.py`。実 workerd の HTTP / Queue / 仮想属性 /
+作者追跡 / 転送シナリオも実行する。本番のデータ・キューを検証用に書き換えない。
+
+## Workers の有界ストリーム処理
+
+### 管理・更新と配信の実行環境
+
+管理・取得・配信は別の Worker script として配備する。管理と4つの取得 script が D1 のジョブ台帳を共有し、配信側とは D1 / S3 の作品データを共有する。各 script の `MemoryPermit` は独立する。
+`worker_entry/src/worker_role.rs` が配信側で実行できる読み取りルートを限定し、
+プレフィックス Route に巻き込まれた編集要求は元の管理 Worker へ転送する。
+配信先への公開 Route は管理 Worker を経由しないため、更新側のメモリ・
+`MemoryPermit` を API / EPUB の取得と共有しない。
+
+配信用の composition は保存方式の初期化・旧属性のバックフィルを行わず、
+source ObjectStore / AssetStore の変更を拒否する。例外は下記の非公開 stage と
+その予約 journal だけである。cron・配信の割当と一時データの期限付き回収は管理側が担い、実際の取得は別の4 script、変換は既存の専用 Queue で実行する。
+URL・認証・配備上の境界は [`external-api.md`](external-api.md#workers-の配信用-worker) を参照。
+
+### 所有権・保存・公開
+
+HTTP の `send_stream` と `AssetStore` の `read_stream` / `read_range` / `stage_stream` を
+大きなデータの入口にする。`read_small` は設定・目次等の制御データ専用で、画像・完成 ZIP・
+完成 EPUB を読み込む代替経路にはしない。`AssetReader` は immutable な stage を Range で読み、
+ZIP の索引参照とフレームの順次復号を両立させる。
+
+本文の `read_range` は要求した範囲と一致する 206 を必須とし、Range を無視した
+200 応答を全量読み込む代替処理はしない。一方、サイズ照会の `stat` はヘッダだけを使い、
+200 の Content-Length または 206 の Content-Range の総サイズを読む。プロキシが
+Range を変更してもサイズ照会を壊さず、200 の本文も一切読み出さない。
+
+```mermaid
+flowchart LR
+  HTTP[HTTP チャンク] --> Stage[非公開 stage]
+  Stage --> Decode[1 話・1 フレーム・1 行の処理]
+  Decode --> Output[出力チャンク]
+  Output --> Store[S3 順次 multipart]
+  Store --> Verify[長さ・ハッシュ・保存結果の照合]
+  Verify --> Publish[索引・参照の公開]
+  Output --> Client[HTTP / ブラウザの pull]
+  Stage --> GC[期限付き回収]
+```
+
+S3 は 1 part の保存完了を待って次を読み、multipart 完了応答が HTTP 200 でも XML の
+`Error` なら失敗とする。コピーの応答・送信元の版・保存先も照合してから公開する。
+切断・エラーでは upload を中断し、強制終了で実行できない後片付けは
+`.narou-stage-journal/` の期限付き記録から回収する。更新・回収は条件付き要求で競合を判定し、
+回収中の予約を古い処理が復活させない。D1 の stage も lease と CAS で同じ境界を持つ。
+
+### 常駐させる単位
+
+| 対象 | 単位・上限 |
+|---|---|
+| 通常のデータチャンク | 64 KiB |
+| Range reader | 整列した 64 KiB 窓を 2 個。ZIP 索引と本文の往復で毎回取り直さない |
+| S3 multipart | 8 MiB / part、同時送信 1 part |
+| stage の失効 | 24 時間の無活動。進行中は lease を更新 |
+| isolate の重い処理 | 1 件。応答 stream の EOF / error / cancel まで所有 |
+| Wasm の転送メタデータ | 24 MiB の割当予算。容量・管理領域・再確保時の旧新領域を含めて判定 |
+| Wasm の画像処理 | codec の作業領域を事前に見積もり、96 MiB の予算内へ制限 |
+
+これらは各処理の制御値であり、Worker の RSS や JS heap の実測値ではない。
+画像 codec の予算は 128 MiB 全部を使わず、ランタイム・I/O 用の余地を残すためのもの。
+形式上の ZIP 上限は変更せず、Wasm では別途メタデータの割当を拒否できる。
+上限超過を内容の間引き・縮小・切り捨てで成功に変えない。
+
+本文変換は 1 話ずつ読み、変換済みテキスト・XHTML を immutable stage へ送る。
+本文の初読では CRC32 / SHA-256 と世代を検証し、終端では
+`ObjectStore::verify_fingerprints` と最終目次を照合して更新中の異なる版を混ぜない。
+Worker の immutable S3 本文は、既に検証して消費したバイト列の SHA-256 を
+キャッシュなしの D1 primary 参照と100件ずつ比較し、本文 blob は再取得しない。
+可変ファイル・旧 D1 本文等、確かな保存済みダイジェストが無い保存層は本文を再読する。
+時刻や不透明な ETag を本文ハッシュの代わりには使わない。
+バーチャル小説もメンバー本文を蓄積しない。Lite の ZIP 計画は名前・参照を持ち、
+XHTML と画像をエントリの書き出し時に供給する。
+このため EPUB の GET でも一時保存先への書き込みが必要になる。S3 の書き込みが
+停止している間は生成を失敗させ、全量メモリ保持や旧データへの差し替えで隠さない。
+失敗した更新が現行本文を消さないことと、保存先の復旧後にその本文から EPUB を
+再生成できることを実 Worker で検証する。
+
+挿絵の存在確認はリクエスト内で負の結果も共用し、同じ欠落を繰り返し照会しない。
+記録は最大512参照で、上限以後の未記録参照も省略せず通常どおり照会する。
+画像番号・本文内の出現順を保つため、変換入力の参照列自体は重複除去しない。
+
+APNG は ZIP を stage に置き、1 フレームずつ復号・符号化する。EPUB の非インタレース PNG は
+行単位の復号・リサイズを使い、元画像全体とリサイズ中間画像を持たない。
+他の codec やアニメーション合成は 1 フレーム / canvas が必要な場合がある。
+これは全アニメーションの保持とは区別し、必要な作業領域を確保前に判定する。
+透過・16 bit PNG・フレーム数・表示時間・ループ情報を容量対策で省略しない。
+
+### 同時実行・キャッシュ・異常終了
+
+`memory_budget::MemoryPermit` は isolate 内の作業所有権で、HTTP 容量待ちは
+`503` / `memory_capacity` / `Retry-After: 5` を返す。取得 Queue は別 script の
+専用レーンで実行し、各 isolate の1件制限を外さずに系列間を並列化する。
+通常の枠待ちは、系列・対象を保存した D1 の待機状態として扱い、実行 lease と
+通常の試行回数を消費しない。枠とメモリの解放前に次の配信を開始しない。
+クライアントの `cancel()` 完了は、サーバーが切断を受け取ったことの確認ではない。
+切断伝播中の別要求は 503 になり得る。時間切れだけで許可を解放して旧処理と
+併走させず、stream の破棄で解放する。回帰検証では上流画像を EOF 前に停止し、
+実際に上流接続が中断された後に次の要求を受け付けることを確認する。
+
+Worker設定は `enable_request_signal` を明示し、元の要求の切断通知を準備処理と本文の
+読み出しへ伝える。上流fetchのAbortControllerはヘッダ待ちの前から所有し、ヘッダ待ち・
+本文途中の破棄をどちらも中止する。EOF前の破棄で成功扱いへ変更しない。
+readerは通常のEOF/errorで解放し、取消・panicで非同期の解放処理を実行できないときは
+元の30秒リースが自然失効する。detachedタスクや期限の書換えで回収しない。
+ローカル契約は実service bindingの要求signalを取消し、上流ヘッダ前と本文途中の
+実接続の切断を元の5秒上限内で確認する。dev TCP bridgeのTCP切断だけではsignalへ
+伝播しなかったため、ブラウザのcancel完了をサーバー側中断の証拠に置き換えない。
+
+isolate キャッシュは件数だけでなく byte weight で制限し、共有値は `Arc` で参照する。
+本文ハッシュのヒントは全ライブラリ分をロードせず、小説 ID ごとの
+`novel_section_hashes` から読む。移行不能な旧値を migration で無条件に消さない。
+
+コンソール・進捗は待機中と送信中を合わせて 256 KiB の FIFO に載せ、
+`PushHubSink::run` が生成側と単一の送信側を同じ invocation 内で poll する。
+空きが十分な間は取得を進め、送信側だけが最小間隔を待って複数イベントをまとめる。
+1 行ごとに間隔待ちをすると取得まで遅くなるため、生成側が待つのは空きが少ないときだけ。
+通常の行は捨てず、置換可能な進捗だけを統合する。上限より長い単独行は先行分を送り切って
+直接送る。終端前は残りを送り切り、キャンセルでは両 future を破棄する。
+長編 fixture は 1,685 話を既存の 10 分以内という条件で確認し、待ち時間の延長では回避しない。
+
+OOM / trap / 実行喪失では通常のエラー保存に到達しないため、`attempts` だけで再試行を制御しない。
+migration `0019_bounded_runtime.sql` の `recovery_attempts` を回収時に進め、
+永続化したチェックポイントが過去の到達位置を超えたときだけ回復予算を戻す。
+途中までの再実行で cursor を巻き戻さず、同じ位置までの再到達や phase・metadata だけの変更では回数をリセットしない。
+上限到達は終端へ移し、サイトの枠を後続へ解放する。回収・待機再投入・消去はページ単位で行う。
+容量待ちを再配信するときは期限切れ lease を除き、更新した時刻から配送猶予を数える。
+未到来の retry backoff と、すでに別実行が取得した lease は変更しない。
+
+### 配備と明示的に残す境界
+
+リレーを使う場合は **リレー更新 → D1 migration → Worker 更新** の順にする。
+新 Worker は `Accept: application/vnd.narou.relay.v1+octet-stream` を要求し、
+`NRS1`・長さ付き JSON メタデータ・生の本文を読む。旧リレーの JSON/Base64 応答を
+全量復号するフォールバックは持たず、更新が必要なエラーを返す。
+既存クライアント用のリレー JSON 契約は維持する。
+
+Native の外部変換ツール向け String / ファイル API、テスト等向けの明示的な
+whole-value 転送 utility は残るが、Worker の大きな本文・画像・アーカイブ経路では使わない。
+リレープロセスの上流取得には従来の 16 MiB 有界バッファが残るため、
+リレー Native 側まで完全に無バッファ化したという意味ではない。
+
+### 測定と回帰検証
+
+64 枚の 1000×1000 JPEG を含む ZIP（7,761,763 bytes）から APNG を生成する
+Native コンポーネント測定では、要求中の生存 allocation のピークが次のように変わった。
+入力の SHA-256 は `b10805d1555950eed5047b72c8c3adc655a821d74389e13d4cf1d33ee1c03c6a`。
+
+| 指標 | 旧処理 | ストリーム処理 |
+|---|---:|---:|
+| 要求中 allocation のピーク | 110.9 MiB | 14.8 MiB |
+
+削減率は 86.6%。これは **Worker 全体のメモリ使用量や RSS ではない**。
+生成物は 44,036,067 bytes で、保持せず 770 チャンクへ流した。
+旧版 release / 新版 debug で測定したため、処理時間の比較には使わない。
+
+再現可能な回帰検証は `worker_entry` でビルド後、以下を実行する。
+`content_storage.mjs` は実 workerd・ローカル D1・S3 HTTP fixture を使う。
+Wasm の線形メモリと JS heap は別なので、線形メモリの測定値を
+Worker 全体のピークとして扱わない。
+
+```sh
+worker-build --release
+node tests/content_storage.mjs
+node tests/runtime_recovery.mjs
+node tests/transfer.mjs
+```
+
+Native の S3 互換性と転送経路は、リポジトリルートで次のように確認する。
+
+```sh
+cargo test -p narou_rs --features lite --test s3_range_transport --test transfer_archive_e2e
+cargo test -p narou_rs --features lite --lib platform::s3_
+```
+
+実 workerd の 64 フレーム・512×512 RGBA fixture と 4096×4096 / 6000×6000 PNG では、
+取得・S3 multipart 保存・EPUB 配信・EOF・上流を停止した状態での中断を通した。
+さらに 500 万個の未知の manifest 項目を読み飛ばす取り込みを同じ isolate で行い、
+Wasm 線形メモリの最高値は 38,010,880 bytes（36.25 MiB）だった。
+全フレームの画素・透明度・再生時間、静止画の縮小後の画素・透明度、EPUB 内の参照を
+照合している。JS heap はこの数値に含まない。
+転送 wasm 単体では、6 MiB の NUL を含む題名を約 36 MiB の JSON として逐次出力し、
+線形メモリ 18,350,080 bytes（17.5 MiB）、入出力チャンク最大 64 KiB で完走した。

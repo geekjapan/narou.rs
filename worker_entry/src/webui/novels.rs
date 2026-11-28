@@ -1,0 +1,403 @@
+//! 小説 1 件を対象にする JSON API (native: `src/web/novels.rs` /
+//! `src/web/tags.rs` / `src/web/batch.rs`)。
+//!
+//! - `GET  /api/novels/count` / `GET /api/novels/all_ids` — 作品件数と全 id
+//!   一覧 (native `novels_count` / `misc::all_novel_ids`)。
+//! - `GET  /api/novels/{id}/author_comments` — native `author_comments`
+//!   (TOC + 各セクションのまえがき/あとがきを集計して返す)。
+//! - `POST /api/novels/{id}/freeze` / `unfreeze` — native `freeze_novel` /
+//!   `unfreeze_novel`。
+//! - `DELETE /api/novels/{id}` — native `remove_novel`
+//!   (`with_file` は任意 JSON 本文、省略時 false)。
+//! - `POST /api/novels/{id}/tag` / `DELETE /api/novels/{id}/tag` —
+//!   native `add_tag` / `remove_tag`。
+//! - `POST /api/novels/{id}/tags` / `PUT` / `POST /api/novels/{id}/tags/remove`
+//!   — native `add_tags` / `update_tags` / `remove_tags`。
+//! - `POST /api/novels/tag` / `DELETE /api/novels/tag` —
+//!   native `batch_tag` / `batch_untag` (本文は `[BatchIdsBody, TagBody]` の
+//!   2 要素配列)。
+//!
+//! エラー応答は Worker 共通の `json_error` 形 (native は `(Status, String)`
+//! の文字列ボディだが、非 2xx をそのまま通知に表示するフロントには同じ
+//! メッセージが伝わる)。成功応答の `{success, message}` は native の
+//! `ApiResponse` と同じ。
+//!
+//! 変更操作は native (`tags.rs` / `batch.rs`) と同じイベント選択で PushHub へ
+//! 配信する (`application::webui::mutations` が唯一の定義)。
+
+use narou_rs::application::webui::author_comments::author_comments_payload;
+use narou_rs::application::webui::mutations::MutationNotice;
+use narou_rs::application::webui::{
+    MAX_WEB_TAGS_PER_REQUEST, normalize_web_tag_name, sort_ids_from_records,
+};
+use narou_rs::application::{
+    AppServices, FileDeletionStatus, RemoveRequest, TagAction, TagChangeRequest,
+};
+use narou_rs::platform::NovelId;
+use serde::Deserialize;
+use serde_json::json;
+use worker::{Request, Response};
+
+use super::{api_response, application_error_response, json_error};
+
+// ---------------------------------------------------------------------------
+// GET /api/novels/count / GET /api/novels/all_ids
+// (native: novels.rs novels_count / misc.rs all_novel_ids)
+// ---------------------------------------------------------------------------
+
+/// native `novels_count`: `{"count": N}`。native と同じく読めないときは
+/// エラーにせず 0 件として返す (一覧ヘッダの表示用)。
+pub async fn count(services: &AppServices) -> worker::Result<Response> {
+    let count = services.library.count().await.unwrap_or(0);
+    Response::from_json(&json!({ "count": count }))
+}
+
+/// native `all_novel_ids`: `{"ids": [...]}` (全件・ソート順なし)。
+///
+/// ID だけが必要なので `records()` (全レコード復号) ではなく
+/// `NovelRepository::scan_ids` の ID 投影を使う。順序は native と同じ
+/// id 昇順。
+pub async fn all_ids(services: &AppServices) -> worker::Result<Response> {
+    let ids = services
+        .library
+        .all_ids(&narou_rs::platform::NovelFilter::all())
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect::<Vec<i64>>();
+    Response::from_json(&json!({ "ids": ids }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/novels/{id}/author_comments (native: novels.rs author_comments)
+// ---------------------------------------------------------------------------
+
+pub async fn author_comments(services: &AppServices, id: NovelId) -> worker::Result<Response> {
+    let mut scope = services.content.read_scope("author-comments");
+    let result = async {
+    let record = match services.content.read_record(&mut scope, id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return json_error(404, "not_found", Some(&format!("ID: {}", id.0)));
+        }
+        Err(error) => return application_error_response(&error),
+    };
+    // native は TOC なしを 404 ("TOC not found")、壊れた YAML を 500 にする。
+    let toc = match services.content.toc(&mut scope, id).await {
+        Ok(toc) => toc,
+        Err(error) => return application_error_response(&error),
+    };
+    let Some(bytes) = toc else {
+        return json_error(404, "not_found", Some("TOC not found"));
+    };
+    let toc = match serde_yaml::from_slice::<narou_rs::downloader::types::TocObject>(&bytes) {
+        Ok(toc) => toc,
+        Err(error) => {
+            return json_error(500, "internal_error", Some(&error.to_string()));
+        }
+    };
+
+    let mut sections: Vec<Option<narou_rs::downloader::types::SectionFile>> =
+        Vec::with_capacity(toc.subtitles.len());
+    for sub in &toc.subtitles {
+        let Some(bytes) = (match services
+            .content
+            .section(&mut scope, id, &sub.index, &sub.file_subtitle)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return application_error_response(&error),
+        }) else {
+            sections.push(None);
+            continue;
+        };
+        sections.push(serde_yaml::from_slice::<narou_rs::downloader::types::SectionFile>(&bytes).ok());
+    }
+
+    Response::from_json(&author_comments_payload(&record.title, &toc, &sections))
+    }.await;
+    super::leased_response(result, scope).await
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/novels/{id}/freeze|unfreeze (native: novels.rs freeze/unfreeze_novel)
+// ---------------------------------------------------------------------------
+
+pub async fn freeze_novel(
+    env: &worker::Env,
+    services: &AppServices,
+    id: NovelId,
+) -> worker::Result<Response> {
+    freeze_or_unfreeze(env, services, id, true).await
+}
+
+pub async fn unfreeze_novel(
+    env: &worker::Env,
+    services: &AppServices,
+    id: NovelId,
+) -> worker::Result<Response> {
+    freeze_or_unfreeze(env, services, id, false).await
+}
+
+async fn freeze_or_unfreeze(
+    env: &worker::Env,
+    services: &AppServices,
+    id: NovelId,
+    freeze: bool,
+) -> worker::Result<Response> {
+    let result = match if freeze {
+        services.novel_actions.freeze(&[id]).await
+    } else {
+        services.novel_actions.unfreeze(&[id]).await
+    } {
+        Ok(result) => result,
+        Err(error) => return application_error_response(&error),
+    };
+    if !result.missing.is_empty() {
+        return json_error(404, "not_found", Some(&format!("ID: {}", id.0)));
+    }
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
+    let persisted = result.store_failed.is_empty();
+    let verb = if freeze { "Froze" } else { "Unfroze" };
+    let message = if persisted {
+        format!("{verb} {}", id.0)
+    } else {
+        format!("{verb} {} (freeze state persistence failed)", id.0)
+    };
+    Response::from_json(&api_response(persisted, message))
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/novels/{id} (native: novels.rs remove_novel)
+// ---------------------------------------------------------------------------
+
+pub async fn remove_novel(
+    env: &worker::Env,
+    services: &AppServices,
+    id: NovelId,
+    mut req: Request,
+) -> worker::Result<Response> {
+    let content_type = match req.headers().get("Content-Type") {
+        Ok(value) => value,
+        Err(_) => return json_error(400, "bad_request", Some("invalid Content-Type")),
+    };
+    let with_file = if let Some(content_type) = content_type {
+        let mime = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if mime != "application/json"
+            && !(mime.starts_with("application/") && mime.ends_with("+json"))
+        {
+            return json_error(415, "unsupported_media_type", Some("JSON Content-Type required"));
+        }
+        let body = match req.json::<serde_json::Value>().await {
+            Ok(value) => value,
+            Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+        };
+        body.get("with_file").and_then(serde_json::Value::as_bool).unwrap_or(false)
+    } else {
+        false
+    };
+    let result = match services
+        .novel_actions
+        .remove(&RemoveRequest {
+            ids: vec![id],
+            delete_files: with_file,
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return application_error_response(&error),
+    };
+    if !result.missing.is_empty() {
+        return json_error(404, "not_found", Some(&format!("ID: {}", id.0)));
+    }
+    // native `remove_novel` と同じく、一覧とタグ表示の両方を再読込させる。
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
+    let files_ok = result
+        .files
+        .iter()
+        .all(|(_, status)| matches!(status, FileDeletionStatus::Deleted));
+    let message = if files_ok {
+        format!("Removed {}", id.0)
+    } else {
+        format!("Removed {} (file deletion incomplete)", id.0)
+    };
+    Response::from_json(&api_response(files_ok, message))
+}
+
+// ---------------------------------------------------------------------------
+// POST/DELETE /api/novels/{id}/tag, POST/PUT /api/novels/{id}/tags,
+// POST /api/novels/{id}/tags/remove (native: tags.rs)
+
+
+/// native `TagBody` (`src/web/state.rs`) と同じ受理形。
+#[derive(Debug, Deserialize)]
+struct TagBody {
+    tag: String,
+}
+
+/// native `TagsBody` (`src/web/state.rs`) と同じ受理形。
+#[derive(Debug, Deserialize)]
+struct TagsBody {
+    tags: Vec<String>,
+}
+
+async fn apply_tag_change(
+    services: &AppServices,
+    ids: &[i64],
+    action: TagAction,
+    tags: Vec<String>,
+) -> Result<narou_rs::application::TagChangeResult, worker::Result<Response>> {
+    services
+        .novel_actions
+        .change_tags(&TagChangeRequest {
+            ids: ids.iter().copied().map(NovelId::from).collect(),
+            action,
+            tags,
+        })
+        .await
+        .map_err(|error| application_error_response(&error))
+}
+
+/// `{id}/tag` (POST=add_tag / DELETE=remove_tag)。`tag` 1 件を対象にする。
+pub async fn novel_tag(
+    env: &worker::Env,
+    services: &AppServices,
+    id: NovelId,
+    mut req: Request,
+    remove: bool,
+) -> worker::Result<Response> {
+    let body: TagBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    let tag = match normalize_web_tag_name(&body.tag) {
+        Ok(tag) => tag,
+        Err(message) => return json_error(400, "bad_request", Some(&message)),
+    };
+    let action = if remove { TagAction::Remove } else { TagAction::Add };
+    let result = match apply_tag_change(services, &[id.0], action, vec![tag]).await {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    // native `add_tag` / `remove_tag` と同じ順序で、変更後の再読込を先に配信する。
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
+    if !result.missing.is_empty() {
+        return json_error(404, "not_found", Some(&format!("ID: {}", id.0)));
+    }
+    let message = if remove { "Tag removed" } else { "Tag added" };
+    Response::from_json(&api_response(true, message))
+}
+
+/// `{id}/tags` (POST=add_tags / PUT=update_tags) と `{id}/tags/remove` (POST)。
+pub async fn novel_tags(
+    env: &worker::Env,
+    services: &AppServices,
+    id: NovelId,
+    mut req: Request,
+    action: TagAction,
+) -> worker::Result<Response> {
+    let body: TagsBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    let tags = match validate_tags(&body.tags) {
+        Ok(tags) => tags,
+        Err(message) => return json_error(400, "bad_request", Some(&message)),
+    };
+    let result = match apply_tag_change(services, &[id.0], action, tags).await {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    // native `add_tags` / `remove_tags` / `update_tags` と同じ順序で、変更後の
+    // 再読込を先に配信する。
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
+    if !result.missing.is_empty() {
+        return json_error(404, "not_found", Some(&format!("ID: {}", id.0)));
+    }
+    let message = match action {
+        TagAction::Add => "Tags added",
+        TagAction::Remove => "Tags removed",
+        TagAction::Replace => "Tags updated",
+    };
+    Response::from_json(&api_response(true, message))
+}
+
+/// native `validate_tags` (`src/web/tags.rs:12`): 件数上限と正規化。
+fn validate_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    if tags.len() > MAX_WEB_TAGS_PER_REQUEST {
+        return Err("too many tags".to_string());
+    }
+    tags.iter().map(|tag| normalize_web_tag_name(tag)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// POST/DELETE /api/novels/tag (native: batch.rs batch_tag / batch_untag)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct BatchIdsBody {
+    ids: Vec<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    sort_state: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    timestamp: Option<u64>,
+}
+
+/// `POST /api/novels/tag` (追加) / `DELETE /api/novels/tag` (削除)。
+/// 本文は native と同じ `[{"ids":[…], …}, {"tag":"…"}]` の 2 要素配列。
+pub async fn batch_tag(
+    env: &worker::Env,
+    services: &AppServices,
+    mut req: Request,
+    remove: bool,
+) -> worker::Result<Response> {
+    // axum の `Json<(BatchIdsBody, TagBody)>` と同じ受理形 (2 要素の配列)。
+    let body: (BatchIdsBody, TagBody) = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    let (ids_body, tag_body) = body;
+    if ids_body.ids.len() > super::max_web_targets_for(services).await {
+        return json_error(400, "bad_request", Some("too many ids"));
+    }
+    let ids = sort_ids_for_request(services, &ids_body.ids).await;
+    let tag = match normalize_web_tag_name(&tag_body.tag) {
+        Ok(tag) => tag,
+        Err(message) => return json_error(400, "bad_request", Some(&message)),
+    };
+    let action = if remove { TagAction::Remove } else { TagAction::Add };
+    let result = match apply_tag_change(services, &ids, action, vec![tag]).await {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    if !result.missing.is_empty() {
+        return json_error(
+            404,
+            "not_found",
+            Some(&format!("ID: {}", result.missing[0].0)),
+        );
+    }
+    // native `batch_tag` / `batch_untag` と同じく、実在 id を確認してから
+    // 一覧とタグ表示を再読込させる。
+    crate::push_hub::broadcast_mutations(env, MutationNotice::TableAndTags).await;
+    let verb = if remove { "Untagged" } else { "Tagged" };
+    Response::from_json(&api_response(
+        true,
+        format!("{verb} {} novels", ids.len()),
+    ))
+}
+
+/// native `sort_ids_for_request`: リクエストの sort_state/timestamp は参照
+/// せず、サーバー保存の現在ソートで並べ直す (row_actions.rs と同じ規則)。
+/// `sort_ids_from_records` は選択 id のレコードしか見ないので、全件ではなく
+/// 選択分だけを 1 クエリで読み、ソート状態の読み取りとは同時に走らせる。
+async fn sort_ids_for_request(services: &AppServices, ids: &[i64]) -> Vec<i64> {
+    let (records, sort_state) = futures::join!(
+        services.library.records_by_ids(ids),
+        super::load_current_sort_state_for(&services.settings),
+    );
+    sort_ids_from_records(ids, &records.unwrap_or_default(), &sort_state)
+}

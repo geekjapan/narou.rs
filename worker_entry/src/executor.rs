@@ -1,0 +1,795 @@
+//! Worker queue consumer execution (Phase 8).
+//!
+//! Executes one discrete [`JobPlan`] with the shared Downloader and reduces
+//! the outcome to the ledger vocabulary:
+//!
+//! - success / no-update-needed → `Succeeded`
+//! - interactive decision required (auth/adult/digest) → `Blocked`
+//! - novel gone / invalid → `Permanent`
+//! - transient transport failure → `Retryable` (bounded by the consumer)
+//! - section-boundary budget expiration → `Partial` with the next section
+//!   cursor (the in-flight section is never cancelled)
+//!
+//! No blanket retry-to-success and no `catch_unwind`: a panic propagates to
+//! the queue runtime, which redelivers / dead-letters the message.
+
+use std::time::Duration;
+use std::sync::Arc;
+
+use worker::console_log;
+
+use narou_rs::application::novel_access::{NovelAccess, NovelWriteGuard};
+use narou_rs::application::{
+    classify_failure, messages, ExecutionPhase, JobFailureClass, JobId, JobKind, JobPlan,
+    JobTarget, WorkerExecutionCheckpoint,
+};
+use narou_rs::downloader::{
+    DownloadExecutionOptions, DownloadResult, Downloader, SectionBudget, UpdateStatus,
+};
+use narou_rs::error::{NarouError, Result};
+use narou_rs::platform::{JobExecutionOwner, NovelId, NovelObjectKeys, NovelRepository};
+
+use crate::budget::WorkerBudget;
+use crate::composition::WorkerRuntime;
+use crate::push_hub::{HubProgress, PushHubClient, PushHubSink, echo};
+
+
+/// Bounded wall-clock budget per job. Checked before sections and uncached
+/// images, so a single image-heavy section can span multiple invocations.
+pub const JOB_TIME_BUDGET: Duration = Duration::from_secs(60 * 10);
+
+/// Typed outcome of executing one job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobOutcome {
+    Succeeded,
+    /// Terminal skip: the job was eligible but its target was disallowed
+    /// (frozen novel without `--force`). Ledgers as `Partial` because that
+    /// is the native shape — a single-target frozen job exits the child
+    /// process with mistook=1, which the web worker reports as partial
+    /// rather than failed.
+    Skipped { reason: String },
+    /// Soft-budget checkpoint produced before the next section starts. The
+    /// checkpoint is resumable because preceding sections are already
+    /// persisted and the next section index is explicit.
+    Partial {
+        reason: String,
+        checkpoint: WorkerExecutionCheckpoint,
+    },
+    Blocked { reason: String },
+    Permanent { reason: String },
+    Retryable { reason: String },
+}
+
+impl JobOutcome {
+    pub fn from_error(error: NarouError) -> Self {
+        match classify_failure(&error) {
+            JobFailureClass::Retryable => Self::Retryable { reason: error.to_string() },
+            JobFailureClass::Permanent => Self::Permanent { reason: error.to_string() },
+            JobFailureClass::Blocked => Self::Blocked { reason: error.to_string() },
+        }
+    }
+}
+
+/// Whether a job plan can be executed by this consumer at all.
+pub fn unsupported_reason(job: &JobPlan) -> Option<String> {
+    if !job.kind.is_worker_executable() {
+        return Some(format!(
+            "unsupported job kind {:?} on the worker (no subprocess support)",
+            job.kind
+        ));
+    }
+    if job.target == JobTarget::All {
+        return Some(
+            "auto-update must be planned into discrete per-novel jobs".to_string(),
+        );
+    }
+    None
+}
+
+fn resume_section_for_checkpoint(
+    job_id: &JobId,
+    novel_id: Option<narou_rs::platform::NovelId>,
+    checkpoint: Option<&WorkerExecutionCheckpoint>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(None);
+    };
+    if checkpoint.job_id != *job_id {
+        return Err(format!(
+            "execution checkpoint belongs to job {}, not {}",
+            checkpoint.job_id, job_id
+        ));
+    }
+    if checkpoint.novel_id.is_some() && checkpoint.novel_id != novel_id {
+        return Err("execution checkpoint belongs to a different novel".to_string());
+    }
+    if checkpoint.creation_reservation.is_some() && checkpoint.write_origin.is_none()
+        && (checkpoint.phase != ExecutionPhase::Planned || checkpoint.next_section_index.is_some()) {
+        return Err("only a pre-prefix planned creation may lack its original namespace epoch".into());
+    }
+    // A legacy cursor cannot prove which epoch produced its saved sections.
+    // Re-fetch from zero rather than bless that continuation with a new epoch.
+    if checkpoint.write_origin.is_none() {
+        return Ok(None);
+    }
+    match checkpoint.phase {
+        ExecutionPhase::Planned | ExecutionPhase::Finished => Ok(None),
+        ExecutionPhase::Fetching | ExecutionPhase::Persisting => {
+            let Some(index) = checkpoint.next_section_index else {
+                return Err("execution checkpoint has no section cursor".to_string());
+            };
+            usize::try_from(index).map(Some).map_err(|_| {
+                format!("execution checkpoint section index {index} is not representable")
+            })
+        }
+    }
+}
+
+/// Claimed execution state and metadata already read for update admission.
+pub struct JobExecution<'a> {
+    pub job_id: &'a JobId,
+    pub owner: Arc<JobExecutionOwner>,
+    pub checkpoint: Option<&'a WorkerExecutionCheckpoint>,
+    pub update_record: Option<&'a narou_rs::db::NovelRecord>,
+    pub prepared_writer: Option<NovelWriteGuard>,
+}
+
+/// Execute one job and classify the outcome.
+///
+/// `downloader` is owned by the caller for the duration of a queue batch —
+/// `runtime` supplies the platform capabilities the lifecycle hooks need
+/// (freeze check, post-update record writes, checkpointing ledger).
+pub async fn execute_job(
+    downloader: &mut Downloader,
+    job: &JobPlan,
+    execution: JobExecution<'_>,
+    runtime: &WorkerRuntime,
+    push: &PushHubClient,
+) -> JobOutcome {
+    let JobExecution { job_id, owner, checkpoint, update_record, prepared_writer } = execution;
+    let execution_token = owner.execution_token();
+    if let Some(reason) = unsupported_reason(job) {
+        return JobOutcome::Blocked { reason };
+    }
+
+    let push_sink = PushHubSink::shared(push.clone(), None);
+    let context = messages::MessageContext::new(
+        push_sink.clone(), crate::consumer::webui_debug_mode(runtime).await,
+    );
+    push_sink.run(async {
+    let outcome = context.scope(async {
+
+    if let Err(error) = runtime.ledger.ensure_execution_active(job_id, execution_token).await {
+        return JobOutcome::from_error(error);
+    }
+
+    if job.kind == JobKind::AuthorCheck {
+        use narou_rs::application::messages::MessageSink as _;
+        let url = match &job.target {
+            JobTarget::Url(url) => url,
+            _ => return JobOutcome::Permanent { reason: "author check requires an author URL".into() },
+        };
+        let result: Result<()> = async {
+            if !runtime.author_service().list().await?.iter().any(|author| JobTarget::parse(&author.url).as_ref() == Some(&job.target)) {
+                push_sink.emit_async(messages::Stream::Stdout, &messages::author::untracked(url)).await;
+                return Ok(());
+            }
+            push_sink.emit_async(messages::Stream::Stdout, &messages::author::checking(url)).await;
+            let urls = runtime.author_work_urls(url).await?;
+            // Removal while discovery was running must also stop new fan-out.
+            if !runtime.author_service().list().await?.iter().any(|author| JobTarget::parse(&author.url).as_ref() == Some(&job.target)) {
+                return Ok(());
+            }
+            runtime.ledger.ensure_execution_active(job_id, execution_token).await?;
+            let plans: Vec<JobPlan> = urls.into_iter().map(|url| JobPlan {
+                kind: JobKind::Download, target: JobTarget::Url(url), options: Vec::new(),
+            }).collect();
+            runtime.enqueue_batch(&plans).await?;
+            push_sink.emit_async(messages::Stream::Stdout, &messages::author::queued(url, plans.len())).await;
+            if !plans.is_empty() { crate::consumer::notify_queue_changed(push).await; }
+            Ok(())
+        }.await;
+        return match result {
+            Ok(()) => JobOutcome::Succeeded,
+            Err(error) => classify_result(Err(error), job, runtime, push_sink.as_ref(), None).await,
+        };
+    }
+
+    let novel_id = match job.target {
+        JobTarget::Id(id) => Some(id),
+        _ => None,
+    };
+    let resume_from_section = match resume_section_for_checkpoint(job_id, novel_id, checkpoint) {
+        Ok(index) => index,
+        Err(reason) => return JobOutcome::Permanent { reason },
+    };
+    // Reuse the writer prepared before metadata/hash hints. A saved checkpoint
+    // is authoritative; it can never be blessed with today's captured epoch.
+    let mut origin_guard = match (checkpoint.and_then(|saved| saved.write_origin.as_ref()), prepared_writer) {
+        (Some(origin), Some(writer)) if writer.origin() != *origin => {
+            return JobOutcome::from_error(NarouError::Platform("worker continuation writer origin changed during claim".into()));
+        }
+        (_, Some(writer)) => Some(writer),
+        (Some(origin), None) => match NovelWriteGuard::resume(runtime.write_objects(), Some(runtime.assets()), origin).await {
+            Ok(writer) => Some(writer),
+            Err(error) => return JobOutcome::from_error(error),
+        },
+        (None, None) => None,
+    };
+    if let Some(writer) = origin_guard.as_mut() {
+        if let Err(error) = writer.bind_job_owner(Arc::clone(&owner)) { return JobOutcome::from_error(error); }
+        let admission = match NovelAccess::from_writer(writer.clone(), "worker-execution-origin").await {
+            Ok(admission) => admission,
+            Err(error) => return JobOutcome::from_error(error),
+        };
+        if let Err(error) = admission.release().await { return JobOutcome::from_error(error); }
+    }
+
+    // The execution boundary also accepts raw series plans (persisted ledger
+    // rows and legacy envelopes). Fan out through the same expander as new
+    // requests; the child plans retain per-novel budgets and follow-up convert.
+    let series_result = match downloader.download_target_expander().expand_plan(job).await {
+        Ok(Some(plans)) => {
+            let count = plans.len();
+            Some(async {
+                runtime.ledger.ensure_execution_active(job_id, execution_token).await?;
+                runtime.enqueue_batch(&plans).await.map(|_| count)
+            }.await)
+        }
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    };
+    if let Some(result) = series_result {
+        use narou_rs::application::messages::MessageSink as _;
+        let sink = &push_sink;
+        let outcome = match result {
+            Ok(count) => {
+                sink.emit_async(messages::Stream::Stdout, &messages::download::series_expanded(job.target.as_str(), count)).await;
+                crate::consumer::notify_queue_changed(push).await;
+                JobOutcome::Succeeded
+            }
+            Err(error) => {
+                sink.emit_async(messages::Stream::Stdout, &messages::indented_error(&error)).await;
+                classify_result(Err(error), job, runtime, sink.as_ref(), None).await
+            }
+        };
+        return outcome;
+    }
+
+    let force = job
+        .options
+        .iter()
+        .any(|option| option == "--force" || option == "-f");
+    let target = job.target.as_str();
+
+    if !force && job.kind == JobKind::Update && let Some(record) = update_record
+        && runtime.write_services().novel_actions.is_frozen(NovelId(record.id)).await
+    {
+        let line = messages::update::frozen_id(record.id, &record.title);
+        console_log!("job {job_id} skipped: {line}");
+        push.broadcast_best_effort(&[echo(&line, "stdout")]).await;
+        return JobOutcome::Skipped { reason: line };
+    }
+    // Download resolves its stored record after series/author expansion.
+    if !force && job.kind == JobKind::Download {
+        match resolve_novel_id(runtime.novels.as_ref(), &job.target).await {
+            Some(id) if runtime.write_services().novel_actions.is_frozen(id).await => {
+                let title = runtime
+                    .novels
+                    .get(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|record| record.title)
+                    .unwrap_or_default();
+                let line = messages::download::frozen_abort(title);
+                console_log!("job {job_id} skipped: {line}");
+                push.broadcast_best_effort(&[echo(&line, "stdout")]).await;
+                // native の単発 frozen 経路は子プロセスを mistook=1 で終了
+                // させ、Web worker がそれを「部分完了」(queue_partial) として
+                // 記録するので、ここでも terminal の Partial に写す
+                // (queue_failed にはしない)。
+                return JobOutcome::Skipped { reason: line };
+            }
+            _ => {}
+        }
+    }
+    if job.kind == JobKind::Update {
+        let domain = update_record.and_then(|record| record.domain.as_deref())
+            .filter(|domain| !domain.is_empty()).unwrap_or("__unknown__");
+        if let Err(error) = runtime.pace_update_start(domain).await {
+            return JobOutcome::Retryable { reason: format!("update start pacing failed: {error}") };
+        }
+    }
+
+
+    // 進捗とコンソールは同じ送信キューに積み、順序を保つ。
+    // operation は実行トークンごとに異なり、再試行の遅延更新と混ざらない。
+    let progress = HubProgress::new(
+        push_sink.clone(),
+        job.kind.as_str(),
+        job_id.as_str(),
+        execution_token,
+    );
+    narou_rs::platform::ProgressReporter::flush(&progress).await;
+    downloader.set_progress(Box::new(progress));
+    downloader.set_message_sink(push_sink.clone());
+    let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests)
+        .with_checkpoints(
+            runtime.ledger.clone(),
+            job_id,
+            Arc::clone(&owner),
+            novel_id,
+        ).with_resume_checkpoint(checkpoint);
+    let result = downloader
+        .download_novel_with_execution_options(
+            &target,
+            DownloadExecutionOptions {
+                force,
+                budget: Some(&mut budget),
+                resume_from_section,
+                access: origin_guard.clone(),
+                creation_reservation: checkpoint.and_then(|saved| saved.creation_reservation),
+            },
+        )
+        .await;
+    let result = match result {
+        Err(NarouError::DownloadResumeCorrupt(reason)) if resume_from_section.is_some() => {
+            console_log!(
+                "job {job_id}: invalid resume checkpoint ({reason}); restarting from section 0"
+            );
+            push.broadcast_best_effort(&[echo(
+                &messages::jobs::resume_checkpoint_invalid(&reason),
+                "stdout",
+            )])
+            .await;
+            if let Err(error) = budget.drain_checkpoint_writes().await {
+                return JobOutcome::from_error(error);
+            }
+            let mut restarted = checkpoint.expect("a section resume has a durable checkpoint").clone();
+            restarted.phase = ExecutionPhase::Fetching;
+            restarted.next_section_index = Some(0);
+            if let Err(error) = runtime.ledger.restart_checkpoint(job_id, execution_token, &restarted).await {
+                return JobOutcome::from_error(error);
+            }
+            budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests)
+                .with_checkpoints(
+                    runtime.ledger.clone(),
+                    job_id,
+                    Arc::clone(&owner),
+                    novel_id,
+                ).with_resume_checkpoint(Some(&restarted));
+            // Even a failure before the restarted section loop must not retain
+            // the corrupt incoming cursor.
+            budget.should_yield(0);
+            downloader
+                .download_novel_with_execution_options(
+                    &target,
+                    DownloadExecutionOptions {
+                        force,
+                        budget: Some(&mut budget),
+                        resume_from_section: None,
+                        // A corrupt section cursor does not authorize a new
+                        // writer epoch for an already-running operation.
+                        access: origin_guard.clone(),
+                        creation_reservation: restarted.creation_reservation,
+                    },
+                )
+                .await
+        }
+        other => other,
+    };
+    // 1 件分の結果行は native `commands::{download,update}` と同じ文言を
+    // 共有実装 (`download_result_line`) で出す。エラー系も native と
+    // 同じ行を使う (download は `  {error}`、update は `ID:{id} {title} の
+    // 更新は失敗しました` + debug-mode 時の `  Error detail: {error}`)。
+    // 予算切れは下の Partial 分岐が理由を説明するので除く。
+    match &result {
+        Ok(result) => {
+            // native `commands::update` は `DownloadResult.title` が空のとき
+            // キャンセル行のタイトルをレコードから引き直すので、同じ解決を
+            // ここでも行う (Download では使われない)。
+            let canceled_title = if job.kind == JobKind::Update
+                && result.status == UpdateStatus::Canceled
+                && result.title.is_empty()
+            {
+                runtime
+                    .novels
+                    .get(NovelId(result.id))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|record| record.title)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if let Some(line) = narou_rs::application::download_result_line(job.kind, result, Some(&canceled_title)) {
+                use narou_rs::application::messages::MessageSink as _;
+                push_sink.emit_async(messages::Stream::Stdout, &line).await;
+            }
+        }
+        Err(error) if !matches!(error, NarouError::DownloadBudgetExpired { .. }) => {
+            // ネイティブはエラーも stdout に出す (`error()` -> `$stdout.error`)。
+            // Web UI は target_console が stdout 以外だと 2 番目のコンソールへ
+            // 流すため、ここも stdout に揃える。
+            use narou_rs::application::messages::MessageSink as _;
+            // `SuspendDownload` は対話/中断 (native は update/download 全体を
+            // 中断して専用行を出す)。Worker ではジョブ単位なので、kind ごとに
+            // native の中断行を出してから終端分類へ進む。
+            let line = match (job.kind, error) {
+                (_, NarouError::SuspendDownload(_)) if job.kind == JobKind::Update => {
+                    messages::update::update_interrupted().to_string()
+                }
+                (_, NarouError::SuspendDownload(_)) => {
+                    messages::download::download_interrupted().to_string()
+                }
+                (JobKind::Update, _) => {
+                    let title = match novel_id {
+                        Some(id) => runtime
+                            .novels
+                            .get(id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|record| record.title)
+                            .unwrap_or_default(),
+                        None => job.target.as_str(),
+                    };
+                    messages::update::update_failed(
+                        novel_id.map(|id| id.0).unwrap_or_default(),
+                        title,
+                    )
+                }
+                (_, _) => messages::indented_error(error),
+            };
+            push_sink.emit_async(messages::Stream::Stdout, &line).await;
+            if job.kind == JobKind::Update && crate::consumer::webui_debug_mode(runtime).await {
+                push_sink.emit_async(
+                    messages::Stream::Stdout,
+                    &messages::update::error_detail(error),
+                ).await;
+            }
+        }
+        _ => {}
+    }
+    // ダウンロードが更新した section hash cache を D1 へ書き戻す
+    // (強更新の判定ヒント。書き戻しは必ず当初の writer origin 経由)。
+    if let Some(origin) = budget.write_origin() {
+        let persist: Result<()> = async {
+            let mut guard = NovelWriteGuard::resume(runtime.write_objects(), Some(runtime.assets()), origin).await?;
+            guard.bind_job_owner(Arc::clone(&owner))?;
+            runtime.persist_pending_section_hash_cache(guard.fence()).await
+        }.await;
+        if let Err(error) = persist {
+            return JobOutcome::from_error(error);
+        }
+    }
+    // A cancellation during the last in-flight fetch must not create a new
+    // Convert job (or perform post-update bookkeeping) after acquisition ends.
+    if let Err(error) = runtime.ledger.ensure_execution_active(job_id, execution_token).await {
+        return JobOutcome::from_error(error);
+    }
+    if let Err(error) = &result
+        && !matches!(error, NarouError::DownloadBudgetExpired { .. })
+        && classify_failure(error) == JobFailureClass::Retryable
+        && let Err(checkpoint_error) = budget.save_retry_progress().await
+    {
+        return JobOutcome::Retryable {
+            reason: format!("{error}; retry progress checkpoint failed: {checkpoint_error}"),
+        };
+    }
+    match result {
+        Err(NarouError::DownloadBudgetExpired {
+            next_section_index,
+        }) => {
+            let limit = budget.exceeded_reason().unwrap_or("wall-clock");
+            JobOutcome::Partial {
+                reason: messages::jobs::budget_expired_partial(
+                    limit,
+                    next_section_index,
+                    runtime.subrequests.used(),
+                ),
+                checkpoint: {
+                    let Some(origin) = budget.write_origin() else {
+                        return JobOutcome::Permanent { reason: "download yielded without a durable writer origin".into() };
+                    };
+                    let mut checkpoint = WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id);
+                    checkpoint.write_origin = Some(origin.clone());
+                    checkpoint.creation_reservation = budget.creation_reservation();
+                    checkpoint.phase = ExecutionPhase::Fetching;
+                    checkpoint.next_section_index = Some(next_section_index as u64);
+                    checkpoint
+                },
+            }
+        }
+        result => {
+            let writer = match budget.write_origin() {
+                Some(origin) => match NovelWriteGuard::resume(runtime.write_objects(), Some(runtime.assets()), origin).await {
+                    Ok(mut guard) => {
+                        if let Err(error) = guard.bind_job_owner(Arc::clone(&owner)) { return JobOutcome::from_error(error); }
+                        Some(guard)
+                    },
+                    Err(error) => return JobOutcome::from_error(error),
+                },
+                None => None,
+            };
+            classify_result(result, job, runtime, push_sink.as_ref(), writer.as_ref()).await
+        },
+    }
+    }).await;
+    // Drain every exit, including expansion, frozen and pacing-error paths.
+    downloader.clear_progress().await;
+    downloader.clear_message_sink();
+    outcome
+    }).await
+}
+
+
+/// Resolve a job target to a stored novel id (native `get_data_by_target`
+/// parity for the freeze check): `Id` is direct, `Ncode`/`Url` resolve
+/// through the repository, `All` is unreachable (rejected by
+/// [`unsupported_reason`]). Resolution failures behave like native —
+/// "no record" means "not frozen", so the download proceeds and reports
+/// its own not-found outcome.
+pub(crate) async fn resolve_novel_id(novels: &dyn NovelRepository, target: &JobTarget) -> Option<NovelId> {
+    match target {
+        JobTarget::Id(id) => Some(*id),
+        JobTarget::Ncode(ncode) => novels
+            .find_by_ncode(ncode)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| NovelId(record.id)),
+        JobTarget::Url(url) => novels
+            .find_by_toc_url(url)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| NovelId(record.id)),
+        JobTarget::All => None,
+    }
+}
+
+async fn classify_result(
+    result: Result<DownloadResult>,
+    job: &JobPlan,
+    runtime: &WorkerRuntime,
+    sink: &dyn messages::MessageSink,
+    writer: Option<&NovelWriteGuard>,
+) -> JobOutcome {
+    match result {
+        Ok(result) => match result.status {
+            UpdateStatus::Ok | UpdateStatus::None => {
+                let Some(writer) = writer else {
+                    return JobOutcome::Permanent { reason: "download completed without a durable writer origin".into() };
+                };
+                // native `commands::update` parity: a checked update —
+                // changed or not — clears `modified`, stamps
+                // `last_check_date`, and syncs the `end` tag.
+                if job.kind == JobKind::Update {
+                    let checked: Result<()> = async {
+                        let Some(mut record) = runtime.novels.get_current(NovelId(result.id)).await? else {
+                            return Err(NarouError::NotFound(format!("novel {} disappeared during update", result.id)));
+                        };
+                        if narou_rs::application::novel_actions::mark_update_checked(&mut record, runtime.clock.now_utc()) {
+                            runtime.novels.apply_batch_guarded(writer.fence(), vec![narou_rs::platform::NovelMutation::Upsert(record)]).await?;
+                        }
+                        Ok(())
+                    }.await;
+                    if let Err(error) = checked { return JobOutcome::from_error(error); }
+                }
+                // native `commands::{download,update}` は成功した小説を直後に
+                // 変換する (`narou download` → `narou convert`)。Worker では
+                // `/api/convert` と同じ Convert ジョブを積む。投入自体が
+                // 失敗したらジョブ全体を Retryable に倒す — 変換テキストが
+                // 無いまま「成功」で閉じないため。
+                match enqueue_followup_convert(runtime, job, &result, sink, writer).await {
+                    Ok(()) => JobOutcome::Succeeded,
+                    // native は変換失敗を `convert_error_line` でユーザーへ
+                    // 通知する (`commands::{download,update}` の
+                    // `convert_error_line` emit) ので、ここでも同じ行を出す。
+                    Err(reason) => {
+                        sink.emit_async(
+                            messages::Stream::Stdout,
+                            &messages::download::convert_error_line(&reason),
+                        ).await;
+                        JobOutcome::Retryable { reason }
+                    }
+                }
+            }
+            UpdateStatus::Canceled => JobOutcome::Blocked {
+                reason: format!(
+                    "job {} canceled: an interactive decision (auth/adult/digest) has no terminal on the worker",
+                    job.kind.as_str()
+                ),
+            },
+            UpdateStatus::Failed => {
+                // The only `Failed` producer is the existing-novel TOC 404
+                // (the downloader already echoed "小説が削除されているか
+                // 非公開な可能性があります"). Native freezes the novel with
+                // `frozen` + `404` tags so daily auto-update stops retrying
+                // it — do the same through the shared service.
+                if let Err(error) = runtime
+                    .services
+                    .novel_actions
+                    .mark_not_found_and_freeze(match writer { Some(writer) => writer, None => return JobOutcome::Permanent { reason: "404 result has no writer origin".into() } }, NovelId(result.id))
+                    .await
+                {
+                    return JobOutcome::from_error(NarouError::Platform(error.to_string()));
+                }
+                JobOutcome::Permanent {
+                    reason: "download failed: novel was not found or the update was refused"
+                        .to_string(),
+                }
+            }
+        },
+        Err(error) => JobOutcome::from_error(error),
+    }
+}
+/// ダウンロード成功後の自動変換 (native `commands::{download,update}::auto_convert`
+/// の Web 経路と同じ形)。`/api/convert` が積むのと同じ Convert ジョブを
+/// `enqueue_plan` で積む。台帳の dedupe (`kind:target:options`) が同じ投入を
+/// べき等にするので、再配信で二重に走ることはない。
+///
+/// 戻り値 `Err` は「変換ジョブを積めなかった」= 台帳/キューの障害。
+/// 呼び出し側はジョブ全体をリトライ対象に倒し、変換テキストが無いまま
+/// 成功で閉じない。
+async fn enqueue_followup_convert(
+    runtime: &WorkerRuntime,
+    job: &JobPlan,
+    result: &DownloadResult,
+    sink: &dyn messages::MessageSink,
+    writer: &NovelWriteGuard,
+) -> std::result::Result<(), String> {
+    // 連鎖するのは Download / Update のみ。Convert 自身がここを通らない
+    // (consumer が execute_convert に分岐する) ので無限連鎖は起きない。
+    if !matches!(job.kind, JobKind::Download | JobKind::Update) {
+        return Ok(());
+    }
+    let no_convert = has_option(&job.options, &["--no-convert", "-n"]);
+    let only_new = !no_convert && result.status == UpdateStatus::Ok
+        && job.kind == JobKind::Update
+        && (has_option(&job.options, &["--convert-only-new-arrival", "-a"])
+            || convert_only_new_arrival_setting(runtime).await);
+    let (convert_failure, missing_cached_text) = if !no_convert && result.status == UpdateStatus::None {
+        let mut access = NovelAccess::from_writer(writer.clone(), "followup-convert-decision").await.map_err(|error| error.to_string())?;
+        let inspected: Result<_> = async {
+            access.read()?.validate().await?;
+            let record = runtime.novels.get_current(NovelId(result.id)).await?
+                .ok_or_else(|| NarouError::NotFound(format!("novel {} disappeared before conversion", result.id)))?;
+            let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
+            if keys.prefix().as_ref() != writer.prefix().as_ref().trim_end_matches('/') {
+                return Err(NarouError::Platform("followup conversion namespace changed".into()));
+            }
+            let missing = !record.convert_failure && missing_converted_text(runtime, &record).await;
+            access.read()?.validate().await?;
+            Ok((record.convert_failure, missing))
+        }.await;
+        let released = access.release().await;
+        let decision = inspected.map_err(|error| error.to_string())?;
+        released.map_err(|error| error.to_string())?;
+        decision
+    } else {
+        (false, false)
+    };
+    let convert = narou_rs::application::convert::needs_convert_after_download(
+        result.status,
+        no_convert,
+        narou_rs::application::convert::NoConvertScope::Everything,
+        result.new_arrivals,
+        only_new,
+        convert_failure,
+        missing_cached_text,
+    );
+    if convert && convert_failure {
+        sink.emit_async(messages::Stream::Stdout, &messages::jobs::console_reconvert_note()).await;
+    }
+    if !convert {
+        return Ok(());
+    }
+
+    let outcome = runtime
+        .enqueue_plan_with_origin(JobPlan {
+            kind: JobKind::Convert,
+            target: JobTarget::Id(NovelId(result.id)),
+            options: Vec::new(),
+        }, &writer.origin())
+        .await
+        .map_err(|error| format!("failed to enqueue convert for novel {}: {error}", result.id))?;
+    if let Some(reason) = outcome.blocked {
+        return Err(format!(
+            "convert job for novel {} could not be dispatched: {reason}",
+            result.id
+        ));
+    }
+    console_log!(
+        "job: queued convert job {} for novel {} (sent={})",
+        outcome.job_id,
+        result.id,
+        outcome.sent
+    );
+    Ok(())
+}
+
+fn has_option(options: &[String], names: &[&str]) -> bool {
+    options.iter().any(|option| names.contains(&option.as_str()))
+}
+
+/// `update.convert-only-new-arrival` (native `load_local_setting_bool` 相当)。
+/// 読めないときは native の設定なしと同じ `false` に倒す。
+async fn convert_only_new_arrival_setting(runtime: &WorkerRuntime) -> bool {
+    runtime
+        .write_services()
+        .settings
+        .get("update.convert-only-new-arrival")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| narou_rs::setting_core::setting_bool_value(&value))
+        .unwrap_or(false)
+}
+
+/// Only the Worker adapter checks its persisted text cache; the conversion
+/// decision and failure-flag precedence live in the common predicate.
+async fn missing_converted_text(
+    runtime: &WorkerRuntime,
+    record: &narou_rs::db::NovelRecord,
+) -> bool {
+    let Ok(keys) = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+    else {
+        return false;
+    };
+    // 変換済みテキストを保存しない構成 (`convert.keep-txt=false`) では
+    // そもそも保存されないので、変換を挟む意味がない (EPUB 取得時に組む)。
+    if !crate::convert::keep_converted_text(runtime).await {
+        return false;
+    }
+    // 存在確認がエラーでも「無い」とみなして変換に回す: ストア障害時でも
+    // convert ジョブが queue_failed として失敗を表面化する (黙って
+    // 「テキスト無しのまま成功」にしないため)。
+    // 削除・上書きを伴う変換判定なので primary 直行のストアで存在確認する。
+    !runtime.write_objects().exists(&keys.converted_text()).await.unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_section_for_checkpoint;
+    use narou_rs::application::{
+        ExecutionPhase, JobId, WorkerExecutionCheckpoint,
+    };
+    use narou_rs::platform::NovelId;
+
+    #[test]
+    fn checkpoint_claim_data_resolves_to_downloader_resume_index() {
+        let job_id = JobId("job-1".into());
+        let checkpoint = WorkerExecutionCheckpoint::planned(
+            job_id.clone(),
+            Some(NovelId(42)),
+        )
+        .with_write_origin(narou_rs::application::novel_access::AccessOrigin { prefix: "novels/site/title".into(), epoch: 4 })
+        .advance(ExecutionPhase::Fetching, Some(3));
+        assert_eq!(
+            resume_section_for_checkpoint(&job_id, Some(NovelId(42)), Some(&checkpoint))
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            resume_section_for_checkpoint(
+                &JobId("other-job".into()),
+                Some(NovelId(42)),
+                Some(&checkpoint),
+            )
+            .unwrap_err(),
+            "execution checkpoint belongs to job job-1, not other-job"
+        );
+    }
+
+    #[test]
+    fn legacy_checkpoint_does_not_authorize_a_saved_section_cursor() {
+        let id = JobId("legacy-job".into());
+        let saved = WorkerExecutionCheckpoint::planned(id.clone(), Some(NovelId(42)))
+            .advance(ExecutionPhase::Fetching, Some(200));
+        assert_eq!(resume_section_for_checkpoint(&id, Some(NovelId(42)), Some(&saved)).unwrap(), None);
+    }
+}

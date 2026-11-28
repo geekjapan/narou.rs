@@ -1,14 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NarouApiResult {
-    #[serde(default)]
-    pub allcount: i64,
-    #[serde(default)]
-    pub data: Vec<NarouApiEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NarouApiEntry {
     #[serde(default)]
     pub ncode: String,
@@ -49,6 +41,9 @@ pub struct SubtitleInfo {
     pub subupdate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download_time: Option<String>,
+    /// Saved-body generation: zero is legacy, one is an unchanged legacy baseline.
+    #[serde(default, skip_serializing_if = "is_legacy_revision")]
+    pub download_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +84,13 @@ pub struct SectionFile {
     pub subupdate: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download_time: Option<String>,
+    #[serde(default, skip_serializing_if = "is_legacy_revision")]
+    pub download_revision: u64,
     pub element: SectionElement,
+}
+
+fn is_legacy_revision(revision: &u64) -> bool {
+    *revision == 0
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -32,12 +32,19 @@ fn cmd_folder_inner(targets: &[String], no_open: bool) -> Result<(), String> {
             log::report_error(&format!("{} は存在しません", target));
             continue;
         };
+        if !dir.is_dir() {
+            log::report_error(&format!(
+                "保存フォルダがありません: {} (SQLite の実ファイル保存を無効にしている場合は narou db export-yaml --in-place で復元できます)",
+                dir.display()
+            ));
+            continue;
+        }
 
-        if no_open {
-            println!("{}", dir.display());
-        } else {
+        // Ruby は open の有無に関わらずパスを表示する (folder.rb: `puts dir`)。
+        if !no_open {
             open_directory(&dir, None);
         }
+        println!("{}", dir.display());
     }
 
     Ok(())
@@ -45,12 +52,9 @@ fn cmd_folder_inner(targets: &[String], no_open: bool) -> Result<(), String> {
 
 fn resolve_novel_dir(target: &str) -> Option<PathBuf> {
     let id = super::resolve_target_to_id(target)?;
-    db::with_database(|db| {
-        let archive_root = db.archive_root().to_path_buf();
-        Ok(db
-            .get(id)
-            .map(|record| novel_dir_for_record(&archive_root, record)))
-    })
-    .ok()
-    .flatten()
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let record = novels.get_current_sync(id.into()).ok().flatten()?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .unwrap_or_else(|_| PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
+    Some(novel_dir_for_record(&archive_root, &record))
 }

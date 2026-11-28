@@ -1,0 +1,130 @@
+//! Platform abstraction layer.
+//!
+//! Domain logic (`downloader`, `converter`, `db`, `commands`, `web`) depends on
+//! these traits; native and Cloudflare Workers implementations implement them.
+//! This module must never depend on `reqwest`, `curl`, `std::fs`,
+//! `std::process`, or any Cloudflare-specific type.
+//!
+//! Dependency direction:
+//!
+//! ```text
+//! core → platform (traits) ← native / worker implementations
+//! ```
+//!
+//! See `docs/platform-abstraction.md` for the full design.
+
+pub mod asset_codec;
+pub mod asset_reader;
+pub mod clock;
+pub mod cookie_store;
+pub mod http;
+/// HTTP/1.1 wire codec for transports without an HTTP stack (the Worker's
+/// `connect()` socket fallback). Byte-oriented and platform-neutral.
+pub mod http1;
+pub(crate) mod id_allocator;
+pub mod job_owner;
+pub mod mocks;
+pub mod object_store;
+pub mod progress;
+pub mod rate_limiter;
+/// Codec for an external fetch relay (`scripts/relay/`): builds
+/// `GET|POST /proxy` calls and decodes the JSON response. Transport-neutral.
+pub mod relay;
+pub mod repository;
+mod s3_diagnostics;
+pub mod s3_request;
+pub mod s3_sigv4;
+pub mod s3_store;
+pub mod split_store;
+pub mod staging;
+
+/// Durable, resumable staged uploads in the `.narou-transfer/` namespace:
+/// ordered appends with a persisted `sha2` hash checkpoint, seal/abort,
+/// owner-bound leases and owner-based reclamation. Transfer stage objects
+/// are never touched by the `.narou-staging/` TTL collector.
+pub mod transfer_stage;
+
+/// Per-novel reader/writer access fence (`NovelContentAccess`): admission
+/// close happens before reader drain, renewals reuse the admission CAS, and
+/// canonical commits are epoch-guarded. Identified by `ObjectPrefix`, not
+/// OS paths.
+pub mod access_fence;
+pub mod store_migration;
+pub mod url_policy;
+
+pub use asset_reader::AssetReader;
+pub use staging::StagedAsset;
+pub use job_owner::JobExecutionOwner;
+pub use access_fence::{
+    GateInfo, GateLease, GateState, WriteFence, NovelAccessFence, READER_LEASE_SECS, membership_digest,
+};
+pub use staging::{is_reserved_key, is_staging_key, is_transfer_key};
+pub use transfer_stage::{
+    HASH_CHECKPOINT_ALG, SealedAsset, StageCursor, StageLease, StageLeaseState,
+    STAGE_APPEND_MAX, TRANSFER_PREFIX, TransferStageStore, WriteOnce,
+    decode_sha_state, encode_sha_state, stage_data_key, stage_ledger_key,
+};
+pub use clock::{Clock, SystemClock};
+pub use cookie_store::{
+    CookieStore, DecodedGroups, HostCookie, LoginGroup, apply_set_cookie, cookie_host_for_url,
+    cookie_lookup_hosts, decode_groups, fold_per_host_lists, site_for_host, site_for_host_with,
+    tidy_groups, assign_group_ids, encode_groups, format_cookie_header, mask_cookie,
+    merge_cookie_headers, merge_stored_cookies, normalize_cookie_host, parse_cookie_header,
+};
+pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, HttpStreamResponse, RedirectMode};
+pub use object_store::{
+    paginate_object_listing, prefix_upper_bound,
+    AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectEncoding,
+    ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
+    ObjectUpdateResult, SmallObjectMutator,
+    ObjectFingerprint, ObjectFingerprintMismatch, ObjectFingerprintReader,
+    encode_object_payload, decode_object_payload_limited,
+    compress_object_payload, content_type_for_key, decompress_object_payload, illustration_key,
+    object_crc32, verify_object_crc32,
+};
+pub use progress::ProgressReporter;
+pub use rate_limiter::{
+    DownloadPacing, RateLimitScope, RateLimiter, ScopedPacing, normalize_site_key,
+    site_family,
+    normalize_wait_steps,
+};
+pub use s3_request::{object_size, parse_content_range_size};
+pub use s3_store::{S3Store, S3StoreConfig, MAX_OBJECT_BYTES, SMALL_CAP};
+pub use repository::{
+    NovelFilter, NovelId, NovelIdReservation, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
+    SearchField, SearchTerm, resolve_update_scan_sort,
+};
+pub use split_store::{SplitStore, is_illustration_key};
+pub use store_migration::{
+    IllustrationDedupState, StoreMigrationState, deduplicate_illustrations_page_with_source, migrate_page,
+};
+pub use url_policy::{is_safe_public_ip, validate_url_syntax};
+
+/// Target-aware future type used by every async platform trait.
+///
+/// Native implementations drive blocking transports through
+/// `tokio::task::spawn_blocking` and parallel updates through `tokio::spawn`,
+/// so the future must be `Send`. Cloudflare Workers' JS bindings are not
+/// guaranteed to be `Send`, so on `wasm32` we relax the bound.
+#[cfg(not(target_arch = "wasm32"))]
+pub type PlatformFuture<'a, T> = futures::future::BoxFuture<'a, T>;
+
+#[cfg(target_arch = "wasm32")]
+pub type PlatformFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
+
+/// Marker for services that live on the platform side of the abstraction.
+///
+/// On native, services are shared across threads (`Send + Sync`, required by
+/// `tokio::spawn` and the axum `State`). Worker JS bindings stay within their
+/// isolate and may be neither `Send` nor `Sync`, so `wasm32` has no bound.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait PlatformService: Send + Sync {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> PlatformService for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait PlatformService {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> PlatformService for T {}

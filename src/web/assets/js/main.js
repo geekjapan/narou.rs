@@ -2,22 +2,40 @@
  * Main entry point — initialization and periodic refresh
  */
 import { State, El, initElements } from './core/state.js';
-import { fetchJson } from './core/http.js';
+import { fetchJson, postJson } from './core/http.js';
+import { renderConsoleLine } from './core/console_html.js';
+import { createConsoleHistoryPoller } from './core/console_history.js';
+import { createResilientWebSocket } from './core/websocket.js';
+import { restoreSortState } from './core/sort_state.js';
+import { setCapabilities, applyActionCapabilities, initCapabilityGuard } from './core/capabilities.js';
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
 import { initFeatureTour, maybeShowPendingFeatureTour } from './ui/feature_tour.js';
-import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks } from './ui/render.js';
+import { initConsoleSizing } from './ui/console_size.js';
+import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks, syncAttributeTagControls } from './ui/render.js';
 import {
   applyNotepadSnapshot,
+  captureThemeRead,
+  applyThemeSnapshot,
   bindActions,
+  clearConsoleHistoryUi,
   handleRegisterParam,
   refreshList,
   refreshQueue,
-  refreshQueueDetailed,
+  setQueueStatusObserver,
+  refreshQueueDetailedIfOpen,
   refreshTags,
+  refreshFavoriteTags,
+  replaceConsoleHistory,
+  appendConsoleHistory,
+  captureTagSortRead,
+  applyTagSortOrder,
 } from './ui/actions.js';
 
-let ws = null;
+let wsConnection = null;
+let controlStateMayBeStale = false;
+let webConfigReadGeneration = 0;
+let pendingControlRefresh = false;
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
 const CONSOLE_BOTTOM_THRESHOLD = 8;
 
@@ -37,32 +55,49 @@ function applyPerformanceMode() {
   document.body.classList.toggle('performance-mode', isPerformanceModeEnabled());
 }
 
-async function refreshListWithUiState() {
-  await refreshList();
+async function refreshListWithUiState(redraw = true) {
+  await refreshList(redraw);
   applyPerformanceMode();
 }
 
-async function refreshListAndTags() {
-  await refreshListWithUiState();
-  await refreshTags();
-}
+let pendingListRefresh = false;
+let pendingTagRefresh = false;
+let pendingFavoriteRefresh = false;
+let refreshTimer = null;
 
-function isQueueModalOpen() {
-  return Boolean(El.queueModal && !El.queueModal.classList.contains('hide'));
-}
-
-function refreshQueueDetailedIfOpen() {
-  if (isQueueModalOpen()) {
-    void refreshQueueDetailed();
-  }
+function scheduleTableRefresh(includeList, includeFavorites = false) {
+  pendingListRefresh ||= includeList;
+  pendingTagRefresh = true;
+  pendingFavoriteRefresh ||= includeFavorites;
+  if (refreshTimer !== null) return;
+  refreshTimer = setTimeout(async () => {
+    const reloadList = pendingListRefresh;
+    const reloadTags = pendingTagRefresh;
+    const reloadFavorites = pendingFavoriteRefresh;
+    pendingListRefresh = pendingTagRefresh = pendingFavoriteRefresh = false;
+    await Promise.all([
+      reloadList ? refreshListWithUiState(false) : null,
+      reloadTags ? refreshTags(false) : null,
+      reloadFavorites ? refreshFavoriteTags() : null,
+    ]);
+    renderNovelList();
+    refreshTimer = null;
+    if (pendingListRefresh || pendingTagRefresh || pendingFavoriteRefresh) {
+      scheduleTableRefresh(pendingListRefresh, pendingFavoriteRefresh);
+    }
+  }, 50);
 }
 
 async function init() {
   initElements();
+  initCapabilityGuard(message => showNotification(message, 'warning'));
+  applyActionCapabilities();
   initDropdowns();
   initFeatureTour();
   applyI18n();
+  initProgressQueueSync();
   bindActions();
+  initConsoleSizing();
   bindConsoleAutoScroll(El.console);
   bindConsoleAutoScroll(El.consoleStdout2);
 
@@ -72,44 +107,51 @@ async function init() {
   // refresh of the page does not re-prompt with the same URL.
   handleBookmarkletRegisterParam();
 
-  // Load config from server
+  // Load config and sort state from server。
+  // 互いに独立なので直列に待たず、1 往復分の待ち時間で済ませる
+  // (以前は config の応答を待ってから sort_state を投げていた)。
+  const themeGeneration = captureThemeRead();
+  const tagSortGeneration = captureTagSortRead();
+  const configGeneration = ++webConfigReadGeneration;
+  const [config, sortState] = await Promise.all([
+    fetchJson('/api/webui/config').catch(() => null),
+    fetchJson('/api/sort_state').catch(() => null),
+  ]);
+
   try {
-    const config = await fetchJson('/api/webui/config');
-    if (config) {
-      applyWebConfig(config);
+    if (config && configGeneration === webConfigReadGeneration) {
+      applyWebConfig(config, themeGeneration, tagSortGeneration);
     }
   } catch { /* use defaults */ }
 
-  // Load sort state from server
   try {
-    const sortState = await fetchJson('/api/sort_state');
-    if (sortState) {
-      const colMap = { 0: 'id', 1: 'last_update', 2: 'general_lastup', 3: 'last_check_date',
-        4: 'title', 5: 'author', 6: 'sitename', 7: 'novel_type', 9: 'general_all_no', 10: 'length' };
-      const col = colMap[sortState.column] || 'last_update';
-      State.sortCol = col;
-      State.sortAsc = sortState.dir === 'asc';
-    }
+    restoreSortState(sortState);
   } catch { /* use defaults */ }
 
-  // Initial data load
-  await Promise.all([refreshListWithUiState(), refreshQueue(), refreshQueueDetailed(), refreshTags()]);
+  // 一覧の取得を待たずに投げておく (モーダル/通知の表示自体は各関数が
+  // データを受け取ってから行うので、体感の順序は変わらない)。
+  void maybeShowPendingFeatureTour();
+  void maybeOfferLibraryBackup();
+
+  // Queue details may span many pages. Fetch them only for the queue modal.
+  await Promise.all([refreshListWithUiState(false), refreshQueue(), refreshTags(false)]);
+  void refreshFavoriteTags();
+  renderNovelList();
 
   // Sync UI state (check marks, wide mode, footer)
   syncViewChecks();
-  void maybeShowPendingFeatureTour();
 
   // WebSocket
   connectWebSocket();
+  window.addEventListener('focus', () => {
+    if (wsConnection?.isFallbackActive()) void reloadWebConfig(true);
+  });
 
   // Periodic refresh
   const interval = Math.max(State.pollIntervalSeconds, 10) * 1000;
   setInterval(async () => {
-    await refreshListWithUiState();
-    await refreshQueue();
-    if (isQueueModalOpen()) {
-      await refreshQueueDetailed();
-    }
+    await Promise.all([refreshListWithUiState(), refreshQueue()]);
+    await refreshQueueDetailedIfOpen();
   }, interval);
 }
 
@@ -117,42 +159,83 @@ function connectWebSocket() {
   const url = new URL('/ws', location.href);
   url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
-  try {
-    ws = new WebSocket(url.toString());
-  } catch {
-    return;
-  }
+  // 接続が失敗するだけでなく、handshake が保留になる (onopen も onclose も
+  // 来ない) 場合も履歴取得へ切り替えるため、接続に時間制限を設けた
+  // WebSocket を使う。
+  wsConnection = createResilientWebSocket({
+    url: url.toString(),
+    createSocket: (target) => new WebSocket(target),
+    onOpen: () => {
+      // 接続が確立したら履歴取得を止める。接続が切れて作り直された
+      // 接続が開いたときも、前の接続が始めた履歴取得を止める。
+      stopConsoleHistoryPolling();
+      if (controlStateMayBeStale) {
+        controlStateMayBeStale = false;
+        void reloadWebConfig(true);
+      }
+      const con = document.getElementById('console');
+      if (con) {
+        con.innerHTML = '';
+        setConsolePinned(con, true);
+      }
+      const con2 = document.getElementById('console-stdout2');
+      if (con2) {
+        con2.innerHTML = '';
+        setConsolePinned(con2, true);
+      }
+      clearAllProgressBars();
+    },
+    onMessage: (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        handleWsMessage(msg);
+      } catch {
+        appendConsole(event.data);
+      }
+    },
+    onClose: () => {
+      controlStateMayBeStale = true;
+      setTimeout(connectWebSocket, 5000);
+    },
+    onFallbackStart: () => {
+      controlStateMayBeStale = true;
+      startConsoleHistoryPolling();
+    },
+    onFallbackStop: () => stopConsoleHistoryPolling(),
+  });
+  wsConnection.connect();
+}
 
-  ws.onopen = () => {
+/* ===== WebSocket が使えないときの補完 ===== */
+
+// WebSocket が繋がらないことを一度だけ知らせる (原因が分からないと
+// _STATUS 欄が空のまま原因に気づけないため)。
+function notifyConsoleHistoryFallback() {
+  showNotification(
+    'WebSocket に接続できないため、履歴の取得でコンソールを更新します (server-ws-add-accepted-domains に現在のホストを追加するか、前段 proxy が WebSocket を中継する設定を確認してください)',
+    'warning',
+  );
+}
+
+const consoleHistoryPoller = createConsoleHistoryPoller({
+  fetchJson,
+  notify: notifyConsoleHistoryFallback,
+  getTargets() {
+    const targets = [];
     const con = document.getElementById('console');
-    if (con) {
-      con.innerHTML = '';
-      setConsolePinned(con, true);
-    }
+    if (con) targets.push({ stream: 'stdout', replace: (h) => replaceConsoleHistory(con, h), append: (h) => appendConsoleHistory(con, h) });
     const con2 = document.getElementById('console-stdout2');
-    if (con2) {
-      con2.innerHTML = '';
-      setConsolePinned(con2, true);
-    }
-    clearAllProgressBars();
-  };
+    if (con2) targets.push({ stream: 'stdout2', replace: (h) => replaceConsoleHistory(con2, h), append: (h) => appendConsoleHistory(con2, h) });
+    return targets;
+  },
+});
 
-  ws.onmessage = (event) => {
-    try {
-      const msg = JSON.parse(event.data);
-      handleWsMessage(msg);
-    } catch {
-      appendConsole(event.data);
-    }
-  };
+function startConsoleHistoryPolling() {
+  consoleHistoryPoller.start();
+}
 
-  ws.onclose = () => {
-    setTimeout(connectWebSocket, 5000);
-  };
-
-  ws.onerror = () => {
-    ws?.close();
-  };
+function stopConsoleHistoryPolling() {
+  consoleHistoryPoller.stop();
 }
 
 /**
@@ -189,33 +272,77 @@ function stripRegisterParamFromUrl() {
   }
 }
 
-function applyWebConfig(config) {
+function applyWebConfig(config, themeGeneration, tagSortGeneration) {
   if (config.theme) {
-    const theme = normalizeTheme(config.theme);
-    State.theme = theme;
-    document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
-    const sel = El.themeSelect;
-    if (sel) sel.value = theme;
+    applyThemeSnapshot(normalizeTheme(config.theme), themeGeneration);
   }
-  if (config.ws_port) State.wsPort = config.ws_port;
+  setCapabilities(config.capabilities);
   if (config.performance_mode) State.performanceMode = config.performance_mode;
-  if (config.reload_timing) State.tableReloadTiming = config.reload_timing;
   State.debugMode = Boolean(config.debug_mode);
   setConcurrencyEnabled(Boolean(config.concurrency_enabled));
+  for (const [key, stateKey, id] of [
+    ['attribute_tags_enabled', 'attributeTagsEnabled', 'enable-attribute-tags'],
+    ['show_novel_attribute', 'showNovelAttribute', 'show-novel-attribute'],
+    ['show_manga_attribute', 'showMangaAttribute', 'show-manga-attribute'],
+  ]) {
+    const checkbox = document.getElementById(id);
+    if (typeof config[key] !== 'boolean' || checkbox?.dataset.saving === '1') continue;
+    State[stateKey] = config[key];
+    if (checkbox) checkbox.checked = config[key];
+  }
+  syncAttributeTagControls();
+  renderTagList();
+  renderNovelList();
+  if (config.tag_sort_order) {
+    applyTagSortOrder(config.tag_sort_order, tagSortGeneration);
+  }
 }
 
 function normalizeTheme(theme) {
   return (theme === 'Cerulean' || theme === 'default') ? 'default' : theme;
 }
 
-async function reloadWebConfig() {
+// Debug Mode (`webui.debug-mode`) では、Web コンソールに出る行をブラウザの
+// 開発者コンソールへも流す。Web コンソールを見ていなくても、挿絵が EPUB に
+// 入らない等の内部判断を DevTools で追えるようにするための転送で、表示内容は
+// 変えない (OFF のときは何もしない)。
+function mirrorConsoleToDevtools(text, targetConsole) {
+  if (!State.debugMode || typeof console === 'undefined' || !text) return;
+  const line = String(text);
+  const label = '[narou]';
+  if (line.startsWith('[debug]')) {
+    console.debug(`${label} ${line}`, targetConsole || 'stdout');
+  } else if (targetConsole && targetConsole !== 'stdout') {
+    console.error(`${label} ${line}`, targetConsole);
+  } else {
+    console.log(`${label} ${line}`, targetConsole || 'stdout');
+  }
+}
+
+async function reloadWebConfig(refreshControls = false) {
+  pendingControlRefresh ||= refreshControls;
+  const themeGeneration = captureThemeRead();
+  const tagSortGeneration = captureTagSortRead();
+  const generation = ++webConfigReadGeneration;
+  const previousAttributeTagsEnabled = State.attributeTagsEnabled;
+  const previousTagSortOrder = State.tagSortOrder;
   try {
-    const config = await fetchJson('/api/webui/config');
+    const config = await fetchJson('/api/webui/config?fresh=1');
+    if (generation !== webConfigReadGeneration) return;
     if (config) {
-      applyWebConfig(config);
+      applyWebConfig(config, themeGeneration, tagSortGeneration);
       applyPerformanceMode();
     }
   } catch { /* keep current config */ }
+  if (generation !== webConfigReadGeneration) return;
+  const attributesChanged = previousAttributeTagsEnabled !== State.attributeTagsEnabled;
+  const refreshAll = pendingControlRefresh;
+  pendingControlRefresh = false;
+  await Promise.all([
+    attributesChanged ? refreshList() : null,
+    refreshAll || attributesChanged || previousTagSortOrder !== State.tagSortOrder ? refreshTags() : null,
+    refreshAll ? refreshFavoriteTags() : null,
+  ]);
 }
 
 function setConcurrencyEnabled(enabled) {
@@ -241,19 +368,22 @@ function handleWsMessage(msg) {
     case 'refresh':
     case 'list_updated':
     case 'table.reload':
-      refreshListAndTags();
+      scheduleTableRefresh(true);
       break;
     case 'tag.updateCanvas':
-      refreshTags();
+      scheduleTableRefresh(false);
       break;
     case 'webui.config.reload':
       reloadWebConfig();
       break;
+    case 'favorite_tags.reload':
+      scheduleTableRefresh(false, true);
+      break;
     case 'notepad.change':
       if (msg.data) {
-        const result = applyNotepadSnapshot(msg.data, { keepLocalEdits: true });
+        const result = applyNotepadSnapshot(msg.data);
         if (result.keptLocalEdits) {
-          showNotification('他の画面でメモ帳が更新されました。保存時に再読み込みされます', 'warning');
+          showNotification('他の画面でメモ帳が更新されました。入力内容は保持しています', 'warning');
         }
       }
       break;
@@ -261,34 +391,52 @@ function handleWsMessage(msg) {
       appendConsole(msg.body || '', msg.target_console);
       break;
     case 'queue_start':
+      removeProgressBarsForScope(queueEventJobId(msg.data));
+      closedProgressScopes.delete(queueEventJobId(msg.data));
+      progressStateRevision++;
       refreshQueue();
       refreshQueueDetailedIfOpen();
       break;
     case 'queue_complete':
+      removeProgressBarsForScope(queueEventJobId(msg.data));
       refreshQueue();
       refreshQueueDetailedIfOpen();
       break;
     case 'queue_failed':
+      removeProgressBarsForScope(queueEventJobId(msg.data));
       refreshQueue();
       refreshQueueDetailedIfOpen();
       notifyQueueFailure(msg.data);
       break;
     case 'queue_retry':
+      removeProgressBarsForScope(queueEventJobId(msg.data));
       refreshQueue();
       refreshQueueDetailedIfOpen();
       break;
     case 'queue_partial':
     case 'queue.partial':
+      removeProgressBarsForScope(queueEventJobId(msg.data));
       refreshQueue();
-      refreshQueueDetailed();
+      refreshQueueDetailedIfOpen();
       notifyQueuePartial(msg.data);
       break;
     case 'queue_cancelled':
     case 'queue.cancelled':
+      removeProgressBarsForScope(queueEventJobId(msg.data));
       refreshQueue();
-      refreshQueueDetailed();
+      refreshQueueDetailedIfOpen();
       notifyQueueCancelled(msg.data);
       break;
+    case 'library_backup.done': {
+      const path = (msg.data && msg.data.path) || '';
+      showNotification(`ライブラリのバックアップを作成しました: ${path}`, 'success');
+      break;
+    }
+    case 'library_backup.failed': {
+      const message = (msg.data && msg.data.message) || '不明なエラー';
+      showNotification(`ライブラリのバックアップに失敗しました: ${message}`, 'error');
+      break;
+    }
     case 'shutdown':
       appendConsole('サーバーをシャットダウンしています...');
       break;
@@ -297,43 +445,120 @@ function handleWsMessage(msg) {
       rememberRebootReturnTo();
       setTimeout(() => { location.href = '/_rebooting'; }, 500);
       break;
-    case 'console.clear': {
-      const con = document.getElementById('console');
-      if (con) {
-        con.innerHTML = '';
-        setConsolePinned(con, true);
-      }
-      const con2 = document.getElementById('console-stdout2');
-      if (con2) {
-        con2.innerHTML = '';
-        setConsolePinned(con2, true);
-      }
-      clearAllProgressBars();
+    case 'console.clear':
+      clearConsoleHistoryUi();
       break;
-    }
     case 'error':
       appendConsole('[エラー] ' + (msg.data || msg.message || ''));
       break;
     case 'progressbar.init':
-      initProgressBar(msg.data?.topic, msg.target_console, msg.data?.scope);
+      setProgressBar(msg.data || {}, msg.target_console, true);
       break;
     case 'progressbar.step':
-      setProgressBar(
-        msg.data?.percent,
-        msg.data?.current,
-        msg.data?.total,
-        msg.data?.topic,
-        msg.target_console,
-        msg.data?.scope
-      );
+      setProgressBar(msg.data || {}, msg.target_console);
       break;
     case 'progressbar.clear':
-      removeProgressBar(msg.data?.topic, msg.target_console, msg.data?.scope);
+      removeProgressBar(msg.data || {}, msg.target_console);
       break;
     default:
       console.debug('Unknown WS event:', msg);
       break;
   }
+}
+
+/**
+ * 0.4.0 未満からのアップデート後初回表示で、ライブラリ全体バックアップを
+ * 提案するモーダルを出す。サーバー側の marker (.narou/last-run-version) が
+ * 境界を跨いだ場合だけ pending=true が返る。
+ */
+async function maybeOfferLibraryBackup() {
+  let status;
+  try {
+    status = assertLibraryBackupSuccess(
+      await fetchJson('/api/library_backup'),
+      'ライブラリのバックアップ情報を取得できませんでした'
+    );
+  } catch (error) {
+    showNotification(
+      readApiErrorMessage(error, 'ライブラリのバックアップ情報を取得できませんでした'),
+      'error'
+    );
+    return;
+  }
+  if (!status || !status.pending) return;
+
+  const modal = El.libraryBackupModal;
+  if (!modal) return;
+
+  const sizeText = formatBytes(status.total_bytes);
+  const freeText = status.free_bytes != null ? formatBytes(status.free_bytes) : '不明';
+  if (El.libraryBackupSize) {
+    El.libraryBackupSize.textContent = `対象: ライブラリフォルダ全体 (計 ${sizeText}) / 保存先ドライブの空き: ${freeText}`;
+  }
+  if (El.libraryBackupSpaceWarning) {
+    El.libraryBackupSpaceWarning.classList.toggle('hide', status.enough_space !== false);
+  }
+  if (El.libraryBackupOutput) {
+    El.libraryBackupOutput.value = status.default_output || '';
+  }
+
+  modal.classList.remove('hide');
+
+  const close = () => modal.classList.add('hide');
+  El.libraryBackupClose?.addEventListener('click', close, { once: true });
+  El.libraryBackupDismiss?.addEventListener('click', async () => {
+    close();
+    try {
+      const result = await postJson('/api/library_backup', { action: 'dismiss' });
+      assertLibraryBackupSuccess(result, 'バックアップの提案を閉じられませんでした');
+    } catch (error) {
+      showNotification(readApiErrorMessage(error, 'バックアップの提案を閉じられませんでした'), 'error');
+    }
+  }, { once: true });
+  El.libraryBackupCreate?.addEventListener('click', async () => {
+    close();
+    const output = El.libraryBackupOutput?.value?.trim() || '';
+    try {
+      const result = assertLibraryBackupSuccess(
+        await postJson('/api/library_backup', { action: 'create', output }),
+        'バックアップの開始に失敗しました'
+      );
+      if (result && result.started) {
+        showNotification('ライブラリのバックアップを開始しました', 'info');
+      }
+    } catch (error) {
+      showNotification(readApiErrorMessage(error, 'バックアップの開始に失敗しました'), 'error');
+    }
+  }, { once: true });
+}
+
+function assertLibraryBackupSuccess(result, fallbackMessage) {
+  const error = result?.error;
+  if (result?.success === false || error) {
+    const message = result?.message
+      || error?.message
+      || (typeof error === 'string' ? error : '');
+    throw new Error(message || fallbackMessage);
+  }
+  return result;
+}
+
+function readApiErrorMessage(error, fallbackMessage) {
+  // `core/http.js` が応答本文のメッセージを抽出済みなので、そのまま使う。
+  const message = error?.message;
+  return typeof message === 'string' && message.trim() ? message : fallbackMessage;
+}
+
+function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes)) return '不明';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit + 1 < units.length) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} ${units[unit]}` : `${value.toFixed(1)} ${units[unit]}`;
 }
 
 function notifyQueueFailure(data) {
@@ -419,6 +644,27 @@ function isConsolePinned(consoleEl) {
 function scrollConsoleToBottom(consoleEl) {
   if (!consoleEl) return;
   consoleEl.scrollTop = consoleEl.scrollHeight;
+  consoleScrollTops.set(consoleEl, consoleEl.scrollTop);
+}
+
+var consoleScrollTops = new WeakMap();
+var consoleStickFrames = new WeakMap();
+
+// 一番下に張り付いている間は、レイアウト変更で scrollHeight / clientHeight が
+// 変わっても追従する。次のフレームでもう一度合わせるのは、スクロールバーの
+// 出現・進捗バーの表示でブラウザが確定する位置が 1 フレーム遅れるため。
+function scheduleConsoleStick(consoleEl) {
+  if (!consoleEl) return;
+  syncPinnedConsole(consoleEl);
+  var previous = consoleStickFrames.get(consoleEl);
+  if (previous) cancelAnimationFrame(previous);
+  consoleStickFrames.set(consoleEl, requestAnimationFrame(function() {
+    consoleStickFrames.set(consoleEl, requestAnimationFrame(function() {
+      consoleStickFrames.delete(consoleEl);
+      syncPinnedConsole(consoleEl);
+      consoleScrollTops.set(consoleEl, consoleEl.scrollTop);
+    }));
+  }));
 }
 
 function syncPinnedConsole(consoleEl) {
@@ -430,16 +676,30 @@ function syncPinnedConsole(consoleEl) {
 function bindConsoleAutoScroll(consoleEl) {
   if (!consoleEl) return;
   setConsolePinned(consoleEl, true);
+  consoleScrollTops.set(consoleEl, consoleEl.scrollTop);
   consoleEl.addEventListener('scroll', () => {
+    // 高さやスクロールバーの変化だけで発生したスクロール（scrollTop が
+    // 動いていない）では追従を解除しない。利用者が実際に動かしたときだけ
+    // 一番下かどうかでピン留めを更新する。
+    var previous = consoleScrollTops.get(consoleEl);
+    if (previous === undefined) previous = consoleEl.scrollTop;
+    var moved = Math.abs(consoleEl.scrollTop - previous);
+    consoleScrollTops.set(consoleEl, consoleEl.scrollTop);
+    if (moved < 1) return;
     setConsolePinned(consoleEl, isConsoleNearBottom(consoleEl));
   }, { passive: true });
   if (typeof ResizeObserver !== 'undefined') {
-    const observer = new ResizeObserver(() => syncPinnedConsole(consoleEl));
+    const observer = new ResizeObserver(() => scheduleConsoleStick(consoleEl));
     observer.observe(consoleEl);
+    if (consoleEl.parentElement) observer.observe(consoleEl.parentElement);
   }
 }
 
 var progressBars = {};
+var closedProgressOperations = new Map();
+var closedProgressScopes = new Map();
+var progressStateRevision = 0;
+var progressQueueSyncTimer = null;
 
 function getProgressHost(targetConsole) {
   var consoleEl = getConsoleEl(targetConsole);
@@ -456,165 +716,152 @@ function updateProgressHostVisibility(targetConsole) {
   var consoleEl = getConsoleEl(targetConsole);
   var host = consoleEl?.parentElement?.querySelector('.console-progress-host');
   if (!host) return;
-  var hasItems = host.childElementCount > 0;
-  host.classList.toggle('hide', !hasItems);
-  consoleEl.classList.toggle('console-with-progress', hasItems);
-  syncPinnedConsole(consoleEl);
+  host.classList.toggle('hide', host.childElementCount === 0);
+  scheduleConsoleStick(consoleEl);
 }
 
-function progressBarKey(topic, targetConsole, scope) {
-  return (targetConsole || 'stdout') + ':' + (scope || topic || 'default');
+function progressBarKey(data, targetConsole) {
+  return JSON.stringify([
+    targetConsole || 'stdout', data.scope || '', data.topic || 'default', data.operation || '',
+  ]);
 }
 
-function initProgressBar(topic, targetConsole, scope) {
-  var key = progressBarKey(topic, targetConsole, scope);
-  removeProgressBar(topic, targetConsole, scope);
-  var host = getProgressHost(targetConsole);
-  if (!host) return;
-  var wrapper = document.createElement('div');
-  wrapper.className = 'console-progress-item';
-  var label = document.createElement('div');
-  label.className = 'console-progress-topic';
-  label.textContent = formatProgressLabel(0, 0, 0);
-  wrapper.appendChild(label);
-  var progress = document.createElement('div');
-  progress.className = 'progress';
-  progress.innerHTML = '<div class="progress-bar" style="width:0%"></div>';
-  wrapper.appendChild(progress);
-  host.appendChild(wrapper);
-  progressBars[key] = {
-    wrapper: wrapper,
-    bar: progress.querySelector('.progress-bar'),
-    label: label,
-  };
-  updateProgressHostVisibility(targetConsole);
+function rememberProgressCompletion(entries, key) {
+  entries.delete(key);
+  entries.set(key, true);
+  if (entries.size > 512) entries.delete(entries.keys().next().value);
 }
 
-function setProgressBar(percent, current, total, topic, targetConsole, scope) {
-  var key = progressBarKey(topic, targetConsole, scope);
-  if (!progressBars[key]) initProgressBar(topic, targetConsole, scope);
-  progressBars[key].bar.style.width = (percent || 0) + '%';
-  progressBars[key].label.textContent = formatProgressLabel(current, total, percent);
-}
-
-function removeProgressBar(topic, targetConsole, scope) {
-  var key = progressBarKey(topic, targetConsole, scope);
-  if (!progressBars[key]) return;
-  var wrapper = progressBars[key].wrapper;
-  if (wrapper) wrapper.remove();
+function discardProgressBar(key) {
+  var entry = progressBars[key];
+  if (!entry) return;
+  entry.wrapper.remove();
   delete progressBars[key];
-  updateProgressHostVisibility(targetConsole);
+  progressStateRevision++;
+  updateProgressHostVisibility(entry.console);
+}
+
+/** A terminal job event closes every operation in that job, never its peers. */
+function removeProgressBarsForScope(scope, targetConsole) {
+  if (typeof scope !== 'string' || !scope) return;
+  rememberProgressCompletion(closedProgressScopes, scope);
+  Object.keys(progressBars).forEach(function(key) {
+    var entry = progressBars[key];
+    if (entry.scope !== scope || (targetConsole && entry.console !== targetConsole)) return;
+    if (entry.operation) rememberProgressCompletion(closedProgressOperations, key);
+    discardProgressBar(key);
+  });
+  progressStateRevision++;
+}
+
+function queueEventJobId(data) {
+  if (typeof data === 'string') return data;
+  if (data && typeof data === 'object' && typeof data.job_id === 'string') return data.job_id;
+  return '';
+}
+
+/** Unknown/partial queue status is not proof that a running job is idle. */
+function clearProgressBarsWhenQueueIdle(queueStatus) {
+  if (!queueStatus || !Number.isFinite(queueStatus.running_count) || !Number.isFinite(queueStatus.pending)) return;
+  if (queueStatus.running_count !== 0 || queueStatus.pending !== 0) return;
+  Object.keys(progressBars).forEach(function(key) {
+    if (progressBars[key].scope) discardProgressBar(key);
+  });
+}
+
+function initProgressQueueSync() {
+  setQueueStatusObserver({
+    before: () => progressStateRevision,
+    after: (status, revision) => {
+      if (revision === progressStateRevision) clearProgressBarsWhenQueueIdle(status);
+    },
+  });
+}
+
+function scheduleProgressQueueSync() {
+  if (progressQueueSyncTimer !== null) return;
+  progressQueueSyncTimer = setTimeout(function() {
+    progressQueueSyncTimer = null;
+    void refreshQueue();
+  }, 50);
+}
+
+function setProgressBar(data, targetConsole, isInit) {
+  var key = progressBarKey(data, targetConsole);
+  if (closedProgressScopes.has(data.scope) || closedProgressOperations.has(key)) return;
+  var entry = progressBars[key];
+  var hasSequence = Number.isSafeInteger(data.sequence) && data.sequence >= 0;
+  if (entry && ((hasSequence && data.sequence <= entry.sequence) || (isInit && !hasSequence))) return;
+  if (!entry) {
+    var host = getProgressHost(targetConsole);
+    if (!host) return;
+    var wrapper = document.createElement('div');
+    wrapper.className = 'console-progress-item';
+    var label = document.createElement('div');
+    label.className = 'console-progress-topic';
+    wrapper.appendChild(label);
+    var progress = document.createElement('div');
+    progress.className = 'progress';
+    progress.setAttribute('role', 'progressbar');
+    progress.setAttribute('aria-valuemin', '0');
+    progress.setAttribute('aria-valuemax', '100');
+    var bar = document.createElement('div');
+    bar.className = 'progress-bar';
+    progress.appendChild(bar);
+    wrapper.appendChild(progress);
+    host.appendChild(wrapper);
+    entry = progressBars[key] = {
+      wrapper: wrapper, progress: progress, bar: bar, label: label,
+      topic: data.topic || 'default', console: targetConsole || 'stdout',
+      scope: data.scope || '', operation: data.operation || '', sequence: -1,
+    };
+    updateProgressHostVisibility(targetConsole);
+    if (entry.scope) scheduleProgressQueueSync();
+  }
+  if (hasSequence) entry.sequence = data.sequence;
+  var total = Number.isFinite(data.total) && data.total > 0 ? data.total : null;
+  var current = Number.isFinite(data.current) ? Math.max(0, data.current) : null;
+  if (total !== null && current !== null) current = Math.min(current, total);
+  var percent = total !== null && current !== null ? current / total * 100
+    : Number.isFinite(data.percent) ? Math.max(0, Math.min(100, data.percent)) : null;
+  var labelText = formatProgressLabel(current, total, percent);
+  if (typeof data.message === 'string' && data.message) labelText += ' — ' + data.message;
+  entry.label.textContent = labelText;
+  entry.label.title = labelText;
+  entry.progress.setAttribute('aria-valuetext', labelText);
+  entry.progress.setAttribute('aria-label', data.message || entry.topic);
+  entry.bar.classList.toggle('progress-bar-indeterminate', percent === null);
+  entry.bar.style.width = percent === null ? 'var(--progress-indeterminate-width)' : percent + '%';
+  if (percent === null) entry.progress.removeAttribute('aria-valuenow');
+  else entry.progress.setAttribute('aria-valuenow', String(percent));
+  progressStateRevision++;
+}
+
+function removeProgressBar(data, targetConsole) {
+  if (data.scope && !data.topic && !data.operation) {
+    removeProgressBarsForScope(data.scope, targetConsole);
+    return;
+  }
+  var key = progressBarKey(data, targetConsole);
+  var entry = progressBars[key];
+  if (entry && Number.isSafeInteger(data.sequence) && data.sequence < entry.sequence) return;
+  if (data.operation) rememberProgressCompletion(closedProgressOperations, key);
+  discardProgressBar(key);
 }
 
 function clearAllProgressBars() {
-  Object.keys(progressBars).forEach(function(key) {
-    var wrapper = progressBars[key].wrapper;
-    if (wrapper) wrapper.remove();
-  });
-  progressBars = {};
-  ['stdout', 'stdout2'].forEach(function(targetConsole) {
-    updateProgressHostVisibility(targetConsole);
-  });
+  clearTimeout(progressQueueSyncTimer);
+  progressQueueSyncTimer = null;
+  Object.keys(progressBars).forEach(discardProgressBar);
+  closedProgressOperations.clear();
+  closedProgressScopes.clear();
+  progressStateRevision++;
 }
 
 function formatProgressLabel(current, total, percent) {
-  var currentValue = Number.isFinite(current) ? current : 0;
-  var totalValue = Number.isFinite(total) ? total : 0;
-  var percentValue = Number.isFinite(percent) ? percent : 0;
-  return '進捗 ' + currentValue + '/' + totalValue + ' ' + percentValue.toFixed(1) + '%';
-}
-
-function sanitizeConsoleSpanStyle(styleText) {
-  var declarations = String(styleText || '')
-    .split(';')
-    .map(function(part) { return part.trim(); })
-    .filter(Boolean);
-  if (!declarations.length || declarations.length > 2) return '';
-
-  var color = '';
-  var fontWeight = '';
-  for (var i = 0; i < declarations.length; i++) {
-    var separator = declarations[i].indexOf(':');
-    if (separator <= 0) return '';
-    var name = declarations[i].slice(0, separator).trim().toLowerCase();
-    var value = declarations[i].slice(separator + 1).trim();
-    if (name === 'color') {
-      if (!/^[#(),.%\sa-zA-Z0-9-]+$/.test(value)) return '';
-      color = value;
-    } else if (name === 'font-weight') {
-      if (value.toLowerCase() !== 'bold') return '';
-      fontWeight = 'bold';
-    } else {
-      return '';
-    }
-  }
-  if (!color) return '';
-
-  var parts = [];
-  if (fontWeight) parts.push('font-weight:bold');
-  parts.push('color:' + color);
-  return parts.join(';');
-}
-
-function sanitizeConsoleNodes(source, target) {
-  var children = source.childNodes || [];
-  for (var i = 0; i < children.length; i++) {
-    var child = children[i];
-    if (child.nodeType === Node.TEXT_NODE) {
-      target.appendChild(document.createTextNode(child.textContent || ''));
-      continue;
-    }
-    if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'RUBY') {
-      appendConsoleRubyBaseText(child, target);
-      continue;
-    }
-    if (child.nodeType === Node.ELEMENT_NODE && (child.tagName === 'RT' || child.tagName === 'RP')) {
-      continue;
-    }
-    if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'RB') {
-      sanitizeConsoleNodes(child, target);
-      continue;
-    }
-    if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'SPAN') {
-      var style = sanitizeConsoleSpanStyle(child.getAttribute('style') || '');
-      if (!style) {
-        target.appendChild(document.createTextNode(child.textContent || ''));
-        continue;
-      }
-      var span = document.createElement('span');
-      span.setAttribute('style', style);
-      sanitizeConsoleNodes(child, span);
-      target.appendChild(span);
-      continue;
-    }
-    target.appendChild(document.createTextNode(child.textContent || ''));
-  }
-}
-
-function appendConsoleRubyBaseText(source, target) {
-  var rbElements = source.querySelectorAll('rb');
-  if (rbElements.length > 0) {
-    for (var i = 0; i < rbElements.length; i++) {
-      target.appendChild(document.createTextNode(rbElements[i].textContent || ''));
-    }
-    return;
-  }
-
-  var children = source.childNodes || [];
-  for (var i = 0; i < children.length; i++) {
-    var child = children[i];
-    if (child.nodeType === Node.TEXT_NODE) {
-      target.appendChild(document.createTextNode(child.textContent || ''));
-    } else if (child.nodeType === Node.ELEMENT_NODE && child.tagName !== 'RT' && child.tagName !== 'RP') {
-      sanitizeConsoleNodes(child, target);
-    }
-  }
-}
-
-function appendSanitizedConsoleHtml(target, html) {
-  var template = document.createElement('template');
-  template.innerHTML = html;
-  sanitizeConsoleNodes(template.content, target);
+  if (percent === null) return current ? '確認済み ' + current + '（総数未確定）' : '進捗（準備中）';
+  var counts = total !== null && current !== null ? '完了 ' + current + '/' + total + ' ' : '進捗 ';
+  return counts + percent.toFixed(1) + '%';
 }
 
 var lastLineComplete = true;
@@ -622,6 +869,9 @@ var lastLineComplete = true;
 function appendConsole(text, targetConsole) {
   const con = getConsoleEl(targetConsole);
   if (!con) return;
+  State.consoleRevision++;
+
+  mirrorConsoleToDevtools(text, targetConsole);
 
   // Ensure text ends with newline (worker strips \n from BufReader::lines())
   if (text.length > 0 && !text.endsWith('\n')) {
@@ -636,22 +886,7 @@ function appendConsole(text, targetConsole) {
   if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
 
   for (var i = 0; i < lines.length; i++) {
-    // Ruby web mode sends <hr> for horizontal rules; also detect text HR (U+2015 × 30+)
-    if (lines[i] === '<hr>' || /^―{30,}$/.test(lines[i])) {
-      var hr = document.createElement('hr');
-      hr.className = 'console-line console-hr';
-      con.appendChild(hr);
-    } else {
-      var div = document.createElement('div');
-      div.className = 'console-line';
-      // Allow limited HTML in console output: styled spans and ruby stripped to base text.
-      if (/<(?:span|ruby|rb|rt|rp)[\s>]/i.test(lines[i])) {
-        appendSanitizedConsoleHtml(div, lines[i]);
-      } else {
-        div.textContent = lines[i];
-      }
-      con.appendChild(div);
-    }
+    renderConsoleLine(con, lines[i]);
   }
 
   // Trim old lines (only console-line elements, preserve progress bars)
@@ -664,7 +899,7 @@ function appendConsole(text, targetConsole) {
   }
 
   if (shouldStick) {
-    scrollConsoleToBottom(con);
+    scheduleConsoleStick(con);
   }
 }
 

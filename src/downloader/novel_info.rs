@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::error::Result;
+use crate::platform::{HttpClient, RateLimiter};
 
+use super::http_policy;
 use super::site_setting::SiteSetting;
 
 pub struct NovelInfo {
@@ -39,35 +41,80 @@ impl NovelInfo {
         }
     }
 
-    pub fn load(
+    /// Fetch the novel-info page (when the site defines `novel_info_url`)
+    /// and parse it. Any fetch failure falls back to the TOC source, matching
+    /// the old `NovelInfo::load` behaviour.
+    ///
+    /// When `novel_info_url` resolves to the already-fetched `toc_url`
+    /// (e.g. Kakuyomu's `\k<toc_url>`), the pre-treated TOC source is parsed
+    /// directly instead of issuing a second request for identical bytes.
+    pub async fn load(
+        http: &dyn HttpClient,
+        rate_limiter: &dyn RateLimiter,
         setting: &SiteSetting,
-        client: &reqwest::blocking::Client,
         toc_source: &str,
         url_captures: &HashMap<String, String>,
+        toc_url: &str,
+        jobs: &mut super::preprocess::PreprocessJobs,
     ) -> Result<Self> {
-        if let Some(novel_info_url) = &setting.novel_info_url {
-            let resolved_url = setting
-                .novel_info_url_with_captures(url_captures)
-                .unwrap_or_else(|| setting.interpolate(novel_info_url));
-            let response = client.get(&resolved_url).send()?;
-            if !response.status().is_success() {
-                return Ok(Self::empty());
+        let Some(novel_info_url) = &setting.novel_info_url else {
+            return Ok(Self::from_toc_source(setting, toc_source).await);
+        };
+        let mut captures = url_captures.clone();
+        captures.insert("__target_url".to_string(), toc_url.to_string());
+        let resolved_url = setting
+            .novel_info_url_with_captures(&captures)
+            .unwrap_or_else(|| setting.interpolate(novel_info_url));
+        if resolved_url == toc_url {
+            // The TOC fetch already ran `pretreatment_source`; parsing it with
+            // the novel-info rules is identical to re-fetching the same URL
+            // and pre-treating it again.
+            return Ok(Self::from_detail_or_toc(setting, toc_source, toc_source).await);
+        }
+        let policy = http_policy::FetchPolicy::for_site(setting);
+        match http_policy::fetch_text(
+            http,
+            rate_limiter,
+            &resolved_url,
+            &policy,
+            Some(setting.encoding()),
+        )
+        .await
+        {
+            Ok(mut body) => {
+                crate::downloader::util::pretreatment_source_with_jobs(
+                    crate::downloader::util::PretreatmentRequest {
+                        http,
+                        rate_limiter,
+                        policy: &policy,
+                        src: &mut body,
+                        encoding: setting.encoding(),
+                        setting: Some(setting),
+                        jobs,
+                        url: &resolved_url,
+                    },
+                )
+                .await?;
+                Ok(Self::from_detail_or_toc(setting, &body, toc_source).await)
             }
-            let mut body = response.text()?;
-            crate::downloader::pretreatment_source(&mut body, setting.encoding(), Some(setting));
-
-            Ok(Self::from_novel_info_source(setting, &body))
-        } else {
-            Ok(Self::from_toc_source(setting, toc_source))
+            Err(_) => Ok(Self::from_toc_source(setting, toc_source).await),
         }
     }
 
-    pub fn from_novel_info_source(setting: &SiteSetting, source: &str) -> Self {
+    async fn from_detail_or_toc(setting: &SiteSetting, detail: &str, toc_source: &str) -> Self {
+        let mut info = Self::from_novel_info_source(setting, detail).await;
+        if info.has_missing_core_fields() {
+            info.fill_missing_from(Self::from_toc_source(setting, toc_source).await);
+        }
+        info
+    }
+
+    pub async fn from_novel_info_source(setting: &SiteSetting, source: &str) -> Self {
         let mut info = Self::empty();
         let keys = [
             "t", "w", "s", "nt", "ga", "gf", "nu", "gl", "l", "tags", "sitename",
         ];
-        info.raw_captures = setting.multi_match(source, &keys);
+        info.raw_captures = setting.multi_match(source, &keys).await;
         if info.raw_captures.is_empty() {
             return info;
         }
@@ -98,9 +145,10 @@ impl NovelInfo {
             .raw_captures
             .get("nu")
             .and_then(|s| parse_narou_date_with_timezone(s, timezone));
-        info.length = info.raw_captures.get("l").and_then(|s| {
-            s.replace(',', "").trim().parse().ok()
-        });
+        info.length = info
+            .raw_captures
+            .get("l")
+            .and_then(|s| s.replace(',', "").trim().parse().ok());
 
         info
     }
@@ -108,12 +156,12 @@ impl NovelInfo {
     /// Fill empty/missing core display fields from a fallback source (e.g. the
     /// TOC page) without overwriting any value already extracted from the
     /// primary novel_info page.
-    pub fn fill_missing_from(&mut self, fallback: NovelInfo) {
+    fn fill_missing_from(&mut self, fallback: NovelInfo) {
         let fill = |target: &mut Option<String>, source: Option<String>| {
-            if target.as_deref().is_none_or(str::is_empty) {
-                if let Some(v) = source.filter(|s| !s.is_empty()) {
-                    *target = Some(v);
-                }
+            if target.as_deref().is_none_or(str::is_empty)
+                && let Some(v) = source.filter(|s| !s.is_empty())
+            {
+                *target = Some(v);
             }
         };
         fill(&mut self.title, fallback.title);
@@ -124,16 +172,16 @@ impl NovelInfo {
 
     /// Whether any core display field (title/author/story/tags) is missing and
     /// could be recovered from a fallback source.
-    pub fn has_missing_core_fields(&self) -> bool {
+    fn has_missing_core_fields(&self) -> bool {
         [&self.title, &self.author, &self.story, &self.tags]
             .iter()
             .any(|field| field.as_deref().is_none_or(str::is_empty))
     }
 
-    pub fn from_toc_source(setting: &SiteSetting, toc_source: &str) -> Self {
+    pub async fn from_toc_source(setting: &SiteSetting, toc_source: &str) -> Self {
         let mut info = Self::empty();
         let keys = ["title", "author", "story", "tags"];
-        info.raw_captures = setting.multi_match(toc_source, &keys);
+        info.raw_captures = setting.multi_match(toc_source, &keys).await;
         info.title = info.raw_captures.get("title").cloned();
         info.author = info.raw_captures.get("author").cloned();
         info.story = info.raw_captures.get("story").cloned();
@@ -147,10 +195,7 @@ fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
     parse_narou_date_with_timezone(s, super::site_timezone(None))
 }
 
-fn parse_narou_date_with_timezone(
-    s: &str,
-    timezone: super::SiteTimezone,
-) -> Option<DateTime<Utc>> {
+fn parse_narou_date_with_timezone(s: &str, timezone: super::SiteTimezone) -> Option<DateTime<Utc>> {
     super::parse_loose_datetime_with_timezone(s, timezone)
 }
 
@@ -161,20 +206,15 @@ mod tests {
     use crate::downloader::site_setting::SiteSetting;
     use chrono::{Datelike, Timelike};
 
-    #[test]
-    fn syosetu_org_title_falls_back_to_toc_when_detail_page_blocked() {
-        let settings = SiteSetting::load_all().unwrap();
-        let setting = settings
-            .iter()
-            .find(|s| s.domain == "syosetu.org")
-            .unwrap();
+    #[tokio::test]
+    async fn syosetu_org_title_falls_back_to_toc_when_detail_page_blocked() {
+        let setting: SiteSetting =
+            serde_yaml::from_str(include_str!("../../webnovel/syosetu.org.yaml")).unwrap();
 
         // Anti-bot interstitial served with HTTP 200: none of the `t:` / `w:`
         // novel_info patterns match, so from_novel_info_source yields nothing.
         let challenge = "<!DOCTYPE html><html><head><title>Just a moment...</title>\
             </head><body>checking your browser</body></html>";
-        let detail_info = NovelInfo::from_novel_info_source(setting, challenge);
-        assert!(detail_info.title.as_deref().unwrap_or("").is_empty());
 
         // The TOC page (reliably fetched during body DL) carries the title/author
         // via the `title:` / `author:` patterns.
@@ -182,8 +222,7 @@ mod tests {
             <span style=\"font-size:150%\" itemprop=\"name\">テスト小説</span>\n\
             <div align=\"right\">作者：<span itemprop=\"author\">著者名</span></div>";
 
-        let mut info = detail_info;
-        info.fill_missing_from(NovelInfo::from_toc_source(setting, toc));
+        let info = NovelInfo::from_detail_or_toc(&setting, challenge, toc).await;
 
         assert_eq!(info.title.as_deref(), Some("テスト小説"));
         assert_eq!(info.author.as_deref(), Some("著者名"));

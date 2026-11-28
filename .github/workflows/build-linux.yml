@@ -1,0 +1,95 @@
+name: Linux build
+
+# Linux サーバー向けバイナリを GitHub ホストの runner で作る。
+# 生成物は配置先に依存しない artifact として取得できる。
+#
+# なぜ self-hosted runner を使わないか:
+#   - このリポジトリは public で、`platform.yml` に pull_request トリガがある。
+#     self-hosted runner に載せると、フォーク PR のコードが手元のマシンで走り得る。
+#   - release プロファイルは lto = true / codegen-units = 1 で、リンクに数 GB を要する。
+#
+# glibc: ubuntu-22.04 (glibc 2.35) でビルドする。Debian 12 / Ubuntu 22.04 以降の
+# コンテナで動く。もっと古い glibc の環境では musl ターゲットに切り替えるか、
+# 一致するコンテナ内でビルドすること。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+
+permissions:
+  contents: read
+
+env:
+  # crates.io などへのダウンロードの一時的なネットワーク障害で CI が落ちるのを防ぐ。
+  # デフォルトの再試行回数 (3) だと macos-15-intel のような不安定なランナーの
+  # 数分の DNS 停止を吸収できない (v0.6.12 のリリース失敗)。
+  CARGO_NET_RETRY: "10"
+  # curl 8.x の HTTP/2 多重化で "transfer too slow" の偽発生が多発するため無効化。
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  build:
+    name: narou_rs (linux x86_64, lite/GPL)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-release
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Build transfer WASM artifacts
+        run: |
+          rustup target add wasm32-unknown-unknown
+          node scripts/build-transfer-wasm.mjs --install-bindgen
+
+      - name: Build
+        env:
+          NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS: "1"
+        run: |
+          cargo build --locked --release --features lite \
+            --bin narou_rs --bin narou_rs_backup --bin narou_rs_login
+
+      - name: Assemble the bundle
+        run: |
+          set -eu
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          dir="narou_rs-${version}-linux-x86_64-gpl"
+          mkdir -p "$dir/webnovel" "$dir/preset"
+          cp target/release/narou_rs "$dir/"
+          cp target/release/narou_rs_backup "$dir/"
+          cp target/release/narou_rs_login "$dir/"
+          cp webnovel/*.yaml "$dir/webnovel/"
+          cp preset/AozoraEpub3.ini.default preset/custom_chuki_tag.txt.default "$dir/preset/"
+          cp Third-Party-License.md "$dir/"
+          cat > "$dir/README.txt" <<'EOF'
+          Linux サーバー用バンドル (x86_64 / 組み込み EPUB エンジン入り = GPL-3.0-only)。
+
+            narou_rs         本体 (CLI + Web UI)
+            narou_rs_backup  バックアップ用ヘルパー
+            narou_rs_login   ブラウザから Cookie を取得 (ブラウザのある端末で実行)
+            webnovel/        同梱のサイト定義 (実行ファイルの隣に置くこと)
+            preset/          外部 AozoraEpub3 を使う場合の雛形 (組み込みエンジンでは不要)
+
+          初回はライブラリ用のフォルダで narou_rs init、その後 narou_rs web を実行。
+          glibc 2.35 (Ubuntu 22.04 / Debian 12) 以降が必要。
+          EOF
+          tar czf "${dir}.tar.gz" "$dir"
+          sha256sum "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: narou_rs-linux-x86_64
+          path: |
+            narou_rs-*-linux-x86_64-gpl.tar.gz
+            narou_rs-*-linux-x86_64-gpl.tar.gz.sha256
+          retention-days: 30

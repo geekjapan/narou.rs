@@ -1,0 +1,294 @@
+//! `GET`/`POST /api/list` — DataTables 形式の小説一覧。
+//!
+//! native `src/web/novels.rs` の `api_list` / `api_list_post`
+//! (`api_list_inner`) と同じパラメータ・同じ JSON 形を返す。
+//! GET はクエリ文字列、POST は `application/x-www-form-urlencoded` 本文から
+//! 読む。axum はどちらも `serde_urlencoded` で平らに展開するため、
+//! `search[value]` / `order[0][column]` / `order[0][dir]` はブラケット込みの
+//! リテラルキー名として扱う (ネストしない)。
+//!
+//! 一覧の絞り込み・ソート・ページング・frozen/new マーカーは native と
+//! 同じ `narou_rs::application::LibraryService::list`
+//! (`MetadataServices::library`) に委譲するので、行の意味も一致する。
+
+use narou_rs::application::web_payloads::{
+    DEFAULT_WEB_PAGE_LENGTH, ListParams, MAX_WEB_PAGE_LENGTH, MAX_WEB_SEARCH_BYTES,
+    NovelListItem, NovelListResponse, combine_search_terms, sort_column_from_index,
+};
+use narou_rs::application::{ApplicationError, LibraryListRequest, LibrarySortOrder};
+use std::collections::HashSet;
+use worker::{Env, Method, Request, Response};
+
+use super::json_error;
+
+/// axum `Form` と同じ受理 Content-Type (パラメータ部は無視)。
+const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+
+
+pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    let params = match req.method() {
+        // axum は `get(...)` に HEAD も通す。Query と同じく生クエリを読む。
+        Method::Get | Method::Head => {
+            let url = req.url()?;
+            parse_list_params(url.query().unwrap_or("").as_bytes())
+        }
+        // axum `Form` と同じく urlencoded 本文のみを受け付ける。
+        Method::Post => {
+            let content_type = req.headers().get("content-type")?.unwrap_or_default();
+            let essence = content_type.split(';').next().unwrap_or("").trim();
+            if !essence.eq_ignore_ascii_case(FORM_CONTENT_TYPE) {
+                return json_error(
+                    415,
+                    "unsupported_media_type",
+                    Some("expected request with `Content-Type: application/x-www-form-urlencoded`"),
+                );
+            }
+            let body = req.bytes().await?;
+            parse_list_params(&body)
+        }
+        _ => return Response::error("Method Not Allowed", 405),
+    };
+    let params = match params {
+        Ok(params) => params,
+        Err(message) => return json_error(400, "invalid_request", Some(&message)),
+    };
+    api_list_inner(&env, params).await
+}
+
+/// native `api_list_inner` (`src/web/novels.rs`) の写し。
+async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Response> {
+    let started_ms = js_sys::Date::now();
+    let draw = params.draw.unwrap_or(1);
+    let return_all = params.all.unwrap_or(false);
+    let start = if return_all {
+        0
+    } else {
+        params.start.unwrap_or(0) as usize
+    };
+    let length = if return_all {
+        None
+    } else {
+        Some(
+            params
+                .length
+                .unwrap_or(DEFAULT_WEB_PAGE_LENGTH)
+                .min(MAX_WEB_PAGE_LENGTH) as usize,
+        )
+    };
+    let total_query_bytes = params.filter.as_ref().map_or(0, String::len)
+        + params.search_value.as_ref().map_or(0, String::len);
+    if total_query_bytes > MAX_WEB_SEARCH_BYTES {
+        return json_error(400, "invalid_request", Some("search query is too long"));
+    }
+
+    let search = combine_search_terms(params.filter, params.search_value);
+    let sort_column = sort_column_from_index(params.order_column);
+    let sort_order = if params.order_dir.as_deref() == Some("desc") {
+        LibrarySortOrder::Descending
+    } else {
+        LibrarySortOrder::Ascending
+    };
+    let include_hidden = params.show_hidden.unwrap_or(false);
+    let db = super::metadata::primary_database(env)?;
+    let repository = std::sync::Arc::new(crate::d1_repository::D1NovelRepository::new(db.clone()));
+    // Attribute reconciliation does not edit the filter inputs. Wait for it
+    // before reading rows, but overlap its primary round trips with the inputs.
+    let (attributes, inputs) = futures::join!(
+        super::metadata::initialize_attributes(env),
+        repository.web_list_inputs(include_hidden),
+    );
+    if let Err(error) = attributes {
+        worker::console_log!("attribute migration failed: {error}");
+        return json_error(503, "service_unavailable", None);
+    }
+    let inputs = match inputs {
+        Ok(inputs) => inputs,
+        Err(error) => return json_error(503, "service_unavailable", Some(&error.to_string())),
+    };
+    let exclude_ids = inputs.members.all_member_ids().into_iter().collect();
+    let primary_library = narou_rs::application::LibraryService::new(
+        repository.clone(),
+        std::sync::Arc::new(narou_rs::platform::SystemClock),
+        std::sync::Arc::new(crate::d1_repository::D1FreezeStore::new(db)),
+        std::sync::Arc::new(narou_rs::application::EmptySiteTimezoneProvider),
+    );
+    let snapshot_started_ms = js_sys::Date::now();
+    let page = match primary_library
+        .list_metadata_snapshot(&LibraryListRequest {
+            search,
+            start,
+            length,
+            sort_column,
+            sort_order,
+            hidden: inputs.hidden,
+            include_hidden,
+            exclude_ids,
+            attribute_tags_enabled: inputs.attribute_tags_enabled,
+        }, |query| async {
+            repository.web_list_snapshot(query, inputs.raw_members).await
+                .map_err(ApplicationError::platform)?
+                .ok_or_else(|| ApplicationError::Conflict("virtual membership changed during listing".into()))
+        })
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => return map_application_error(error),
+    };
+    let snapshot_finished_ms = js_sys::Date::now();
+
+    let data = page
+        .data
+        .into_iter()
+        .map(|record| NovelListItem {
+            id: record.id,
+            title: record.title,
+            author: record.author,
+            sitename: record.sitename,
+            novel_type: record.novel_type,
+            end: record.end,
+            last_update: record.last_update.timestamp(),
+            general_lastup: record.general_lastup.map(|dt| dt.timestamp()),
+            last_check_date: record.last_check_date.map(|dt| dt.timestamp()),
+            new_arrivals_date: record.new_arrivals_date.map(|dt| dt.timestamp()),
+            tags: record
+                .tags
+                .into_iter()
+                .filter(|tag| !narou_rs::virtual_novel::is_internal_tag(tag))
+                .collect(),
+            new_arrivals: record.new_arrivals,
+            frozen: record.frozen,
+            suspend: record.suspend,
+            length: record.length,
+            toc_url: record.toc_url,
+            display_url: record.display_url,
+            ncode: record.ncode,
+            general_all_no: record.general_all_no,
+        })
+        .collect();
+
+    let response = Response::from_json(&NovelListResponse {
+        draw,
+        records_total: page.records_total,
+        records_filtered: page.records_filtered,
+        data,
+    })?;
+    let mut response = super::metadata::timed_response(response, "list", started_ms)?;
+    response.headers_mut().append(
+        "Server-Timing",
+        &format!(
+            "list_inputs;dur={:.1}, list_snapshot;dur={:.1}",
+            (snapshot_started_ms - started_ms).max(0.0),
+            (snapshot_finished_ms - snapshot_started_ms).max(0.0),
+        ),
+    )?;
+    Ok(response)
+}
+
+/// `serde_urlencoded` (= `form_urlencoded`) と同じ規則で生バイト列から
+/// `ListParams` を組み立てる:
+/// - `&` 区切り、`=` が無い要素は値が空文字列、`+` は空白、`%XX` は
+///   バイト復号 (不完全な `%` はリテラル)、UTF-8 は lossy。
+/// - 未知キーは無視、既知キーの重複・型不一致はエラー (= native の 400)。
+fn parse_list_params(raw: &[u8]) -> Result<ListParams, String> {
+    const KNOWN_KEYS: [&str; 9] = [
+        "draw",
+        "start",
+        "length",
+        "all",
+        "filter",
+        "search[value]",
+        "order[0][column]",
+        "order[0][dir]",
+        "show_hidden",
+    ];
+    let mut params = ListParams::default();
+    let mut seen = HashSet::new();
+    for pair in raw.split(|&byte| byte == b'&') {
+        let (key_raw, value_raw) = match pair.iter().position(|&byte| byte == b'=') {
+            Some(index) => (&pair[..index], &pair[index + 1..]),
+            None => (pair, &[][..]),
+        };
+        let key = decode_component(key_raw);
+        if !KNOWN_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if !seen.insert(key.clone()) {
+            return Err(format!("duplicate parameter `{key}`"));
+        }
+        let value = decode_component(value_raw);
+        match key.as_str() {
+            "draw" => params.draw = Some(parse_u64(&key, &value)?),
+            "start" => params.start = Some(parse_u64(&key, &value)?),
+            "length" => params.length = Some(parse_u64(&key, &value)?),
+            "all" => params.all = Some(parse_bool(&key, &value)?),
+            "filter" => params.filter = Some(value),
+            "search[value]" => params.search_value = Some(value),
+            "order[0][column]" => params.order_column = Some(parse_u64(&key, &value)?),
+            "order[0][dir]" => params.order_dir = Some(value),
+            "show_hidden" => params.show_hidden = Some(parse_bool(&key, &value)?),
+            _ => unreachable!("known key guard above"),
+        }
+    }
+    Ok(params)
+}
+
+fn parse_u64(key: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid parameter `{key}`: expected unsigned integer"))
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    value
+        .parse::<bool>()
+        .map_err(|_| format!("invalid parameter `{key}`: expected `true` or `false`"))
+}
+
+/// `form_urlencoded` の 1 要素分のデコード。
+/// `+` → 空白、`%XX` → バイト (後続 2 桁が hex でない `%` はリテラル)。
+fn decode_component(raw: &[u8]) -> String {
+    if !raw.contains(&b'%') && !raw.contains(&b'+') {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%'
+                if index + 2 < raw.len()
+                    && hex_value(raw[index + 1]).is_some()
+                    && hex_value(raw[index + 2]).is_some() =>
+            {
+                out.push(hex_value(raw[index + 1]).unwrap() << 4 | hex_value(raw[index + 2]).unwrap());
+                index += 3;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Keep the public gate error taxonomy shared with all content endpoints.
+fn map_application_error(error: ApplicationError) -> worker::Result<Response> {
+    super::application_error_response(&error)
+}
+

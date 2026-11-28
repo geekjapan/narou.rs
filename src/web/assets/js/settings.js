@@ -3,12 +3,20 @@
  * Loads settings from API, renders tabs/forms, and handles save.
  */
 
+import { fetchJson, postJson, assertApiSuccess } from './core/http.js';
+import { bindAuthorsPane } from './authors.js';
+import { confirmDialog, promptDialog } from './ui/dialog.js';
+
 (function() {
   'use strict';
 
   let settingsData = null;
   let activeTab = null;
   let saveInFlight = false;
+  let baselineFormData = {};
+  let loginMutationPending = false;
+  let loginListStale = false;
+  let loginReadGeneration = 0;
 
   // ─── Init ──────────────────────────────────────────────
   document.addEventListener('DOMContentLoaded', init);
@@ -54,11 +62,26 @@
 
       if (tab.id === 'replace') {
         pane.innerHTML = renderReplaceTab();
+      } else if (tab.id === 'login') {
+        pane.innerHTML = renderLoginTab();
+      } else if (tab.id === 'authors') {
+        pane.replaceChildren();
+      } else if (tab.id === 'external_api') {
+        pane.innerHTML = renderExternalApiTab();
       } else {
         pane.innerHTML = renderSettingsPanel(tab);
       }
 
       container.appendChild(pane);
+
+      // ログインタブの初期化は DOM に挿入した後に行う。loadLoginHosts は
+      // document から #login-hosts を探すため、未挿入だと null で静かに戻り、
+      // 一覧が「読み込み中…」のままになる。
+      if (tab.id === 'login') {
+        bindLoginPane(pane);
+      }
+      if (tab.id === 'authors') bindAuthorsPane(pane);
+      if (tab.id === 'external_api') bindExternalApiPane(pane);
     });
   }
 
@@ -77,6 +100,7 @@
 
     if (items.length === 0) {
       html += '<div class="list-group"><div class="list-group-item"><em>この分類に該当する設定はありません</em></div></div>';
+      if (tab.id === 'webui') html += renderStorageModeBlock();
       html += '</div>';
       return html;
     }
@@ -85,78 +109,193 @@
     items.forEach(function(setting) {
       html += renderSettingItem(setting);
     });
-    html += '</div></div>';
+    html += '</div>';
+    if (tab.id === 'webui') html += renderStorageModeBlock();
+    html += '</div>';
     return html;
   }
 
+  // ─── データ管理方式 (YAML / SQLite) ──────────────────────
+  function renderStorageModeBlock() {
+    return '<div class="list-group" id="storage-mode-panel">' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">データ管理方式</h4>' +
+      '<div class="list-group-item-text">' +
+      '<div class="setting-help" id="storage-mode-description">作品データを従来の YAML ファイルで管理するか、SQLite データベースで管理するかを選びます。' +
+      'SQLite へ移行すると旧 YAML は <code>*.imported-*</code> へ退避され、戻すときは YAML を書き出してから切り替えます。' +
+      'どちらの方式でも作品データはそのまま使えます。</div>' +
+      '<div id="storage-mode-status"><em>読み込み中…</em></div>' +
+      '<div class="storage-mode-actions">' +
+      '<button type="button" class="btn btn-primary hide" id="storage-mode-to-sqlite" disabled>SQLite 管理へ移行</button>' +
+      '<button type="button" class="btn btn-default hide" id="storage-mode-to-yaml" disabled>YAML 管理へ戻す</button>' +
+      '</div>' +
+      '</div></div></div>';
+  }
+
+  async function loadStorageMode() {
+    const panel = document.getElementById('storage-mode-panel');
+    if (!panel) return;
+    const status = document.getElementById('storage-mode-status');
+    const toSqlite = document.getElementById('storage-mode-to-sqlite');
+    const toYaml = document.getElementById('storage-mode-to-yaml');
+    [toSqlite, toYaml].forEach(function(button) {
+      if (button) { button.disabled = true; button.classList.add('hide'); }
+    });
+    const bind = function(button, mode) {
+      if (!button || button.dataset.bound === '1') return;
+      button.dataset.bound = '1';
+      button.addEventListener('click', function() { switchStorageMode(mode, button); });
+    };
+    try {
+      const data = await fetchJson('/api/storage/mode');
+      if (data.error || data.success === false || !['sqlite', 'yaml'].includes(data.mode)) {
+        throw new Error(data.error?.message || data.message || '保存方式を取得できません');
+      }
+      const sqlite = data.mode === 'sqlite';
+      const locked = Boolean(data.locked_by_env);
+      let html = '<p class="storage-mode-current">現在: <strong>' +
+        (data.metadata_backend === 'd1' ? 'D1 管理' : sqlite ? 'SQLite 管理' : 'YAML 管理') + '</strong>' +
+        (locked ? '（' + escapeHtml(data.reason || 'この環境では固定されています') + '）' : '') + '</p>';
+      if (data.marker) {
+        html += '<p class="setting-help storage-mode-paths">切替ファイル: <code>' + escapeHtml(data.marker) + '</code>' +
+          (data.database ? ' / データベース: <code>' + escapeHtml(data.database) + '</code>' : '') + '</p>';
+      }
+      status.innerHTML = html;
+      if (data.metadata_backend === 'd1') {
+        document.getElementById('storage-mode-description').textContent =
+          'この環境では管理情報と本文を D1 に保存します。YAML / SQLite の切り替えはできません。挿絵の保存先は Worker の配備設定で指定します。';
+      }
+      if (toSqlite) toSqlite.disabled = locked;
+      if (toYaml) toYaml.disabled = locked;
+      if (toSqlite) toSqlite.classList.toggle('hide', sqlite || locked);
+      if (toYaml) toYaml.classList.toggle('hide', !sqlite || locked);
+      bind(toSqlite, 'sqlite');
+      bind(toYaml, 'yaml');
+    } catch (e) {
+      status.innerHTML = '<em>読み込みに失敗しました: ' + escapeHtml(e.message) + '</em>';
+    }
+  }
+
+  async function switchStorageMode(mode, button) {
+    if (button && button.disabled) return;
+    const confirmation = mode === 'sqlite'
+      ? {
+        title: 'SQLite 管理へ移行',
+        message: '作品データの管理を SQLite へ移行します。旧 YAML は自動で退避されます。よろしいですか？',
+        okLabel: '移行する',
+      }
+      : mode === 'yaml'
+        ? {
+          title: 'YAML 管理へ戻す',
+          message: 'YAML を書き出してから YAML 管理へ戻します。よろしいですか？',
+          okLabel: '戻す',
+        }
+        : null;
+    if (confirmation && !(await confirmDialog(confirmation))) return;
+    if (button) button.disabled = true;
+    try {
+      const result = await postJson('/api/storage/mode', { mode: mode });
+      assertApiSuccess(result, '切り替えに失敗しました');
+      showToast(result.message || '切り替えました', 'success');
+      if (result.reboot) {
+        navigateAfterReboot();
+      } else {
+        await loadStorageMode();
+      }
+    } catch (e) {
+      showToast('切り替えに失敗しました: ' + e.message, 'error');
+      if (button) button.disabled = false;
+    }
+  }
+
+  function navigateAfterReboot() {
+    try {
+      sessionStorage.setItem('narou-rs-webui-reboot-return-to', location.pathname + location.search + location.hash);
+    } catch (e) {}
+    location.href = '/_rebooting';
+  }
+
   function renderSettingItem(setting) {
-    let html = '<div class="list-group-item" data-setting="' + escapeAttr(setting.name) + '">';
-    html += '<h4 class="list-group-item-heading">' + escapeHtml(setting.name) + '</h4>';
+    const ineffective = setting.worker_ineffective === true;
+    // disabled 属性に加えて行自体にも理由を title で出す (コントロールの
+    // ツールチップはブラウザによって disabled で出ないため)。
+    const reason = ineffective
+      ? (setting.worker_note || 'この設定はこの環境では効きません')
+      : '';
+    let html = '<div class="list-group-item' + (ineffective ? ' setting-worker-ineffective' : '') +
+               '" data-setting="' + escapeAttr(setting.name) + '"' +
+               (ineffective ? ' aria-disabled="true" title="' + escapeAttr(reason) + '"' : '') + '>';
+    html += '<h4 class="list-group-item-heading">' + escapeHtml(setting.name) +
+            (ineffective ? ' <small class="text-muted">(Worker では無効)</small>' : '') + '</h4>';
     html += '<div class="list-group-item-text">';
-    html += renderControl(setting);
+    html += renderControl(setting, ineffective);
 
     // Help text
     if (setting.help) {
       html += '<p class="setting-help">' + renderHelpHtml(setting.help) + '</p>';
     }
+    // Worker では経路が無い項目への注記 (API の worker_note)。
+    if (setting.worker_note) {
+      html += '<p class="setting-help">⚠ ' + escapeHtml(setting.worker_note) + '</p>';
+    }
+    if (setting.requires_restart) {
+      html += '<p class="setting-help">変更するとサーバーを再起動します。</p>';
+    }
 
     html += '</div></div>';
     return html;
   }
 
-  function renderControl(setting) {
+  function renderControl(setting, disabled) {
     const name = setting.name;
     const value = setting.value;
     const type = setting.var_type;
+    const dis = disabled ? ' disabled' : '';
 
     if (type === 'boolean') {
-      if (setting.three_way) {
-        return renderThreeWay(name, value);
-      }
-      return renderToggle(name, value);
+      return renderThreeWay(name, value, dis, setting.default_value);
     }
 
     if (type === 'select') {
-      return renderSelect(name, value, setting.select_keys || [], setting.select_summaries || []);
+      return renderSelect(name, value, setting.select_keys || [], setting.select_summaries || [], dis);
     }
 
     if (type === 'multiple') {
-      return renderMultiple(name, value, setting.select_keys || [], setting.select_summaries || []);
+      return renderMultiple(name, value, setting.select_keys || [], setting.select_summaries || [], dis);
     }
 
-    // text / integer / float / string / directory
     const placeholder = getPlaceholder(type);
     const strVal = (value !== null && value !== undefined) ? String(value) : '';
-    return '<input type="text" class="setting-input" data-name="' + escapeAttr(name) +
-           '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '">';
+    const inputType = type === 'integer' || type === 'float' ? 'number'
+      : /(?:password|secret-access-key)$/.test(name) ? 'password' : 'text';
+    const numeric = inputType === 'number'
+      ? ' step="' + (type === 'integer' ? '1' : 'any') + '"' +
+        (typeof setting.max_value === 'number' ? ' max="' + setting.max_value + '"' : '')
+      : '';
+    return '<input type="' + inputType + '" class="setting-input" data-name="' + escapeAttr(name) +
+           '" aria-label="' + escapeAttr(name) + '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '"' + numeric + dis + '>';
   }
 
-  function renderToggle(name, value) {
-    const checked = value === true ? ' checked' : '';
-    return '<label class="switch-light">' +
-           '<input type="checkbox" data-name="' + escapeAttr(name) + '"' + checked + '>' +
-           '<span class="switch-track"></span>' +
-           '<span class="switch-label-text">' + (value ? 'はい' : 'いいえ') + '</span>' +
-           '</label>';
-  }
 
-  function renderThreeWay(name, value) {
+  function renderThreeWay(name, value, dis, defaultValue) {
     const nilChecked = (value === null || value === undefined) ? ' checked' : '';
     const offChecked = (value === false) ? ' checked' : '';
     const onChecked = (value === true) ? ' checked' : '';
+    const defaultLabel = defaultValue === true ? '未設定 (既定: はい)'
+      : defaultValue === false ? '未設定 (既定: いいえ)' : '未設定 (既定を使用)';
 
-    return '<div class="switch-3way">' +
-           '<input type="radio" id="' + escapeAttr(name) + '-nil" name="' + escapeAttr(name) + '" value="nil"' + nilChecked + '>' +
-           '<label for="' + escapeAttr(name) + '-nil">未設定</label>' +
-           '<input type="radio" id="' + escapeAttr(name) + '-off" name="' + escapeAttr(name) + '" value="off"' + offChecked + '>' +
+    return '<div class="switch-3way" role="radiogroup" aria-label="' + escapeAttr(name) + '">' +
+           '<input type="radio" id="' + escapeAttr(name) + '-nil" name="' + escapeAttr(name) + '" value="nil"' + nilChecked + dis + '>' +
+           '<label for="' + escapeAttr(name) + '-nil">' + defaultLabel + '</label>' +
+           '<input type="radio" id="' + escapeAttr(name) + '-off" name="' + escapeAttr(name) + '" value="off"' + offChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-off">いいえ</label>' +
-           '<input type="radio" id="' + escapeAttr(name) + '-on" name="' + escapeAttr(name) + '" value="on"' + onChecked + '>' +
+           '<input type="radio" id="' + escapeAttr(name) + '-on" name="' + escapeAttr(name) + '" value="on"' + onChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-on">はい</label>' +
            '</div>';
   }
 
-  function renderSelect(name, value, keys, summaries) {
-    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '">';
+  function renderSelect(name, value, keys, summaries, dis) {
+    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" aria-label="' + escapeAttr(name) + '"' + dis + '>';
     const isTheme = (name === 'webui.theme');
     const isNewTagColor = (name === 'webui.new-tag-color');
     if (!isNewTagColor) {
@@ -171,7 +310,7 @@
     return html;
   }
 
-  function renderMultiple(name, value, keys, summaries) {
+  function renderMultiple(name, value, keys, summaries, dis) {
     let selectedItems = [];
     if (Array.isArray(value)) {
       selectedItems = value;
@@ -179,7 +318,7 @@
       selectedItems = value.split(',').map(function(s) { return s.trim(); });
     }
 
-    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" multiple>';
+    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" aria-label="' + escapeAttr(name) + '" multiple' + dis + '>';
     keys.forEach(function(key, index) {
       const selected = selectedItems.includes(key) ? ' selected' : '';
       const label = summaries[index] || key;
@@ -198,8 +337,486 @@
            '<li>・全ての小説に対する置換設定を行うことが出来ます</li>' +
            '<li>・変更を反映させるには再度変換を実行する必要があります</li>' +
            '</ul>' +
-           '<textarea class="replace-textarea" id="replace-content">' + escapeHtml(content) + '</textarea>' +
+           '<textarea class="replace-textarea" id="replace-content" aria-label="全小説対象の置換設定">' + escapeHtml(content) + '</textarea>' +
            '</div></div></div>';
+  }
+
+  // ─── External API tab ──────────────────────────────────
+  // 外部公開 API (/api/v1) の Bearer トークンを管理する。作成は CLI
+  // (`narou api create`) からもできるが、ここから作成・確認・削除できる。
+  // Worker では Cloudflare Access の Service Token の資格情報も同じ場所へ
+  // 出す (CI で作成した secret をここで確認するため)。
+  function renderExternalApiTab() {
+    return '<div class="panel-settings">' +
+      '<div class="panel-heading">外部公開 API (/api/v1) の設定</div>' +
+      '<div class="list-group">' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">接続情報</h4>' +
+      '<div id="external-api-info" class="login-hosts"><em>読み込み中…</em></div>' +
+      '</div>' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">Bearer トークン</h4>' +
+      '<div class="setting-help">外部のツールから <code>Authorization: Bearer &lt;トークン&gt;</code> で送ります。値は平文で保存されます。</div>' +
+      '<div id="external-api-tokens" class="login-hosts"><em>読み込み中…</em></div>' +
+      '<div style="margin-top:0.5rem">' +
+      '<button type="button" class="btn btn-primary" id="external-api-token-create">新しいトークンを作る</button> ' +
+      '<button type="button" class="btn btn-default" id="external-api-refresh">再読み込み</button>' +
+      '</div>' +
+      '</div>' +
+      '</div></div>';
+  }
+
+  function bindExternalApiPane(pane) {
+    const create = pane.querySelector('#external-api-token-create');
+    const refresh = pane.querySelector('#external-api-refresh');
+    if (create) create.addEventListener('click', function() { createExternalApiToken(pane); });
+    if (refresh) refresh.addEventListener('click', function() { loadExternalApiInfo(pane); });
+    // 一覧は読み込みのたびに描き直されるので、クリックは親の要素で受ける。
+    pane.addEventListener('click', function(event) {
+      const reveal = event.target.closest('.external-api-token-reveal');
+      if (reveal) {
+        const row = reveal.closest('.login-cred-row');
+        const code = row && row.querySelector('.external-api-token');
+        if (code) {
+          const shown = code.textContent === reveal.dataset.token;
+          code.textContent = shown ? reveal.dataset.fingerprint : reveal.dataset.token;
+          reveal.textContent = shown ? '表示' : '隠す';
+        }
+        return;
+      }
+      const remove = event.target.closest('.external-api-token-delete');
+      if (remove) {
+        deleteExternalApiToken(pane, remove.dataset.id);
+      }
+    });
+    loadExternalApiInfo(pane);
+  }
+
+  async function loadExternalApiInfo(pane) {
+    const infoBox = pane.querySelector('#external-api-info');
+    const tokenBox = pane.querySelector('#external-api-tokens');
+    if (!infoBox || !tokenBox) return;
+    try {
+      const info = await fetchJson('/api/external_api');
+      infoBox.innerHTML = renderExternalApiInfo(info);
+      tokenBox.innerHTML = renderExternalApiTokens(info.tokens || []);
+    } catch (e) {
+      infoBox.innerHTML = '<em>読み込みに失敗しました: ' + escapeHtml(e.message) + '</em>';
+      tokenBox.innerHTML = '';
+    }
+  }
+
+  function renderExternalApiInfo(info) {
+    let html = '';
+    if (info.base_url) {
+      html += '<div>API の URL: <code>' + escapeHtml(info.base_url) + '</code></div>';
+    }
+    html += '<div>Bearer 認証: ' + (info.require_token ? '必須' : '不要 (external-api.require-token=false)') + '</div>';
+    if (info.access_client_id || info.access_client_secret) {
+      html += '<div class="setting-help" style="margin-top:0.5rem">Cloudflare Zero Trust の Service Token (CI で作成)</div>';
+      html += '<div>Client Id: <code>' + escapeHtml(info.access_client_id || '(未設定)') + '</code></div>';
+      html += '<div>Client Secret: <code>' + escapeHtml(info.access_client_secret || '(未設定)') + '</code></div>';
+    }
+    return html;
+  }
+
+  function renderExternalApiTokens(tokens) {
+    if (!tokens.length) {
+      return '<div><em>トークンはありません。</em></div>';
+    }
+    return tokens.map(function(token) {
+      return '<div class="login-cred-row">' +
+        '<div class="login-cred-info">' +
+        '<div class="login-cred-label">' + escapeHtml(token.name) + '</div>' +
+        '<div class="login-cred-added">ID: ' + escapeHtml(token.id) +
+        (token.created_at ? ' · 作成: ' + escapeHtml(token.created_at) : '') + '</div>' +
+        '<div class="login-cred-hosts"><code class="external-api-token">' +
+        escapeHtml(token.fingerprint || token.token) + '</code></div>' +
+        '</div>' +
+        '<span class="login-cred-actions">' +
+        '<button type="button" class="btn btn-default external-api-token-reveal" data-token="' +
+        escapeAttr(token.token) + '" data-fingerprint="' +
+        escapeAttr(token.fingerprint || token.token) + '">表示</button>' +
+        '<button type="button" class="btn btn-default external-api-token-delete" data-id="' +
+        escapeAttr(token.id) + '">削除</button>' +
+        '</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  async function createExternalApiToken(pane) {
+    const name = await promptDialog({
+      title: 'トークンの名前',
+      message: '外部のツールを見分けるための名前です (空でも作れます)。',
+      value: 'token',
+    });
+    if (name === null) return;
+    try {
+      await postJson('/api/external_api/token', { name: name });
+      await loadExternalApiInfo(pane);
+    } catch (e) {
+      await alertDialog({
+        title: 'エラー',
+        message: 'トークンを作れませんでした: ' + e.message,
+      });
+    }
+  }
+
+  async function deleteExternalApiToken(pane, id) {
+    const ok = await confirmDialog({
+      title: '確認',
+      message: 'このトークンを削除しますか? 使っている外部ツールは認証に失敗します。',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const response = await fetch('/api/external_api/token/' + encodeURIComponent(id), { method: 'DELETE' });
+      if (!response.ok) throw new Error(response.status + ' ' + response.statusText);
+      await loadExternalApiInfo(pane);
+    } catch (e) {
+      await alertDialog({
+        title: 'エラー',
+        message: '削除できませんでした: ' + e.message,
+      });
+    }
+  }
+
+  // ─── Login tab ─────────────────────────────────────────
+  // The browser half is the separate narou_rs_login executable; this pane is
+  // the receiving end: it reads the export that writes (by picking the file or
+  // pasting its text) and stores the credentials encrypted at rest.
+  function renderLoginTab() {
+    return '<div class="panel-settings">' +
+      '<div class="panel-heading">ログイン情報 (Cookie) の管理</div>' +
+      '<div class="list-group">' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">保存済みのログイン</h4>' +
+      '<div id="login-hosts" class="login-hosts"><em>読み込み中…</em></div>' +
+      '<div class="setting-help" id="login-list-help">上から順にログインを試行します。値はマスクして表示しています。</div>' +
+      '<div style="margin-top:0.5rem">' +
+      '<button type="button" class="btn btn-default" id="login-refresh">再読み込み</button> ' +
+      '<button type="button" class="btn btn-danger" id="login-clear-all">すべて削除</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">書き出しファイルを取り込む</h4>' +
+      '<div class="setting-help">narou_rs_login が書き出したファイル (YAML) を選択するか、内容を貼り付けて取り込みます。</div>' +
+      '<div class="login-form">' +
+      '<input type="file" class="login-envelope-file" id="login-envelope-file" accept=".yaml,.yml,.txt,.json">' +
+      '<span class="login-file-name" id="login-file-name"></span>' +
+      '</div>' +
+      '<div class="login-form">' +
+      '<input type="text" class="setting-input" id="login-import-name" placeholder="名前 (例: 本垢 / サブ垢。空ならファイルの名前を使います)">' +
+      '</div>' +
+      '<textarea class="replace-textarea login-envelope" id="login-envelope" placeholder="version: 1&#10;encrypted: true&#10;…"></textarea>' +
+      '<div class="login-form">' +
+      '<input type="password" class="setting-input" id="login-passphrase" placeholder="パスフレーズ (暗号化されている場合)">' +
+      '<label class="login-replace"><input type="checkbox" id="login-replace"> 取り込みに含まれないサイトを削除する</label>' +
+      '</div>' +
+      '<div style="margin-top:0.5rem">' +
+      '<button type="button" class="btn btn-primary" id="login-import">取り込む</button>' +
+      '</div>' +
+      '</div>' +
+      '</div></div>';
+  }
+
+  function renderLoginSite(entry) {
+    const logins = entry.logins || [];
+    const state = entry.encrypted ? '暗号化済み' : '未暗号';
+    let html = '<div class="login-site">' +
+      '<div class="login-site-head">' +
+      '<span class="login-site-name">' + escapeHtml(entry.site) + '</span>' +
+      '<span class="login-site-state">' + state + '</span>' +
+      '<button type="button" class="btn btn-default login-remove-site" data-site="' + escapeAttr(entry.site) + '">サイトを削除</button>' +
+      '</div>';
+    html += logins.map(function(login, index) {
+      return renderLoginEntry(entry.site, login, index, logins.length);
+    }).join('');
+    html += '</div>';
+    return html;
+  }
+
+  function renderLoginEntry(site, login, index, total) {
+    const name = login.display_name || login.label || site;
+    const hosts = login.hosts || [];
+    const up = index > 0
+      ? '<button type="button" class="login-cred-up" data-site="' + escapeAttr(site) + '" data-index="' + index + '" title="上へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_up</span></button>'
+      : '<button type="button" class="login-cred-up" disabled title="上へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_up</span></button>';
+    const down = index < total - 1
+      ? '<button type="button" class="login-cred-down" data-site="' + escapeAttr(site) + '" data-index="' + index + '" title="下へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_down</span></button>'
+      : '<button type="button" class="login-cred-down" disabled title="下へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_down</span></button>';
+    const meta = [];
+    if (typeof login.host_count === 'number') meta.push(login.host_count + ' ホスト');
+    if (login.short_id) meta.push('ID: ' + login.short_id);
+    if (login.added_at) meta.push(formatLoginAddedAt(login.added_at));
+    return '<div class="login-cred-row">' +
+      '<span class="login-cred-index">' + (index + 1) + '.</span>' +
+      '<div class="login-cred-info">' +
+      '<div class="login-cred-label">' + escapeHtml(name) + '</div>' +
+      (meta.length ? '<div class="login-cred-added">' + escapeHtml(meta.join(' · ')) + '</div>' : '') +
+      '<div class="login-cred-hosts">' +
+      hosts.map(function(host) {
+        const names = (host.names || []).join(', ');
+        return '<div class="login-cred-host">' + escapeHtml(host.host) +
+          (names ? ' <span class="login-cred-names">' + escapeHtml(names) + '</span>' : '') +
+          (host.cookies ? '<div class="login-cred-cookies">' + escapeHtml(host.cookies) + '</div>' : '') +
+          '</div>';
+      }).join('') +
+      '</div>' +
+      '</div>' +
+      '<span class="login-cred-actions">' +
+      '<button type="button" class="btn btn-default login-cred-rename" data-site="' + escapeAttr(site) + '" data-index="' + index + '" data-label="' + escapeAttr(login.label || '') + '">名前を変更</button>' +
+      up + down +
+      '<button type="button" class="btn btn-default login-cred-remove" data-site="' + escapeAttr(site) + '" data-index="' + index + '">削除</button>' +
+      '</span>' +
+      '</div>';
+  }
+
+  function formatLoginAddedAt(value) {
+    const date = new Date(value);
+    if (isNaN(date.getTime())) return value;
+    return date.toLocaleString();
+  }
+
+  function bindLoginPane(pane) {
+    const refresh = pane.querySelector('#login-refresh');
+    const clearAll = pane.querySelector('#login-clear-all');
+    const importBtn = pane.querySelector('#login-import');
+    const envelopeFile = pane.querySelector('#login-envelope-file');
+    if (refresh) refresh.addEventListener('click', loadLoginHosts);
+    if (clearAll) clearAll.addEventListener('click', clearAllLogin);
+    if (importBtn) importBtn.addEventListener('click', importLoginEnvelope);
+    if (envelopeFile) envelopeFile.addEventListener('change', readLoginEnvelopeFile);
+  }
+
+  /// The name to give what an import brings in: what the user typed, or the
+  /// file's own name (minus its extension) when they left it empty.
+  function importName() {
+    const input = document.getElementById('login-import-name');
+    const typed = input && input.value.trim();
+    if (typed) return typed;
+    const file = document.getElementById('login-envelope-file');
+    const name = file && file.files && file.files[0] ? file.files[0].name : '';
+    return name.replace(/\.[^.]*$/, '');
+  }
+
+  function readLoginEnvelopeFile() {
+    const input = document.getElementById('login-envelope-file');
+    const envelope = document.getElementById('login-envelope');
+    const name = document.getElementById('login-file-name');
+    if (!input || !envelope) return;
+    const file = input.files && input.files[0];
+    if (!file) {
+      if (name) name.textContent = '';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = function() {
+      envelope.value = String(reader.result || '');
+      if (name) name.textContent = file.name + ' を読み込みました';
+    };
+    reader.onerror = function() {
+      if (name) name.textContent = '';
+      showToast('ファイルを読み込めませんでした: ' + file.name, 'error');
+    };
+    reader.readAsText(file);
+  }
+
+  function setLoginControlsPending() {
+    document.querySelectorAll('#login-hosts button[data-site], #login-import, #login-clear-all').forEach(function(button) {
+      button.disabled = loginMutationPending || loginListStale;
+    });
+    const refresh = document.getElementById('login-refresh');
+    if (refresh) refresh.disabled = loginMutationPending;
+  }
+
+  async function loadLoginHosts({ throwOnError = false } = {}) {
+    if (loginMutationPending && !throwOnError) return;
+    const container = document.getElementById('login-hosts');
+    if (!container) return;
+    const generation = ++loginReadGeneration;
+    try {
+      const result = await fetchJson('/api/login');
+      assertApiSuccess(result, '読み込みに失敗しました');
+      if (generation !== loginReadGeneration) return;
+      if (!Array.isArray(result?.data?.sites)) throw new Error('ログイン一覧の形式が不正です');
+      loginListStale = false;
+      renderLoginHosts(result.data);
+    } catch (e) {
+      if (generation !== loginReadGeneration) return;
+      container.innerHTML = '<em>読み込みに失敗しました: ' + escapeHtml(e.message) + '</em>';
+      if (throwOnError) throw e;
+    }
+  }
+
+  async function refreshLoginHosts(data) {
+    if (Array.isArray(data?.sites)) {
+      ++loginReadGeneration;
+      loginListStale = false;
+      renderLoginHosts(data);
+    } else {
+      await loadLoginHosts({ throwOnError: true });
+    }
+  }
+
+  async function runLoginMutation(action, fallbackMessage) {
+    if (loginMutationPending || loginListStale) return null;
+    loginMutationPending = true;
+    loginListStale = true;
+    ++loginReadGeneration;
+    setLoginControlsPending();
+    try {
+      const result = await action();
+      assertApiSuccess(result, fallbackMessage);
+      await refreshLoginHosts(result.data);
+      showToast(result.message || 'ログイン情報を更新しました', 'success');
+      return result;
+    } catch (e) {
+      showToast(e.message, 'error');
+      return null;
+    } finally {
+      loginMutationPending = false;
+      setLoginControlsPending();
+    }
+  }
+
+  function renderLoginHosts(data) {
+    const container = document.getElementById('login-hosts');
+    if (!container) return;
+    const sites = (data && data.sites) || [];
+    if (sites.length === 0) {
+      container.innerHTML = '<em>保存されたログイン情報はありません。narou_rs_login で書き出したファイルを取り込んでください。</em>';
+    } else {
+      container.innerHTML = sites.map(renderLoginSite).join('');
+      container.querySelectorAll('.login-cred-rename').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          renameLogin(btn.dataset.site, parseInt(btn.dataset.index, 10), btn.dataset.label || '');
+        });
+      });
+      container.querySelectorAll('.login-cred-remove').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          removeLoginEntry(btn.dataset.site, parseInt(btn.dataset.index, 10));
+        });
+      });
+      container.querySelectorAll('.login-remove-site').forEach(function(btn) {
+        btn.addEventListener('click', function() { removeLoginSite(btn.dataset.site); });
+      });
+      const wireReorder = function(selector, direction) {
+        container.querySelectorAll(selector).forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            const site = btn.closest('.login-site');
+            const total = site ? site.querySelectorAll('.login-cred-row').length : 0;
+            moveLogin(btn.dataset.site, parseInt(btn.dataset.index, 10), direction, total);
+          });
+        });
+      };
+      wireReorder('.login-cred-up', -1);
+      wireReorder('.login-cred-down', 1);
+    }
+    const help = document.getElementById('login-list-help');
+    if (help && data) {
+      const siteCount = (typeof data.sites_count === 'number') ? data.sites_count : sites.length;
+      const loginCount = (typeof data.logins_count === 'number') ? data.logins_count : 0;
+      let text = '保存済み: ' + siteCount + ' サイト / ' + loginCount + ' 件。上から順にログインを試行します。値はマスクして表示しています。';
+      if (data.key_source) text += ' 鍵: ' + data.key_source;
+      help.textContent = text;
+    }
+    setLoginControlsPending();
+  }
+
+  async function importLoginEnvelope() {
+    const envelope = document.getElementById('login-envelope');
+    const passphrase = document.getElementById('login-passphrase');
+    const replace = document.getElementById('login-replace');
+    if (!envelope || !envelope.value.trim()) {
+      showToast('書き出しファイルを選択するか、内容を貼り付けてください', 'error');
+      return;
+    }
+    const submitted = {
+      envelope: envelope.value,
+      passphrase: passphrase ? passphrase.value || null : null,
+      replace: !!(replace && replace.checked),
+      name: importName() || null,
+    };
+    const result = await runLoginMutation(() => postJson('/api/login/import', submitted), '取り込みに失敗しました');
+    if (result && envelope.value === submitted.envelope) {
+      const submittedNameStillVisible = importName() === (submitted.name || '');
+      envelope.value = '';
+      if (passphrase && (passphrase.value || null) === submitted.passphrase) passphrase.value = '';
+      const fileInput = document.getElementById('login-envelope-file');
+      const fileName = document.getElementById('login-file-name');
+      if (fileInput) fileInput.value = '';
+      if (fileName) fileName.textContent = '';
+      const nameInput = document.getElementById('login-import-name');
+      if (nameInput && submittedNameStillVisible) nameInput.value = '';
+    }
+  }
+
+  async function renameLogin(site, index, current) {
+    if (loginMutationPending || loginListStale) return;
+    const input = await promptDialog({
+      title: 'ログイン名の変更',
+      message: site + ' の ' + (index + 1) + ' 番目のログインの名前を入力してください。空にすると名前を消します。',
+      value: current || '',
+      required: false,
+      okLabel: '変更する',
+    });
+    if (input === null) return;
+    await runLoginMutation(
+      () => postJson('/api/login/rename', { site: site, index: index, label: input.trim() }),
+      '名前の変更に失敗しました'
+    );
+  }
+
+  async function removeLoginEntry(site, index) {
+    await runLoginMutation(
+      () => fetchJson('/api/login/' + encodeURIComponent(site) + '/' + index, { method: 'DELETE' }),
+      '削除に失敗しました'
+    );
+  }
+
+  async function moveLogin(site, index, direction, total) {
+    const swap = index + direction;
+    if (swap < 0 || swap >= total) return;
+    const order = [];
+    for (let i = 0; i < total; i++) order.push(i);
+    const tmp = order[index];
+    order[index] = order[swap];
+    order[swap] = tmp;
+    await runLoginMutation(
+      () => postJson('/api/login/order', { site: site, order: order }),
+      '並べ替えに失敗しました'
+    );
+  }
+
+  async function removeLoginSite(site) {
+    if (loginMutationPending || loginListStale) return;
+    const ok = await confirmDialog({
+      title: 'ログイン情報の削除',
+      message: 'サイト ' + site + ' のログイン情報をすべて削除します。よろしいですか？',
+      okLabel: '削除する',
+      danger: true,
+    });
+    if (!ok) return;
+    await runLoginMutation(
+      () => fetchJson('/api/login/' + encodeURIComponent(site), { method: 'DELETE' }),
+      '削除に失敗しました'
+    );
+  }
+
+  async function clearAllLogin() {
+    if (loginMutationPending || loginListStale) return;
+    const ok = await confirmDialog({
+      title: 'ログイン情報の削除',
+      message: '保存されているすべてのログイン情報を削除します。よろしいですか？',
+      okLabel: '削除する',
+      danger: true,
+    });
+    if (!ok) return;
+    await runLoginMutation(
+      () => fetchJson('/api/login', { method: 'DELETE' }),
+      '削除に失敗しました'
+    );
   }
 
   // ─── Events ────────────────────────────────────────────
@@ -216,24 +833,19 @@
     document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
     document.getElementById('btn-save-settings-bottom').addEventListener('click', saveSettings);
 
-    // Toggle label update
-    document.addEventListener('change', function(e) {
-      if (e.target.type === 'checkbox' && e.target.closest('.switch-light')) {
-        const label = e.target.parentElement.querySelector('.switch-label-text');
-        if (label) {
-          label.textContent = e.target.checked ? 'はい' : 'いいえ';
-        }
-      }
-    });
   }
 
   function switchTab(tabId) {
     // Update tab pills
     document.querySelectorAll('#settings-tabs li').forEach(function(li) {
       li.classList.remove('active');
+      li.querySelector('[role="tab"]')?.setAttribute('aria-selected', 'false');
     });
     const targetLink = document.querySelector('#settings-tabs a[data-tab="' + tabId + '"]');
-    if (targetLink) targetLink.parentElement.classList.add('active');
+    if (targetLink) {
+      targetLink.parentElement.classList.add('active');
+      targetLink.setAttribute('aria-selected', 'true');
+    }
 
     // Update panes
     document.querySelectorAll('#settings-tab-content .tab-pane').forEach(function(pane) {
@@ -241,6 +853,9 @@
     });
     const targetPane = document.getElementById('tab-' + tabId);
     if (targetPane) targetPane.classList.add('active');
+    // 一覧は pane が DOM に乗ってから読む (タブを開くたびに最新化する)。
+    if (tabId === 'login') loadLoginHosts();
+    if (tabId === 'authors') targetPane?.dispatchEvent(new Event('authors:reload'));
 
     // Remember active tab
     activeTab = tabId;
@@ -266,42 +881,81 @@
   }
 
   // ─── Save ──────────────────────────────────────────────
+  function acknowledgeSubmittedValues(body, result) {
+    const saved = result?.settings;
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+      for (const [name, value] of Object.entries(saved)) {
+        if (!Object.hasOwn(body.settings, name)) continue;
+        baselineFormData[name] = body.settings[name];
+        const setting = findSetting(name);
+        if (setting) setting.value = value;
+      }
+      if (Object.hasOwn(saved, 'webui.theme') && Object.hasOwn(body.settings, 'webui.theme')
+          && collectFormData()['webui.theme'] === body.settings['webui.theme']) {
+        applyThemeValue(saved['webui.theme']);
+      }
+    }
+    if (Object.hasOwn(body, 'replace_content') && result && Object.hasOwn(result, 'replace_content')) {
+      settingsData.replace_content = body.replace_content;
+    }
+  }
+
   async function saveSettings() {
     if (saveInFlight) return;
-    const settings = collectFormData();
-    const body = { settings: settings };
-    const tabToRestore = activeTab || getCurrentTabId();
-
-    // Include replace content
+    const current = collectFormData();
+    const settings = {};
+    const expected = {};
+    Object.entries(current).forEach(function(entry) {
+      const name = entry[0], value = entry[1];
+      if (value !== baselineFormData[name]) {
+        settings[name] = value;
+        expected[name] = findSetting(name)?.value ?? null;
+      }
+    });
+    for (const input of document.querySelectorAll('input.setting-input[data-name]')) {
+      if (Object.hasOwn(settings, input.dataset.name) && !input.checkValidity()) {
+        input.reportValidity();
+        return;
+      }
+    }
+    const body = { settings: settings, expected_settings: expected };
     const replaceEl = document.getElementById('replace-content');
-    if (replaceEl) {
+    if (replaceEl && replaceEl.value !== settingsData.replace_content) {
       body.replace_content = replaceEl.value;
+      body.expected_replace_content = settingsData.replace_content;
+    }
+    if (Object.keys(settings).length === 0 && !Object.hasOwn(body, 'replace_content')) {
+      showToast('変更された設定はありません', 'success');
+      return;
     }
 
     try {
       saveInFlight = true;
       setSaveButtonsDisabled(true);
-      const resp = await fetch('/api/global_setting', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      if (!resp.ok) {
-        throw new Error('設定の保存に失敗しました');
+      const result = await postJson('/api/global_setting', body);
+      assertApiSuccess(result, '設定の保存に失敗しました');
+      acknowledgeSubmittedValues(body, result);
+      if (Object.keys(settings).some(name => !Object.hasOwn(result.settings || {}, name))
+          || (Object.hasOwn(body, 'replace_content') && !Object.hasOwn(result, 'replace_content'))) {
+        throw new Error('保存済み設定の応答が不正です');
       }
-      const result = await resp.json();
-      if (!result || result.success !== true) {
-        showToast(result?.message || '保存に失敗しました', 'error');
+      const latest = collectFormData();
+      const hasNewEdits = Object.entries(latest).some(([name, value]) => value !== baselineFormData[name])
+        || (replaceEl && replaceEl.value !== settingsData.replace_content);
+      if (result.reboot && !hasNewEdits) {
+        navigateAfterReboot();
         return;
       }
-      try {
-        await reloadSettingsView(tabToRestore);
-        showToast(result.message || '設定を保存しました', 'success');
-      } catch (reloadError) {
-        showToast((result.message || '設定を保存しました') + '（画面の再読み込みに失敗しました: ' + reloadError.message + '）', 'error');
-      }
+      showToast((result.message || '設定を保存しました')
+        + (result.reboot && hasNewEdits ? '（新しい入力は未保存です。保存後に再起動してください）' : ''), 'success');
     } catch(e) {
-      showToast('保存に失敗しました: ' + e.message, 'error');
+      acknowledgeSubmittedValues(body, e.data);
+      const prefix = e.data?.partial
+        ? '一部の設定を保存しました。未保存の入力は保持しています。'
+        : '保存に失敗しました: ';
+      showToast(prefix + (e.status === 409
+        ? '別の操作で設定が変更されています。内容を控えてから再読み込みしてください'
+        : e.message), 'error');
     } finally {
       saveInFlight = false;
       setSaveButtonsDisabled(false);
@@ -311,14 +965,10 @@
   function collectFormData() {
     const data = {};
 
-    // Checkboxes (normal boolean)
-    document.querySelectorAll('.switch-light input[type="checkbox"]').forEach(function(input) {
-      data[input.dataset.name] = input.checked;
-    });
 
     // Radio buttons (3-way)
     document.querySelectorAll('.switch-3way').forEach(function(group) {
-      const checked = group.querySelector('input[type="radio"]:checked');
+      const checked = group.querySelector('input[type="radio"]:checked:not(:disabled)');
       if (checked) {
         const name = checked.name;
         const val = checked.value;
@@ -333,21 +983,24 @@
     });
 
     // Selects (single)
-    document.querySelectorAll('select.setting-select:not([multiple])').forEach(function(sel) {
+    document.querySelectorAll('select.setting-select:not([multiple])[data-name]').forEach(function(sel) {
+      if (sel.disabled) return;
       const name = sel.dataset.name;
       const val = sel.value;
       data[name] = val === '' ? null : val;
     });
 
     // Selects (multiple)
-    document.querySelectorAll('select.setting-select[multiple]').forEach(function(sel) {
+    document.querySelectorAll('select.setting-select[multiple][data-name]').forEach(function(sel) {
+      if (sel.disabled) return;
       const name = sel.dataset.name;
       const selected = Array.from(sel.selectedOptions).map(function(opt) { return opt.value; });
       data[name] = selected.length > 0 ? selected.join(',') : null;
     });
 
     // Text inputs
-    document.querySelectorAll('input.setting-input[type="text"]').forEach(function(input) {
+    document.querySelectorAll('input.setting-input[data-name]').forEach(function(input) {
+      if (input.disabled) return;
       const name = input.dataset.name;
       const val = input.value.trim();
       data[name] = val === '' ? null : val;
@@ -391,15 +1044,17 @@
     applyLoadedTheme();
     renderTabs();
     renderTabContent();
+    baselineFormData = collectFormData();
+    await loadStorageMode();
     restoreActiveTab(preferredTabId);
   }
 
   async function fetchSettingsData() {
-    const resp = await fetch('/api/global_setting');
-    if (!resp.ok) {
-      throw new Error('Failed to load settings');
+    const data = await fetchJson('/api/global_setting');
+    if (data.error || !Array.isArray(data.settings) || !Array.isArray(data.tabs)) {
+      throw new Error(data.error || '設定一覧の形式が不正です');
     }
-    return resp.json();
+    return data;
   }
 
   function getCurrentTabId() {

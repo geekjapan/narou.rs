@@ -1,0 +1,472 @@
+//! バーチャル小説 (v0.5.0)。
+//!
+//! 「XXX その1」「XXX その2」のように分かれた実小説を 1 作品として一覧に
+//! 表示し、EPUB だけを登録順に結合する。仮想小説自体も `novels` テーブルの
+//! 通常行で、`ncode = vs_<ID>` を持つ。実体 (本文・挿絵) は各メンバーのまま。
+//!
+//! メンバー構成と順序は在庫 `virtual_novel_members` に
+//! `{ virtual_id: [member_id, ...] }` で保存する。仮想小説のタグには
+//! `vs_<ID>` を必ず含めるので、既存の hidden tag 機構で非表示にできる。
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use crate::application::attribute_tags::{MANGA_TAG, NOVEL_TAG};
+
+pub use crate::virtual_identity::{
+    VIRTUAL_NCODE_PREFIX, is_internal_tag, is_portable_toc_url, is_virtual_ncode,
+};
+
+/// Issue a persistent transfer identity without leaking a library-local ID.
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
+pub fn new_toc_url() -> crate::error::Result<String> {
+    let identity: [u8; 16] = crate::login::random_bytes()?;
+    let mut encoded = [0u8; 32];
+    hex::encode_to_slice(identity, &mut encoded).expect("fixed hex output length");
+    let mut url = String::with_capacity("https://narou.rs/virtual/".len() + encoded.len());
+    url.push_str("https://narou.rs/virtual/");
+    url.push_str(std::str::from_utf8(&encoded).expect("hex is ASCII"));
+    Ok(url)
+}
+/// 仮想小説 ID から ncode を作る。
+pub fn ncode(id: i64) -> String {
+    format!("{VIRTUAL_NCODE_PREFIX}{id}")
+}
+
+/// Virtual parents are stored novels, but never upstream download/update targets.
+pub fn is_virtual_record(record: &crate::db::NovelRecord) -> bool {
+    record.ncode.as_deref().is_some_and(is_virtual_ncode)
+}
+
+/// `vs_<数字>` から ID を取り出す。
+pub fn id_from_ncode(ncode: &str) -> Option<i64> {
+    ncode
+        .strip_prefix(VIRTUAL_NCODE_PREFIX)?
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id >= 0)
+}
+
+/// 仮想小説に必ず付与するタグ。
+pub fn tag(id: i64) -> String {
+    ncode(id)
+}
+
+/// 仮想小説 ID → 登録順のメンバー ID。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct VirtualNovelMembers {
+    pub groups: BTreeMap<i64, Vec<i64>>,
+}
+
+impl VirtualNovelMembers {
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    pub fn get(&self, virtual_id: i64) -> Option<&[i64]> {
+        self.groups.get(&virtual_id).map(Vec::as_slice)
+    }
+
+    /// すべてのメンバー ID（表示一覧から除外する用）。
+    pub fn all_member_ids(&self) -> HashSet<i64> {
+        self.groups
+            .values()
+            .flat_map(|members| members.iter().copied())
+            .collect()
+    }
+
+    /// 仮想小説に既に属しているメンバー ID。
+    pub fn owner_of(&self, member_id: i64) -> Option<i64> {
+        self.groups.iter().find_map(|(virtual_id, members)| {
+            members.contains(&member_id).then_some(*virtual_id)
+        })
+    }
+
+    /// 1 つの仮想小説を登録する。メンバーは空でない・重複なし・実小説のみ。
+    pub fn insert(&mut self, virtual_id: i64, members: Vec<i64>) -> Result<(), String> {
+        validate_members(&members)?;
+        if self.groups.contains_key(&virtual_id) {
+            return Err(format!("仮想小説 vs_{virtual_id} は既に登録されています"));
+        }
+        if let Some((owner, member)) = members.iter().find_map(|member| {
+            self.owner_of(*member).map(|owner| (owner, *member))
+        }) {
+            return Err(format!(
+                "小説 {member} は既に仮想小説 vs_{owner} に属しています"
+            ));
+        }
+        self.groups.insert(virtual_id, members);
+        Ok(())
+    }
+
+    /// 登録順を全件指定で並べ替える。
+    pub fn reorder(&mut self, virtual_id: i64, ordered: Vec<i64>) -> Result<(), String> {
+        validate_members(&ordered)?;
+        let Some(current) = self.groups.get(&virtual_id) else {
+            return Err(format!("仮想小説 vs_{virtual_id} は登録されていません"));
+        };
+        let current_set: BTreeSet<i64> = current.iter().copied().collect();
+        let ordered_set: BTreeSet<i64> = ordered.iter().copied().collect();
+        if current_set != ordered_set {
+            return Err("並べ替えには現在のメンバーを全件指定してください".to_string());
+        }
+        self.groups.insert(virtual_id, ordered);
+        Ok(())
+    }
+
+    /// 既存の仮想小説の末尾へメンバーを追加する。
+    ///
+    /// 追加できるのは、まだどの仮想小説にも属していない小説だけ。仮想小説
+    /// 自身がメンバーにならないことはレコード側の検査で弾く。
+    pub fn append(&mut self, virtual_id: i64, new_members: Vec<i64>) -> Result<(), String> {
+        validate_members(&new_members)?;
+        if !self.groups.contains_key(&virtual_id) {
+            return Err(format!("仮想小説 vs_{virtual_id} は登録されていません"));
+        }
+        for member in &new_members {
+            if let Some(owner) = self.owner_of(*member) {
+                return Err(format!(
+                    "小説 {member} は既に仮想小説 vs_{owner} に属しています"
+                ));
+            }
+        }
+        self.groups.get_mut(&virtual_id).expect("validated virtual novel").extend(new_members);
+        Ok(())
+    }
+
+    pub fn remove(&mut self, virtual_id: i64) -> Option<Vec<i64>> {
+        self.groups.remove(&virtual_id)
+    }
+}
+
+/// メンバー ID の妥当性を検証する (登録と同じ条件)。
+pub fn validate_members(members: &[i64]) -> Result<(), String> {
+    if members.is_empty() {
+        return Err("メンバーを 1 件以上指定してください".to_string());
+    }
+    if members.iter().any(|id| *id < 0) {
+        return Err("メンバー ID は 0 以上の整数で指定してください".to_string());
+    }
+    let unique: BTreeSet<i64> = members.iter().copied().collect();
+    if unique.len() != members.len() {
+        return Err("同じ小説を複数回登録できません".to_string());
+    }
+    Ok(())
+}
+
+/// Web UI が送る数値/数値文字列のメンバー ID を正規化する。
+pub fn parse_member_ids(values: &[serde_json::Value]) -> Result<Vec<i64>, String> {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<i64>().ok()))
+                .ok_or_else(|| "メンバー ID は整数で指定してください".to_string())
+        })
+        .collect()
+}
+
+/// Derived metadata shared by Native and Worker membership mutations.
+#[derive(Default)]
+pub struct MemberSummary {
+    pub tags: Vec<String>,
+    pub latest_update: Option<chrono::DateTime<chrono::Utc>>,
+    pub general_all_no: i64,
+    pub composition: AttributeComposition,
+}
+
+impl MemberSummary {
+    pub fn add(&mut self, record: &crate::db::NovelRecord, count: i64, attribute: Option<&str>) {
+        self.tags.extend(record.tags.iter().filter(|tag| !is_internal_tag(tag)).cloned());
+        self.composition.add(attribute);
+        if let Some(updated) = record.general_lastup
+            && self.latest_update.is_none_or(|current| updated > current)
+        {
+            self.latest_update = Some(updated);
+        }
+        self.general_all_no += count;
+    }
+
+    pub fn merged_tags(&self, id: i64, existing: &[String]) -> Vec<String> {
+        let mut tags: Vec<String> = existing.iter()
+            .filter(|tag| !is_internal_tag(tag))
+            .chain(self.tags.iter().filter(|tag| !crate::application::attribute_tags::is_attribute_tag(tag)))
+            .cloned().collect();
+        tags.push(tag(id));
+        tags.sort();
+        tags.dedup();
+        tags
+    }
+
+    pub fn refresh(&self, record: &mut crate::db::NovelRecord) -> Result<(), String> {
+        let attribute = self.composition.resolve(None, record.attribute_tag())?;
+        record.tags = self.merged_tags(record.id, &record.tags);
+        record.general_all_no = (self.general_all_no > 0).then_some(self.general_all_no);
+        record.general_lastup = self.latest_update;
+        record.set_attribute_tag(attribute);
+        Ok(())
+    }
+}
+
+/// 属性タグ (小説 / 漫画) の構成。
+///
+/// バーチャル小説のメンバーは普通の小説行であり、それぞれ `attribute_tag`
+/// を持つ。[`AttributeComposition`] は「メンバーだけなら小説」「漫画だけなら
+/// 漫画」「両方混在している」を表す。混在しているときだけ、利用者が小説 /
+/// 漫画を自分で選べる。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttributeComposition {
+    /// 小説のメンバーが 1 件以上ある。
+    pub has_novel: bool,
+    /// 漫画のメンバーが 1 件以上ある。
+    pub has_manga: bool,
+}
+
+impl AttributeComposition {
+    /// メンバーの属性タグを 1 件加える。
+    ///
+    /// `None` (属性が未設定) は小説として数える。未知の値は無視する。
+    pub fn add(&mut self, tag: Option<&str>) {
+        match tag {
+            None => self.has_novel = true,
+            Some(tag) if tag == NOVEL_TAG => self.has_novel = true,
+            Some(tag) if tag == MANGA_TAG => self.has_manga = true,
+            Some(_) => {}
+        }
+    }
+
+    /// 小説と漫画が混在しているか。
+    pub fn is_mixed(&self) -> bool {
+        self.has_novel && self.has_manga
+    }
+
+    /// 属性を持つメンバーが 1 件もないか。
+    pub fn is_empty(&self) -> bool {
+        !self.has_novel && !self.has_manga
+    }
+
+    /// 求める属性タグを確定する。
+    ///
+    /// * 単一種別 (小説のみ / 漫画のみ) は構成から自動分類する。明示指定が
+    ///   矛盾するときはエラー。
+    /// * 混在しているときは「明示指定 -> 保存済みの値 -> 小説」の順で決める。
+    /// * 属性を持つメンバーが 1 件もないときや、不正な指定はエラー。
+    pub fn resolve(
+        &self,
+        requested: Option<&str>,
+        current: Option<&str>,
+    ) -> Result<&'static str, String> {
+        let requested = match requested {
+            Some(NOVEL_TAG) => Some(NOVEL_TAG),
+            Some(MANGA_TAG) => Some(MANGA_TAG),
+            Some(tag) => return Err(format!("属性タグが不正です: {tag}")),
+            None => None,
+        };
+        let current = match current {
+            Some(NOVEL_TAG) => Some(NOVEL_TAG),
+            Some(MANGA_TAG) => Some(MANGA_TAG),
+            Some(tag) => return Err(format!("属性タグが不正です: {tag}")),
+            None => None,
+        };
+        if self.is_empty() {
+            return Err("属性を持つメンバーがありません".to_string());
+        }
+        if self.is_mixed() {
+            // 混在するときは利用者が選んだ値を優先する。保存済みの値が
+            // あればそれを維持し、無ければ小説を既定にする。
+            return Ok(requested.or(current).unwrap_or(NOVEL_TAG));
+        }
+        let detected = if self.has_novel { NOVEL_TAG } else { MANGA_TAG };
+        if let Some(tag) = requested
+            && tag != detected
+        {
+            return Err(format!(
+                "属性タグはメンバー構成 ({detected}) と一致しません: {tag}"
+            ));
+        }
+        Ok(detected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_virtual_tags_are_detected() {
+        assert!(is_internal_tag("vs_672"));
+        assert!(!is_internal_tag("共通"));
+        assert!(!is_internal_tag("vs_"));
+    }
+
+    #[test]
+    fn member_ids_accept_numbers_and_numeric_strings() {
+        let values = vec![
+            serde_json::json!(3),
+            serde_json::json!("4"),
+            serde_json::json!(5),
+        ];
+        assert_eq!(parse_member_ids(&values).unwrap(), vec![3, 4, 5]);
+        assert!(parse_member_ids(&[serde_json::json!("x")]).is_err());
+    }
+
+    #[test]
+    fn zero_id_members_follow_the_native_repository_id_domain() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(2, vec![0, 1]).unwrap();
+        members.reorder(2, vec![1, 0]).unwrap();
+        assert_eq!(members.get(2), Some([1, 0].as_slice()));
+        assert_eq!(members.owner_of(0), Some(2));
+        assert!(members.append(2, vec![0]).is_err());
+        assert!(validate_members(&[-1]).is_err());
+    }
+
+    #[test]
+    fn composition_tracks_novel_and_manga_members() {
+        let mut composition = AttributeComposition::default();
+        assert!(composition.is_empty());
+        composition.add(Some(NOVEL_TAG));
+        assert!(composition.has_novel);
+        assert!(!composition.has_manga);
+        assert!(!composition.is_mixed());
+        composition.add(Some(MANGA_TAG));
+        assert!(composition.is_mixed());
+    }
+
+    #[test]
+    fn composition_treats_missing_attribute_as_novel() {
+        let mut composition = AttributeComposition::default();
+        composition.add(None);
+        assert!(composition.has_novel);
+        assert!(!composition.has_manga);
+    }
+
+    #[test]
+    fn composition_ignores_unknown_attribute_values() {
+        let mut composition = AttributeComposition::default();
+        composition.add(Some("映画"));
+        assert!(composition.is_empty());
+    }
+
+    #[test]
+    fn single_kind_composition_is_detected_automatically() {
+        let mut novel = AttributeComposition::default();
+        novel.add(Some(NOVEL_TAG));
+        assert_eq!(novel.resolve(None, None).unwrap(), NOVEL_TAG);
+        assert_eq!(
+            novel.resolve(None, Some(MANGA_TAG)).unwrap(),
+            NOVEL_TAG,
+            "a single-kind composition must be auto-corrected"
+        );
+        assert!(novel.resolve(Some(MANGA_TAG), None).is_err());
+
+        let mut manga = AttributeComposition::default();
+        manga.add(Some(MANGA_TAG));
+        assert_eq!(manga.resolve(None, None).unwrap(), MANGA_TAG);
+        assert!(manga.resolve(Some(NOVEL_TAG), None).is_err());
+    }
+
+    #[test]
+    fn mixed_composition_prefers_request_then_current_then_novel() {
+        let mut mixed = AttributeComposition::default();
+        mixed.add(Some(NOVEL_TAG));
+        mixed.add(Some(MANGA_TAG));
+        assert_eq!(mixed.resolve(Some(MANGA_TAG), Some(NOVEL_TAG)).unwrap(), MANGA_TAG);
+        assert_eq!(mixed.resolve(None, Some(MANGA_TAG)).unwrap(), MANGA_TAG);
+        assert_eq!(mixed.resolve(None, None).unwrap(), NOVEL_TAG);
+    }
+
+    #[test]
+    fn resolve_rejects_invalid_values_and_empty_compositions() {
+        let mut mixed = AttributeComposition::default();
+        mixed.add(Some(NOVEL_TAG));
+        mixed.add(Some(MANGA_TAG));
+        assert!(mixed.resolve(Some("映画"), None).is_err());
+        assert!(mixed.resolve(None, Some("映画")).is_err());
+        assert!(AttributeComposition::default().resolve(None, None).is_err());
+    }
+
+    #[test]
+    fn membership_roundtrips_as_a_bare_yaml_map() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(3, vec![1, 2]).unwrap();
+        let yaml = serde_yaml::to_string(&members).unwrap();
+        let back: VirtualNovelMembers = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.get(3), Some([1, 2].as_slice()));
+    }
+
+    #[test]
+    fn ncode_roundtrip_and_detection() {
+        assert_eq!(ncode(12), "vs_12");
+        assert_eq!(id_from_ncode("vs_12"), Some(12));
+        assert_eq!(id_from_ncode("vs_0"), Some(0));
+        assert!(is_virtual_ncode("vs_1"));
+        assert!(!is_virtual_ncode("vs_"));
+        assert!(!is_virtual_ncode("n1234ab"));
+    }
+
+    #[test]
+    fn portable_identity_rejects_local_ids_and_noncanonical_urls() {
+        assert!(is_portable_toc_url("https://narou.rs/virtual/0123456789abcdef0123456789abcdef"));
+        for url in [
+            "https://narou.rs/virtual/vs_1",
+            "http://narou.rs/virtual/0123456789abcdef0123456789abcdef",
+            "https://narou.rs/virtual/0123456789ABCDEF0123456789ABCDEF",
+            "https://narou.rs/virtual/0123456789abcdef0123456789abcdef?x=1",
+            "https://narou.rs/virtual/0123456789abcdef0123456789abcdef/",
+        ] {
+            assert!(!is_portable_toc_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn insert_rejects_duplicates_and_existing_owner() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(1, vec![10, 11]).unwrap();
+        assert!(members.insert(2, vec![11, 12]).is_err());
+        assert!(members.insert(3, vec![10, 10]).is_err());
+        assert_eq!(members.owner_of(11), Some(1));
+        assert_eq!(members.all_member_ids().len(), 2);
+    }
+
+    #[test]
+    fn reorder_requires_the_same_set() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(1, vec![10, 11, 12]).unwrap();
+        members.reorder(1, vec![12, 10, 11]).unwrap();
+        assert_eq!(members.get(1), Some([12, 10, 11].as_slice()));
+        assert!(members.reorder(1, vec![12, 10]).is_err());
+        assert!(members.reorder(1, vec![12, 10, 99]).is_err());
+    }
+
+    #[test]
+    fn append_extends_the_member_list_in_order() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(1, vec![10, 11]).unwrap();
+        members.append(1, vec![12, 13]).unwrap();
+        assert_eq!(members.get(1), Some([10, 11, 12, 13].as_slice()));
+    }
+
+    #[test]
+    fn append_rejects_unknown_duplicate_and_owned_members() {
+        let mut members = VirtualNovelMembers::default();
+        members.insert(1, vec![10, 11]).unwrap();
+        members.insert(2, vec![20]).unwrap();
+        assert!(
+            members.append(99, vec![30]).is_err(),
+            "未登録の仮想小説へは追加できない"
+        );
+        assert!(
+            members.append(1, vec![11]).is_err(),
+            "同じ仮想小説のメンバーは追加できない"
+        );
+        assert!(
+            members.append(1, vec![20]).is_err(),
+            "別の仮想小説のメンバーは追加できない"
+        );
+        assert!(members.append(1, vec![]).is_err(), "空の追加はできない");
+        assert!(members.append(1, vec![12, 12]).is_err(), "重複はできない");
+        assert_eq!(members.get(1), Some([10, 11].as_slice()));
+    }
+}

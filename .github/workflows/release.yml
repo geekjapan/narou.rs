@@ -5,9 +5,24 @@ on:
     tags:
       - "v*"
       - "[0-9]*"
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+# Different tags and manual runs share the same Certum signing credentials.
+# An active release must finish or be explicitly cancelled before another runs.
+concurrency:
+  group: narou-release
+  cancel-in-progress: false
+
+env:
+  # crates.io などへのダウンロードの一時的なネットワーク障害で CI が落ちるのを防ぐ。
+  # デフォルトの再試行回数 (3) だと macos-15-intel のような不安定なランナーの
+  # 数分の DNS 停止を吸収できない (v0.6.12 のリリース失敗)。
+  CARGO_NET_RETRY: "10"
+  # curl 8.x の HTTP/2 多重化で "transfer too slow" の偽発生が多発するため無効化。
+  CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
   validate:
@@ -17,7 +32,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate tag matches Cargo.toml version
         id: version
@@ -30,18 +45,187 @@ jobs:
 
           $version = $Matches[1]
           $tag = "${{ github.ref_name }}"
-          $escapedVersion = [regex]::Escape($version)
-          if ($tag -notmatch "^(?:v)?$escapedVersion(?:[-+][0-9A-Za-z.-]+)?$") {
-            throw "Tag '$tag' does not match Cargo.toml version '$version' or an allowed prerelease/build variant of it."
+          # Tag match is enforced only when the ref is an actual tag
+          # (push to a tag, or a manual dispatch that selected a tag).
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $escapedVersion = [regex]::Escape($version)
+            if ($tag -notmatch "^(?:v)?$escapedVersion(?:[-+][0-9A-Za-z.-]+)?$") {
+              throw "Tag '$tag' does not match Cargo.toml version '$version' or an allowed prerelease/build variant of it."
+            }
           }
 
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          $isPrerelease = $tag -match "^[^+]*-"
+          $isPrerelease = ("${{ github.ref_type }}" -eq "tag") -and ($tag -match "^[^+]*-")
           "prerelease=$($isPrerelease.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-  build:
-    name: Build ${{ matrix.name }}
+  build-helpers:
+    name: Build helper binaries (${{ matrix.name }})
     needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - name: Windows ARM64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-updater-${{ matrix.os }}-${{ matrix.target }}
+
+      - name: Add Rust target
+        shell: pwsh
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build updater binary
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_updater
+
+      - name: Upload unsigned updater
+        uses: actions/upload-artifact@v6
+        with:
+          name: unsigned-updater-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/narou_rs_updater.exe
+          if-no-files-found: error
+
+      - name: Build backup binary
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_backup
+
+      - name: Upload unsigned backup binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: unsigned-backup-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/narou_rs_backup.exe
+          if-no-files-found: error
+
+      - name: Build login binary
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_login
+
+      - name: Upload unsigned login binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: unsigned-login-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/narou_rs_login.exe
+          if-no-files-found: error
+
+      - name: Build MCP binary
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_mcp
+
+      - name: Upload unsigned MCP binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: unsigned-mcp-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/narou_rs_mcp.exe
+          if-no-files-found: error
+
+  sign-helpers:
+    name: Sign Windows helper binaries
+    needs: build-helpers
+    runs-on: windows-2025
+    environment: CodeSining
+    steps:
+      - name: Download unsigned helper binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: unsigned-*-*
+          path: unsigned
+
+      - name: Sign Windows helper binaries (Certum SimplySign)
+        uses: Rumia-Channel/windows-certum-signin@main
+        with:
+          certum-username: ${{ secrets.CERTUM_USERNAME }}
+          certum-otp-uri: ${{ secrets.CERTUM_OTP_URI }}
+          certum-key-id: ${{ vars.CERTUM_KEY_ID }}
+          signer: authenticode
+          files: |
+            unsigned\unsigned-updater-x86_64-pc-windows-msvc\narou_rs_updater.exe
+            unsigned\unsigned-updater-aarch64-pc-windows-msvc\narou_rs_updater.exe
+            unsigned\unsigned-backup-x86_64-pc-windows-msvc\narou_rs_backup.exe
+            unsigned\unsigned-backup-aarch64-pc-windows-msvc\narou_rs_backup.exe
+            unsigned\unsigned-login-x86_64-pc-windows-msvc\narou_rs_login.exe
+            unsigned\unsigned-login-aarch64-pc-windows-msvc\narou_rs_login.exe
+            unsigned\unsigned-mcp-x86_64-pc-windows-msvc\narou_rs_mcp.exe
+            unsigned\unsigned-mcp-aarch64-pc-windows-msvc\narou_rs_mcp.exe
+
+      - name: Upload signed updater (x64)
+        uses: actions/upload-artifact@v6
+        with:
+          name: signed-updater-x86_64-pc-windows-msvc
+          path: unsigned/unsigned-updater-x86_64-pc-windows-msvc/narou_rs_updater.exe
+          if-no-files-found: error
+
+      - name: Upload signed updater (ARM64)
+        uses: actions/upload-artifact@v6
+        with:
+          name: signed-updater-aarch64-pc-windows-msvc
+          path: unsigned/unsigned-updater-aarch64-pc-windows-msvc/narou_rs_updater.exe
+          if-no-files-found: error
+
+      - name: Upload signed backup binary (x64)
+        uses: actions/upload-artifact@v6
+        with:
+          name: signed-backup-x86_64-pc-windows-msvc
+          path: unsigned/unsigned-backup-x86_64-pc-windows-msvc/narou_rs_backup.exe
+          if-no-files-found: error
+
+      - name: Upload signed backup binary (ARM64)
+        uses: actions/upload-artifact@v6
+        with:
+          name: signed-backup-aarch64-pc-windows-msvc
+          path: unsigned/unsigned-backup-aarch64-pc-windows-msvc/narou_rs_backup.exe
+          if-no-files-found: error
+
+      - name: Upload signed login binary (x64)
+        uses: actions/upload-artifact@v6
+        with:
+          name: signed-login-x86_64-pc-windows-msvc
+          path: unsigned/unsigned-login-x86_64-pc-windows-msvc/narou_rs_login.exe
+          if-no-files-found: error
+
+      - name: Upload signed login binary (ARM64)
+        uses: actions/upload-artifact@v6
+        with:
+          name: signed-login-aarch64-pc-windows-msvc
+          path: unsigned/unsigned-login-aarch64-pc-windows-msvc/narou_rs_login.exe
+          if-no-files-found: error
+
+      - name: Upload signed MCP binary (x64)
+        uses: actions/upload-artifact@v6
+        with:
+          name: signed-mcp-x86_64-pc-windows-msvc
+          path: unsigned/unsigned-mcp-x86_64-pc-windows-msvc/narou_rs_mcp.exe
+          if-no-files-found: error
+
+      - name: Upload signed MCP binary (ARM64)
+        uses: actions/upload-artifact@v6
+        with:
+          name: signed-mcp-aarch64-pc-windows-msvc
+          path: unsigned/unsigned-mcp-aarch64-pc-windows-msvc/narou_rs_mcp.exe
+          if-no-files-found: error
+
+  build:
+    needs:
+      - validate
+      - sign-helpers
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -54,6 +238,17 @@ jobs:
             binary: narou_rs.exe
             target: x86_64-pc-windows-msvc
             builder: cargo
+            features: ""
+            variant: ""
+          - name: Windows x64 (GPL)
+            os: windows-2025
+            platform: win
+            arch: x64
+            binary: narou_rs.exe
+            target: x86_64-pc-windows-msvc
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: Windows ARM64
             os: windows-11-arm
             platform: win
@@ -61,6 +256,17 @@ jobs:
             binary: narou_rs.exe
             target: aarch64-pc-windows-msvc
             builder: cargo
+            features: ""
+            variant: ""
+          - name: Windows ARM64 (GPL)
+            os: windows-11-arm
+            platform: win
+            arch: arm64
+            binary: narou_rs.exe
+            target: aarch64-pc-windows-msvc
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: macOS x64
             os: macos-15-intel
             platform: mac
@@ -68,6 +274,17 @@ jobs:
             binary: narou_rs
             target: x86_64-apple-darwin
             builder: cargo
+            features: ""
+            variant: ""
+          - name: macOS x64 (GPL)
+            os: macos-15-intel
+            platform: mac
+            arch: x64
+            binary: narou_rs
+            target: x86_64-apple-darwin
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: macOS ARM64
             os: macos-15
             platform: mac
@@ -75,6 +292,17 @@ jobs:
             binary: narou_rs
             target: aarch64-apple-darwin
             builder: cargo
+            features: ""
+            variant: ""
+          - name: macOS ARM64 (GPL)
+            os: macos-15
+            platform: mac
+            arch: arm64
+            binary: narou_rs
+            target: aarch64-apple-darwin
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: Linux x64
             os: ubuntu-24.04
             platform: linux
@@ -82,6 +310,17 @@ jobs:
             binary: narou_rs
             target: x86_64-unknown-linux-gnu
             builder: cargo
+            features: ""
+            variant: ""
+          - name: Linux x64 (GPL)
+            os: ubuntu-24.04
+            platform: linux
+            arch: x64
+            binary: narou_rs
+            target: x86_64-unknown-linux-gnu
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: Linux ARM64
             os: ubuntu-24.04-arm
             platform: linux
@@ -89,6 +328,17 @@ jobs:
             binary: narou_rs
             target: aarch64-unknown-linux-gnu
             builder: cargo
+            features: ""
+            variant: ""
+          - name: Linux ARM64 (GPL)
+            os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            binary: narou_rs
+            target: aarch64-unknown-linux-gnu
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: Raspberry Pi 2/3/4
             os: ubuntu-24.04
             platform: linux
@@ -96,6 +346,17 @@ jobs:
             binary: narou_rs
             target: armv7-unknown-linux-gnueabihf
             builder: cross
+            features: ""
+            variant: ""
+          - name: Raspberry Pi 2/3/4 (GPL)
+            os: ubuntu-24.04
+            platform: linux
+            arch: armv7
+            binary: narou_rs
+            target: armv7-unknown-linux-gnueabihf
+            builder: cross
+            features: lite
+            variant: GPL
           - name: Raspberry Pi Zero
             os: ubuntu-24.04
             platform: linux
@@ -103,25 +364,76 @@ jobs:
             binary: narou_rs
             target: arm-unknown-linux-gnueabihf
             builder: cross
+            features: ""
+            variant: ""
+          - name: Raspberry Pi Zero (GPL)
+            os: ubuntu-24.04
+            platform: linux
+            arch: armv6
+            binary: narou_rs
+            target: arm-unknown-linux-gnueabihf
+            builder: cross
+            features: lite
+            variant: GPL
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.os }}-${{ matrix.target }}
+          key: release-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.variant }}
 
-      - name: Add Rust target
+      - name: Add Rust targets
         shell: pwsh
-        run: rustup target add ${{ matrix.target }}
+        run: |
+          rustup target add ${{ matrix.target }}
+          rustup target add wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Build transfer WASM artifacts
+        # Produces target/transfer-artifacts/ (glue/wasm/worker + manifest)
+        # which build.rs embeds into the binary. Missing artifacts must fail
+        # the release, never ship a degraded "transfer capable" build.
+        shell: pwsh
+        run: node scripts/build-transfer-wasm.mjs --install-bindgen
 
       - name: Install cross
         if: runner.os == 'Linux' && matrix.builder == 'cross'
         shell: bash
         run: cargo install cross --locked
 
+      - name: Build backup binary
+        if: matrix.platform != 'win'
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: |
+          if ("${{ matrix.builder }}" -eq "cross") {
+            $env:PKG_CONFIG_ALLOW_CROSS = "1"
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs_backup
+          } else {
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_backup
+          }
+
+      - name: Build login binary
+        if: matrix.platform != 'win'
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: |
+          if ("${{ matrix.builder }}" -eq "cross") {
+            $env:PKG_CONFIG_ALLOW_CROSS = "1"
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs_login
+          } else {
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_login
+          }
+
       - name: Build updater binary
+        if: matrix.platform != 'win'
         shell: pwsh
         env:
           NAROU_RS_RELEASE_BUILD: "1"
@@ -132,6 +444,26 @@ jobs:
           } else {
             cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_updater
           }
+
+      - name: Build MCP binary
+        if: matrix.platform != 'win'
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: |
+          if ("${{ matrix.builder }}" -eq "cross") {
+            $env:PKG_CONFIG_ALLOW_CROSS = "1"
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs_mcp
+          } else {
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_mcp
+          }
+
+      - name: Download signed updater
+        if: matrix.platform == 'win'
+        uses: actions/download-artifact@v7
+        with:
+          name: signed-updater-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release
 
       - name: Compute updater SHA-256
         id: updater_hash
@@ -156,40 +488,181 @@ jobs:
         env:
           NAROU_RS_RELEASE_BUILD: "1"
           NAROU_RS_UPDATER_SHA256: ${{ steps.updater_hash.outputs.hash }}
+          NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS: "1"
         run: |
+          $featureArgs = @()
+          if ("${{ matrix.features }}" -ne "") {
+            $featureArgs += "--features"
+            $featureArgs += "${{ matrix.features }}"
+          }
           if ("${{ matrix.builder }}" -eq "cross") {
             $env:PKG_CONFIG_ALLOW_CROSS = "1"
-            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs @featureArgs
           } else {
-            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs @featureArgs
           }
 
+      - name: Upload unsigned Windows binary
+        if: matrix.platform == 'win'
+        uses: actions/upload-artifact@v6
+        with:
+          name: unsigned-main-${{ matrix.target }}${{ matrix.variant != '' && format('-{0}', matrix.variant) || '' }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
       - name: Package release asset
+        if: matrix.platform != 'win'
         id: package
         shell: pwsh
         run: |
           $binary = "${{ matrix.binary }}"
           if ($binary.EndsWith(".exe")) {
             $updaterBinary = "narou_rs_updater.exe"
+            $backupBinary = "narou_rs_backup.exe"
+            $loginBinary = "narou_rs_login.exe"
+            $mcpBinary = "narou_rs_mcp.exe"
           } else {
             $updaterBinary = "narou_rs_updater"
+            $backupBinary = "narou_rs_backup"
+            $loginBinary = "narou_rs_login"
+            $mcpBinary = "narou_rs_mcp"
+          }
+          $commitVersion = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne "tag") {
+            $commitVersion = "{0}+{1}" -f "${{ needs.validate.outputs.version }}", $env:GITHUB_SHA.Substring(0, 7)
           }
           $archivePath = & .\scripts\package-release.ps1 `
             -BinaryPath "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
             -UpdaterBinaryPath "target/${{ matrix.target }}/release/$updaterBinary" `
+            -BackupBinaryPath "target/${{ matrix.target }}/release/$backupBinary" `
+            -LoginBinaryPath "target/${{ matrix.target }}/release/$loginBinary" `
+            -McpBinaryPath "target/${{ matrix.target }}/release/$mcpBinary" `
             -Platform "${{ matrix.platform }}" `
             -Arch "${{ matrix.arch }}" `
             -PackageRoot "narou" `
-            -CommitVersion "${{ github.ref_name }}" `
+            -CommitVersion $commitVersion `
+            -Variant "${{ matrix.variant }}" `
+            -TransferArtifactsManifest "target/transfer-artifacts/manifest.json" `
             -OutputDir "dist"
 
           "archive_path=$archivePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "archive_name=$([System.IO.Path]::GetFileName($archivePath))" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload release asset
+        if: matrix.platform != 'win'
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.package.outputs.archive_name }}
           path: ${{ steps.package.outputs.archive_path }}
+          if-no-files-found: error
+
+  sign-windows:
+    name: Sign Windows binaries
+    needs:
+      - validate
+      - build
+    runs-on: windows-2025
+    environment: CodeSining
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download unsigned binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: unsigned-main-*
+          path: unsigned
+
+      - name: Download signed updaters
+        uses: actions/download-artifact@v7
+        with:
+          pattern: signed-updater-*
+          path: signed-updater
+
+      - name: Download signed backup binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: signed-backup-*
+          path: signed-backup
+
+      - name: Download signed login binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: signed-login-*
+          path: signed-login
+
+      - name: Download signed MCP binaries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: signed-mcp-*
+          path: signed-mcp
+
+      - name: Sign Windows binaries (Certum SimplySign)
+        uses: Rumia-Channel/windows-certum-signin@main
+        with:
+          certum-username: ${{ secrets.CERTUM_USERNAME }}
+          certum-otp-uri: ${{ secrets.CERTUM_OTP_URI }}
+          certum-key-id: ${{ vars.CERTUM_KEY_ID }}
+          signer: authenticode
+          files: |
+            unsigned\unsigned-main-x86_64-pc-windows-msvc\narou_rs.exe
+            unsigned\unsigned-main-x86_64-pc-windows-msvc-GPL\narou_rs.exe
+            unsigned\unsigned-main-aarch64-pc-windows-msvc\narou_rs.exe
+            unsigned\unsigned-main-aarch64-pc-windows-msvc-GPL\narou_rs.exe
+
+      - name: Package signed assets
+        shell: pwsh
+        run: |
+          $targets = @(
+            @{ Target = "x86_64-pc-windows-msvc"; Arch = "x64" },
+            @{ Target = "aarch64-pc-windows-msvc"; Arch = "arm64" }
+          )
+          $variants = @("", "GPL")
+          $commitVersion = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne "tag") {
+            $commitVersion = "{0}+{1}" -f "${{ needs.validate.outputs.version }}", $env:GITHUB_SHA.Substring(0, 7)
+          }
+          foreach ($t in $targets) {
+            $updater = "signed-updater\signed-updater-$($t.Target)\narou_rs_updater.exe"
+            if (-not (Test-Path -Path $updater -PathType Leaf)) {
+              throw "Signed updater not found: $updater"
+            }
+            $backup = "signed-backup\signed-backup-$($t.Target)\narou_rs_backup.exe"
+            if (-not (Test-Path -Path $backup -PathType Leaf)) {
+              throw "Signed backup binary not found: $backup"
+            }
+            $login = "signed-login\signed-login-$($t.Target)\narou_rs_login.exe"
+            if (-not (Test-Path -Path $login -PathType Leaf)) {
+              throw "Signed login binary not found: $login"
+            }
+            $mcp = "signed-mcp\signed-mcp-$($t.Target)\narou_rs_mcp.exe"
+            if (-not (Test-Path -Path $mcp -PathType Leaf)) {
+              throw "Signed MCP binary not found: $mcp"
+            }
+            foreach ($v in $variants) {
+              $suffix = if ($v -eq "") { "" } else { "-$v" }
+              $binary = "unsigned\unsigned-main-$($t.Target)$suffix\narou_rs.exe"
+              if (-not (Test-Path -Path $binary -PathType Leaf)) {
+                throw "Signed binary not found: $binary"
+              }
+              & .\scripts\package-release.ps1 `
+                -BinaryPath $binary `
+                -UpdaterBinaryPath $updater `
+                -BackupBinaryPath $backup `
+                -LoginBinaryPath $login `
+                -McpBinaryPath $mcp `
+                -Platform "win" `
+                -Arch $t.Arch `
+                -PackageRoot "narou" `
+                -CommitVersion $commitVersion `
+                -Variant $v `
+                -OutputDir "dist"
+            }
+          }
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-assets
+          path: dist
           if-no-files-found: error
 
   release:
@@ -197,10 +670,21 @@ jobs:
     needs:
       - validate
       - build
+      - sign-windows
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download packaged release zips
+        uses: actions/download-artifact@v7
         with:
+          pattern: narou_rs_*.zip
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download signed Windows assets
+        uses: actions/download-artifact@v7
+        with:
+          name: windows-assets
           path: release-assets
           merge-multiple: true
 

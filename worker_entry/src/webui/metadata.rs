@@ -1,0 +1,111 @@
+//! D1-only composition for UI metadata reads and global settings.
+//!
+//! These routes do not use object payloads, S3, login cookies, an HTTP client,
+//! a queue producer or a rate limiter. Building a full WorkerRuntime for them
+//! added unrelated serial reads before the actual UI query. Keep the shared
+//! application services (and their validation/cache invalidation) but only
+//! construct their D1 dependencies. Handles are request-local, never global.
+//! Authentication still happens in each route before calling these helpers.
+
+use std::sync::Arc;
+
+use narou_rs::application::{
+    SettingsService, TagColorService,
+};
+use worker::{Env, Response};
+
+use crate::d1_repository::{D1NovelRepository, D1SettingsStore, D1TagColorStore};
+use crate::db_handle::DbHandle;
+
+pub(crate) struct MetadataServices {
+    pub db: DbHandle,
+    pub tag_colors: TagColorService,
+}
+
+pub(crate) fn database(env: &Env) -> worker::Result<DbHandle> {
+    Ok(DbHandle::ui(Arc::new(env.d1("DB")?)))
+}
+
+/// 更新系ハンドラ用の primary 直行ハンドル。書き込み判断の読み取りは
+/// セッション (replica) に流さず、常にこちらを使う。
+pub(crate) fn primary_database(env: &Env) -> worker::Result<DbHandle> {
+    Ok(DbHandle::primary(Arc::new(env.d1("DB")?)))
+}
+
+/// Backfill legacy classifications before indexed list and tag queries.
+///
+/// 配信 Worker (reader) は source を変更しないので backfill も走らせない。
+/// 未分類のままの行は writer の backfill が同じ値を入れるので、配信は
+/// 保存済みの値をそのまま読む。
+pub(crate) async fn initialize_attributes(env: &Env) -> worker::Result<()> {
+    if crate::worker_role::is_reader(env)? {
+        return Ok(());
+    }
+    let db = primary_database(env)?;
+    if crate::virtual_novels::reconcile_attributes(&db).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?
+    {
+        return Ok(());
+    }
+    let repository = D1NovelRepository::new(db.clone());
+    let objects: Arc<dyn narou_rs::platform::ObjectStore> =
+        Arc::new(crate::d1_object_store::D1ObjectStore::new(db));
+    let sites = crate::bundled_sites::load_site_settings_uncached(&objects).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    repository.initialize_attributes(&sites).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    let initialized = crate::virtual_novels::reconcile_attributes(&primary_database(env)?).await
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    if !initialized {
+        return Err(worker::Error::RustError("attribute migration marker disappeared during initialization".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn settings(env: &Env) -> worker::Result<SettingsService> {
+    Ok(SettingsService::new(Arc::new(D1SettingsStore::new(database(env)?))))
+}
+
+/// 編集画面と更新系ハンドラ用の `SettingsService`。`D1SettingsStore::for_writes` は
+/// `load` で isolate キャッシュを介さず、primary ハンドルへ読みに行くので、
+/// 編集画面の期待値や read-modify-write (`set` / `set_raw` / `apply`) が
+/// 古いスナップショットを使わない。
+pub(crate) fn settings_for_writes(env: &Env) -> worker::Result<SettingsService> {
+    Ok(SettingsService::new(Arc::new(D1SettingsStore::for_writes(
+        primary_database(env)?,
+    ))))
+}
+
+impl MetadataServices {
+    pub(crate) fn new(env: &Env) -> worker::Result<Self> {
+        let db = database(env)?;
+        Ok(Self {
+            tag_colors: TagColorService::new(Arc::new(D1TagColorStore::new(db.clone()))),
+            db,
+        })
+    }
+}
+
+/// Post-authentication wall time, including D1 waits, not a CPU measurement.
+/// Workers' clock advances at I/O boundaries; use Workers CPU metrics for
+/// synchronous work. No SQL, query values, titles or credentials are exposed.
+pub(crate) fn timed_response(
+    mut response: Response,
+    metric: &'static str,
+    started_ms: f64,
+) -> worker::Result<Response> {
+    let elapsed = (js_sys::Date::now() - started_ms).max(0.0);
+    response.headers_mut().set("Server-Timing", &format!("{metric};dur={elapsed:.1}"))?;
+    Ok(response)
+}
+
+pub(crate) async fn configured_tag_color(settings: &SettingsService) -> Option<String> {
+    settings
+        .get(narou_rs::application::tag_colors::NEW_TAG_COLOR_SETTING)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| narou_rs::application::tag_colors::is_valid_tag_color(value))
+}

@@ -1,0 +1,804 @@
+# Cloudflare Workers 移行計画 (2026-10-15 改訂: 本文・履歴を S3 へ)
+
+v0.4.x 系で進めてきた Worker 対応を「本番で使える状態」まで持っていくための計画。
+Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は既に引かれており、
+本計画はその上に載る**足回り・保存基盤・機能の穴埋め**を扱う。
+
+## 実装状況 (2026-09-26)
+
+| Phase | 状態 |
+|---|---|
+| P0a 足回り (環境分離・プロビジョニング) | ✅ 完了 (`56d5feb`) |
+| P0b 署名と S3 アダプタ | ✅ 完了 (`23338ec`, `ed87fcd`) |
+| P0c 保存先の振り分け (SplitStore) | ✅ 完了 (`SplitStore` + `asset_backend`、mock 2 系統で固定) |
+| P0d D1→S3 移行 | 挿絵の既存 API に加え、本文・履歴用の独立した `/api/admin/content-migration` を実装。本文を D1 の列へ展開する旧計画は撤回 |
+| P0e 契約テスト + CI デプロイ | ✅ 契約テストは CI (`worker-contract`)、配備は `develop` / `main` の push 後に環境別に自動 (`worker-deploy-*`) |
+| P1 取得系を閉じる | ◐ 実行系は実装済み。SSRF・Cookie・設定の 3 点が未了 |
+| P2 変換を Worker へ | ◐ 変換テキスト生成は完了 (`ConvertService`)。残りは device 出力 (MOBI 等) の扱い |
+| P3 Web UI 移植 | ❌ 未着手 |
+| P4 運用 | ❌ 未着手 |
+
+### P1 の内訳 (2026-09-26 時点の実測)
+
+- ✅ 実装済み: queue 実行系 (`worker_entry/src/consumer.rs`, `executor.rs`)。D1 台帳での claim、予算
+  (`WorkerBudget` + section 境界チェックポイント)、bounded retry、`JobKind::is_worker_executable()` による
+  種別判定まで動く。
+- ✅ URL 検証・資格情報・設定の 3 点は解消済み (§2.2 #1/#3/#4)。
+- ❌ サイト定義はビルド時埋め込みのみ (`EmptySiteDefinitionProvider`, `worker_entry/src/composition.rs`)。
+
+2026-10-15 の変更: D1 の容量を本文量から切り離すため、本文と旧本文も話単位で圧縮して
+S3 に置く。D1 は参照と管理情報を保持する。`asset_backend` は従来どおり挿絵専用で、
+本文は独立した `content_backend` によって段階的に移行する。native の保存先は変更しない。
+
+---
+
+## 0. 決定事項 (2026-09-26)
+
+| 項目 | 決定 | 補足 |
+|---|---|---|
+| **ゴール** | **Web UI ごと Workers へ移行する**。native は CLI と、Workers で代替できない重量処理・ローカル操作のために残す | UI 移植は P3 |
+| **重量処理** | **Worker 内の AozoraEpub3_Lite (in-process) で完結**。外部プロセス前提の機能（AozoraEpub3 jar / kindlegen / SMTP / 端末送信 / セルフアップデート等）は **明示的に `blocked` / `501`** とし、黙って失敗させない | CF Containers は使わない |
+| **保存** | **管理情報・目次・本文への参照は D1、本文・旧本文・挿絵は S3 互換ストレージ**。本文は話単位の圧縮オブジェクト。識別子は `S3_*` / `s3_*` に統一 | 詳細は §1。既存本文は明示的な移行まで D1 を維持 |
+| **EPUB** | **保存しない**。Lite の機能で、Web UI の DL 要求時に保存済みデータからストリーミング生成する | 既存の `GET /api/novels/:id/download.epub` の形を維持 |
+| **raw / 余計なもの** | Workers 側では **raw HTML などのキャッシュを一切保存しない** | native は従来どおり（`.narou/` 互換に影響なし） |
+| **命名** | コード・binding・設定キーは `S3_*` / `s3_*`。ベンダ名を識別子に使わない | R2 / MinIO でも同じ経路 |
+
+補足: Worker 成果物は `worker-runtime` が `lite` を含むため **GPL-3.0-only**（`worker_entry/Cargo.toml:5-9`）。
+
+---
+
+## 1. データの所在と本文移行
+
+### 1.1 種別ごとの置き場
+
+| 種別 | 置き場 | 形 |
+|---|---|---|
+| 作品・タグ・凍結・設定・ジョブ | D1 | 既存の `novels` / `novel_tags` / `frozen_novels` / `app_state` / `worker_jobs` |
+| 目次・小説固有設定・挿絵索引・履歴の版マーカー | D1 `objects` | 既存の論理キー・codec を維持 |
+| 現在の本文と旧本文 | S3、参照は D1 `content_objects` | 1 話 = 1 圧縮オブジェクト。`SectionFile` YAML（抽出した本文 HTML・前書き・後書き・話情報）を保存 |
+| 挿絵・うごイラ | 既存の S3 / D1 選択 | `asset_backend` は変更しない |
+| raw ページ HTML | 保存しない | 本文中の HTML マークアップとは別物 |
+| 変換済み全文 | 既定では保存しない | `convert.keep-txt=false`。有効にした場合の従来の D1 保存は維持 |
+| EPUB | 保存しない | 要求時に本文を読み、変換してストリーミング生成 |
+
+既存の本文は、移行を実行するまでは従来どおり D1 `objects` / `object_chunks` に残る。
+S3 の接続設定は挿絵と共通だが、保存先の状態は独立している。
+
+### 1.2 保存と更新の不変条件
+
+- 実装は `worker_entry/src/content_store.rs`。既存 `ObjectStore` / `AssetStore` を実装し、
+  Downloader・変換・差分履歴・削除は従来の論理キーを使い続ける。native の実装は変更しない。
+- 対象は `本文/<話>.yaml` と `本文/cache/<版>/<話>.yaml`（旧 `.cache` 形式も対象）。
+  タイトルやサイト名に `本文` が含まれても、目次や設定を本文と誤判定しない。サブディレクトリありで
+  作品フォルダ自体が `本文` の場合も、`toc.yaml` / `converter.yaml` / `.illustration_cache.yaml` は D1 に残す。
+  Rust の分類と `0012_content_metadata_boundary.sql` の移行対象・書き込みガードで同じ除外を行う。版マーカー `.version` も D1 に残す。
+- 圧縮は共通の Brotli codec。小さくならない場合は非圧縮で保存する。圧縮方式・元サイズ・
+  保存サイズ・CRC32・SHA-256 は D1 に保持し、読み出し時に照合する。1 話の上限は 16 MiB。
+- S3 の物理キーは `content/<ランダムな版 ID>.bin`。既存オブジェクトの部分更新はせず、
+  新版の PUT 成功後に D1 の参照を原子的に公開する。保存失敗は旧参照を変えない。
+- 履歴は独立した版へコピーし、コピー先・元で圧縮をやり直さない。Worker の更新では
+  `PersistenceService::cache_section` がコピーを選び、新本文の PUT に失敗しても現行本文を残す。
+  改題で論理キーが変わった場合も、新本文と新 TOC の保存後にだけ旧キーを削除する。
+  native は従来どおり履歴への移動を使う。
+- 参照がある本文の S3 欠落・破損・通信失敗を、旧 D1 本文や空本文へのフォールバックで隠さない。
+- 置換・削除した版の実体削除は D1 `content_garbage` に記録する。PUT 前にも削除予約を記録するため、
+  書き込み途中の停止で不要な版が削除管理から漏れない。未完了 PUT の予約は 1 時間後から回収可能。
+  期限切れの予約を使った遅延 PUT は参照を公開できず、回収対象として残す。
+- 本文の列挙は D1 の参照と旧キーを重複なくマージする。S3 の LIST に本文の索引を依存させない。
+- 移行開始後は本文ストアの目次・参照読み取りを primary に揃え、古い replica の目次と新しい本文参照の混在を避ける。
+
+### 1.3 本文専用の保存先状態
+
+`app_state(scope='inv', key='content_backend')` は次の一方向遷移を持つ。
+
+| 状態 | 読み出し | 新しい本文の保存 |
+|---|---|---|
+| `d1`（明示的な旧方式） | 従来の D1 | D1 |
+| `migrating` | 参照があれば S3、参照がまだ無い話だけ旧 D1 | S3 |
+| `s3` | S3 参照のみ | S3 |
+
+本文ストアの初期化時に marker が無ければ、旧 D1 本文・履歴が無いライブラリは `s3`、
+残っているライブラリは `migrating` を選ぶ。S3 の構成に成功した後、旧本文の有無の判定と
+marker の保存を primary の単一 SQL で行う。既存本文を取り残さず、新しい本文は S3 に保存する。
+
+明示的な `d1` は `NAROU_REQUIRE_S3` が無効なローカル検証・旧方式の環境だけで維持する。
+`NAROU_REQUIRE_S3=true` の配備では明示的な `d1` も同じ規則で進める。
+既存の `migrating` / `s3` を戻さず、S3 の設定・通信に失敗しても D1 へフォールバックしない。
+この初期化で既存本文の一括コピーや削除はしない。`plan` / `status` は読み取り専用で、
+本文ストアがまだ初期化されていない未設定状態を `d1` と報告する。
+
+初期化後のコピー・照合・切替・回収は管理 API を通す。書き込みの判断は primary を使い、D1 のトリガーも
+移行開始後の旧本文への書き戻し・無許可の削除を拒否する。切替直前から実行中だった処理にも効く。
+S3 に切り替えた後に marker だけを `d1` に戻す操作や、参照を理解しない旧バイナリへの
+即時ロールバックはサポートしない。
+
+### 1.4 コピー・照合・切替・容量回収
+
+既存の認証を適用した `GET /api/admin/content-migration` が状態を返し、
+`POST` は `{"action":"...","limit":20}` を受け付ける。`limit` は 1〜100、既定 20。
+`asset_backend` と既存の `/api/admin/object-migration`（挿絵用）は変更しない。
+
+| action | 動作 |
+|---|---|
+| `status` | 保存済み進捗、本文の保存先、残存 D1 本文数・参照数・回収待ち数を返す |
+| `plan` | D1 本文・履歴の件数と圧縮前のサイズを数える。読み取りだけで S3 設定は不要 |
+| `copy` | `migrating` へ進め、旧本文を S3 へコピーして参照を作る。同時取得が作った新しい参照を上書きしない |
+| `verify` | コピー全件完了後、S3 の実体を展開し、サイズ・CRC32・SHA-256 を照合する |
+| `cutover` | コピー・照合の完了と全旧本文への検証済み参照を確認して `s3` に進める |
+| `purge` | 切替後、検証済み参照がある旧 D1 本文とチャンクだけを削除する。目次・設定・参照・S3 実体は維持 |
+| `gc` | 不要な S3 版を上限付きで回収する。使用中の版と未完了 PUT の保護期間中の予約は削除しない |
+
+各 action は `done=true` になるまで繰り返す。失敗した話を飛ばしてカーソルを進めない。
+進捗は `app_state('inv','migrate_content')` に保存し、管理操作同士は期限付き lease で排他する。
+S3 基本化で既に `migrating` の場合も、台帳の予定件数が未記録なら最初の `copy` が
+旧 D1 本文の件数・圧縮前サイズを記録する。`plan` は引き続き保存しない。
+保守スクリプトの `--apply` 再実行は完了済みの段階を飛ばし、未完了の段階から続ける。
+検証途中でも完了済みのコピー段階へ戻らず、保存済みカーソルと検証済み件数を維持する。
+終了時に `pending_garbage` が残る場合でも、未完了 PUT の保護期間によってその時点で回収可能な
+対象が無ければ `gc.done=true` になる。後刻の `gc` で回収できる。
+
+CLI から一連の操作を行うヘルパー（ブラウザは開かない）:
+
+```powershell
+$env:BASE_URL = "https://your-worker.example"
+$env:NAROU_ADMIN_TOKEN = "<管理トークン>"
+node scripts/migrate-worker-content.mjs
+node scripts/migrate-worker-content.mjs --apply
+```
+Cloudflare Access の前段がある場合は、既存の契約テストと同じ `CF_ACCESS_CLIENT_ID` /
+`CF_ACCESS_CLIENT_SECRET` も環境変数へ設定する。Worker の認証を無効にして Access だけで
+保護する構成では、サービス用トークンの組だけでも実行できる。Wrangler の OAuth ログインとは別の認証。
+
+
+引数なしは `plan` のみ。`--apply` は `copy` → `verify` → `cutover` → `purge` → `gc` を順に実行する。
+`purge` は旧本文を削除するため、本番の移行は実行者が明示して開始する。配備だけでは移行しない。
+初回の `copy` は新 Worker の配備完了後、旧版で始まったジョブの終了を確認してから開始する。
+移行開始後は新方式の取得・更新を並行利用できる。
+途中で失敗した場合は原因を解消し、同じコマンドを再実行すると保存済みの進捗から続く。
+D1 の物理サイズ表示が、本文 BLOB の削除量と同時・同量で減る保証はない。
+D1 のバックアップ／PITR だけでは S3 の本文実体は復元できない。GC 後の古い D1 参照の復旧にも
+S3 側のバックアップ・保持が必要になるため、移行前に D1 と S3 の両方の復旧手段を用意する。
+
+### 1.5 取得から EPUB まで
+
+```mermaid
+flowchart TD
+    Site[小説サイト] --> Download[Worker: 取得・抽出]
+    Download --> Body[S3: 話単位の圧縮本文・履歴]
+    Download --> Index[D1: 作品・目次・本文参照]
+    Body --> Convert[ConvertService]
+    Index --> Convert
+    Convert --> EPUB[Lite: EPUB ストリーミング応答]
+```
+
+小説の全話を一つの圧縮アーカイブにはしない。既存の上限付き本文読み出し・変換経路を使い、
+本文の GET が失敗した場合は変換や EPUB を成功扱いしない。挿絵の取得経路は従来どおり。
+
+---
+
+## 2. 現状（2026-09-26 調査結果）
+
+### 2.1 既に動く範囲
+
+| 面 | 内容 | 根拠 |
+|---|---|---|
+| エントリ | `fetch` / `scheduled` / `queue` の 3 ハンドラのみ | `worker_entry/src/lib.rs:23,411,421` |
+| HTTP | health 2 + 読み取り 3 + ジョブ 2 + 移行 1（未コミット）。`/` と `/health/live` 以外は Bearer | `worker_entry/src/lib.rs:24-41,438-448` |
+| queue 実行 | `Download` / `Update` のみ。claim → 実行 → durable terminal → ack、retry は 5/10/20 秒・最大 3 回 | `src/application/jobs.rs:64-66`, `worker_entry/src/consumer.rs:32-39,236-270` |
+| cron | 毎分 planner が `Update` を enqueue（実行はしない） | `worker_entry/src/scheduler.rs:26-156` |
+| サイト定義 | build 時に `webnovel/*.yaml` を埋め込み、isolate 初回に compile | `worker_entry/build.rs:20-61`, `worker_entry/src/bundled_sites.rs` |
+| EPUB | `epub_lite::build_book_from_source` + `EpubStreamWriter` で 1 エントリずつ書き出し、挿絵はそのエントリの直前で 1 枚だけ読む（`LazyImageSource`）。チャンクは `Response::from_stream` で流す | `worker_entry/src/lib.rs` (`api_novel_download_epub`) |
+
+### 2.2 本番化を止めている穴
+
+| # | 穴 | 根拠 |
+|---|---|---|
+| 1 | ~~SSRF 検証が DNS 解決を要求~~ → **解決済み**: 構文検証を `platform::url_policy` に分離し、`HttpClient::validate_url` の実装が DNS の有無に応じて判定する（native=解決先まで、worker=構文とアドレスリテラル） | `src/platform/url_policy.rs`, `src/platform/http.rs`, `src/downloader/security.rs`, `worker_entry/src/http.rs` |
+| 2 | ~~Convert が Worker に存在しない~~ → **解決**: `ConvertService`（core）が保存済み TOC と本文から変換テキストを組み、`<prefix>/novel.txt` へ書く。`JobKind::Convert` は worker 実行可能。native は per-title txt + SQLite `novel_outputs` を使い、固定名ミラーは書かない (issue #40) | `src/application/convert.rs`, `worker_entry/src/convert.rs`, `src/application/jobs.rs` |
+| 3 | ~~CookieStore 未注入~~ → **解決**: `D1CookieStore` の読み書き両方を注入（native と同じ `app_state(inv, login_cookie)`、at-rest 暗号化）。`Set-Cookie` の書き戻しと `/api/login*`（一覧・置き換え・削除）も Worker で動く | `worker_entry/src/d1_cookie_store.rs`, `worker_entry/src/http.rs`, `worker_entry/src/login.rs` |
+| 4 | ~~設定が Worker に届かない~~ → **解決**: `SnapshotDownloaderSettings` に `app_state` の `local`/`global`（`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory` / `over18`）と `inv` の section hash cache を起動時に読んで注入。書き戻しは同期 API と非同期 D1 の都合で no-op（`over18` は Web UI 側で設定） | `src/downloader/settings.rs`, `worker_entry/src/composition.rs` |
+| 5 | デプロイ設定: `wrangler.<target>.toml` + `ci/render_config.py`。`worker-deploy-*` の起動条件・必要な secret/vars は §2.2.8 を参照 | `worker_entry/wrangler.develop.toml`, `.github/workflows/platform.yml` |
+| 6 | ~~worker のテストが CI で 1 件も走らない~~ → **解決**: `worker_entry/tests/contract.mjs`（HTTP 契約）と `tests/run.mjs`（ローカル workerd 起動）を CI の `worker-contract` ジョブで実行 | `.github/workflows/platform.yml` |
+
+### 2.2.1 URL 検証の分担（2026-09-26 実装）
+
+- 純粋な構文検証（scheme / host / port / アドレスリテラルの公開判定）は `src/platform/url_policy.rs`。
+  `HttpClient::validate_url` の**既定実装**がこれを使うので、DNS を持たない wasm でも全 HTTP 経路が通る。
+- native は上書きして解決先アドレスまで確認する（`src/native/http.rs`, `downloader::security::validate_public_url`）。
+- 同期文脈（挿絵 URL の足切り、DSL の `fetch` ガード）は `is_safe_public_url_syntax` を使う。ホスト名の
+  解決先は見ないが、実際の取得時に transport が確認するので防御は 2 段のまま。
+- 資格情報の保存形式は変えていない（native が書いた `enc:v1:...` を worker が復号できることを固定ベクタの
+  テストで確認: `src/platform/cookie_store.rs` の `decodes_a_pinned_at_rest_payload`）。
+
+### 2.2.2 Convert の現状 (2026-09-26 実装)
+
+- `ConvertService` (`src/application/convert.rs`) が `<prefix>/toc.yaml` と `本文/*.yaml` を
+  ObjectStore から読み、`setting.ini` / `replace.txt` / `converter.yaml`（いずれも ObjectStore 上）と
+  `SettingsStore` の `default.*` / `force.*` を適用して `NovelConverter::build` → `convert_novel` を実行し、
+  `<prefix>/novel.txt` に書く。この固定名キーは Worker 自身の `download.epub` が
+  そのまま配信できる（409 が消える）。native は per-title txt + SQLite
+  `novel_outputs` を読むため、同じキーを書く必要はない (issue #40)。
+- 検証: `src/application/convert.rs` のテストが MemoryObjectStore 上で往復（TOC + 本文 →
+  `novel.txt`、本文が無ければ失敗）を固定する。
+- 既知の差: 挿絵のローカライズ能力は native の CLI 変換と同じく渡さない（device 側の仕事）。小説ごとの
+  `replace.txt` は適用するが、インストール先の全体 `replace.txt` は native 専用のまま。セクション変換
+  キャッシュは Worker では持たない（毎回変換する）。
+- `JobKind::Convert` は `is_worker_executable` に含めた。Send / Mail / Backup は従来どおり `blocked`。
+
+### 2.2.3 契約テスト (2026-09-26 追加)
+
+- `worker_entry/tests/contract.mjs` は HTTP だけを叩くので、ローカルの `wrangler dev` でもデプロイ済み環境でも
+  同じものを使える。検査内容: `/health/live` `/health/ready`、認証 fail-closed (未認証・誤トークン)、
+  `/api/novels` のページ形、405/404/400 の境界、`/api/jobs` の受理と `blocked` の区別、そして
+  **queue consumer が実際に回って Convert ジョブが終端状態になること**（`CONTRACT_QUEUE=0` で無効化）。
+- `worker_entry/tests/run.mjs` がビルド → ローカル D1 へ migration → `wrangler dev` 起動 → 契約テストまでを
+  1 コマンドで行う。`.dev.vars` と `wrangler.test.toml` は gitignore 済みで、後者は `wrangler.toml` から
+  `[build]` を外して生成する（毎回 release ビルドを走らせないため）。
+- 実測 (2026-09-26, wrangler 4.141 / worker-build 0.8.5): 15 チェックすべて green。ログに
+  `job j... failed permanently: Platform error: 小説 999999999 がありません` が出ており、Convert の
+  実行経路 (plan → queue → claim → ConvertService → 終端) が workerd 上で動くことを確認した。
+
+### 2.2.4 保存先の振り分け (P0c, 2026-09-26 実装)
+
+- `SplitStore` (`src/platform/split_store.rs`) は挿絵の経路だけを分ける。
+  Worker の主ストアは `ContentStore` を重ね、本文・履歴を独立して S3 へ送る（§1）。
+- 挿絵判定は **末尾 2 セグメントが `挿絵/<画像拡張子>`**。小説ディレクトリ名が偶然 `挿絵` のとき
+  (`novels/<site>/挿絵/toc.yaml`) を巻き込まないため、拡張子まで見る。`.illustration_cache.yaml` は
+  メタデータなので D1 に残る。
+- 一覧は `<小説プレフィックス>/挿絵` の形だけ挿絵側へ回す（セグメント数でも区別）。
+- ストアをまたぐ `copy` / `move_or_copy` は経路が決まらないので明示的に失敗させる。
+- 切り替えは `app_state('inv','asset_backend')` (`d1` | `s3`)。`s3` で資格情報が欠けていれば起動を
+  失敗させる (fail-closed)。旧 `object_backend` は撤去した。
+- 検証: `src/platform/split_store.rs` のテストが振り分け（書き込み・読み出し・一覧・交差コピー拒否）と
+  判定規則を `MemoryObjectStore` 2 系統で固定する。
+
+### 2.2.5 挿絵の D1→S3 移行 (P0d, 2026-09-26 実装)
+
+**切替の制限**: 以下は既存ツールの操作説明であり、安全な本番切替の完了証明ではない。
+phase と対象を持たない共通カーソル/`done` は移行完了の証明にならない。今回の CI は開発用旧挿絵を移行せず切り替える（末尾の「S3 必須配備」を参照）。
+
+- `asset_backend` を `s3` に切り替える**前に** `POST /api/admin/object-migration {"action":"copy"}` を
+  繰り返し呼ぶ。1 回 `limit` 件 (既定 100・上限 500) で区切り、`app_state` のカーソルで再開する。
+  `verify` は 1 件ずつ突き合わせ、欠落・不一致・上限超過を `failed` に集める。
+- 移行後も D1 側は消さない。`asset_backend` を `d1` に戻せば即座に元の経路へ戻せる。
+- コアは `narou_rs::platform::store_migration`。`MemoryObjectStore` 2 系統で「挿絵だけ動く」
+  「verify が欠落と不一致を報告する」を固定している。
+- 既知の制約: `verify` は 16 MiB を超えるオブジェクトを「上限超過」として報告する (bounded read と同値)。
+
+### 2.2.6 ログイン資格情報の書き込み (P1, 2026-09-26 実装)
+
+- wasm でも at-rest 暗号化ができるようにした: `getrandom` を `worker-runtime` に足し、
+  `wasm_js` バックエンド (`crypto.getRandomValues`) を**ターゲット限定の依存**で有効にする。
+  native 側には `wasm-bindgen` が入らない (`cargo tree` で確認済み)。
+- `D1CookieStore::save_all` は native と同じく「JSON 配列 → XChaCha20-Poly1305 (host を AAD)」で
+  保存する。鍵 (`NAROU_RS_LOGIN_KEY`) が無ければ平文で書かずに失敗させる (fail-closed)。
+- `WorkerHttpClient` が `Set-Cookie` を書き戻す (native の `persist_set_cookie` と同じ規則:
+  送信した資格情報だけを更新し、別アカウントのセッションを壊さない)。
+- 管理 API: `GET /api/login`（値は伏せて一覧）、`POST /api/login/set`、`DELETE /api/login/{host}`。
+  応答形は native Web UI と同じ `{success, data|message}`。
+- 検証: 契約テストが「登録 → 暗号化されている (`encrypted: true`) → 値が応答に現れない →
+  一覧 → 削除」を workerd 上で確認する。乱数が wasm で動くことも同時に固定される。
+- 残り: `POST /api/login/import`（書き出しファイルの取り込み。argon2 依存のため
+  `login::transfer` は native のみ）と `add` / `order`。
+
+### 2.2.7 サイト定義の差し替え経路 (P1, 2026-09-26 実装)
+
+- モデルは全プラットフォーム共通: **bundle が種（seed）+ フォールバック**、**ユーザー定義が同名で上書き**。
+  名前は `webnovel/` のファイル名そのもの（`ncode.syosetu.com.yaml`）で、拡張子を省いて渡しても補完する。
+- 置き場は保存方式に従う:
+  - native / YAML モード … ライブラリの `webnovel/` フォルダ（narou.rb と同じ場所）
+  - native / SQLite モード … オブジェクトストア（`objects` テーブル）の `webnovel/<name>.yaml`。
+    切り替え時に既存の `webnovel/` から一度だけ取り込む（元ファイルは残す）。以後ファイルを読まないので
+    SQLite 構成は YAML に依存しない。
+  - Worker … 同じオブジェクトストア（D1）
+- 実体は `src/application/site_definitions.rs` の `SiteDefinitions`（+ `SiteDefinitionStore` port）。
+  `put` は保存前に必ずコンパイル検証するので、壊れた定義で readiness を落とせない。
+- 起動時に実効定義を 1 回だけ確定させ (`install_effective_site_settings`)、以後の同期コード
+  （CLI のターゲット解決など）は `effective_site_settings()` を読む。
+- API は native の Axum と Worker の両方に同じ形で用意した:
+  `GET /api/sites` / `GET /api/sites/{name}`（実効定義の本文つき） / `PUT /api/sites/{name}` /
+  `DELETE /api/sites/{name}`。応答は `{success, data|message}`。
+- 残り: `AppServices.site_definitions`（`EmptySiteDefinitionProvider`）は旧 API で、いまは誰も中身を
+  使っていない。`AppServices` の差し替え時に撤去する。
+- **副産物のバグ修正**: `D1ObjectStore::list_keys` の範囲上限が `{prefix}0` で、`0` より後ろの文字で
+  始まるキー（`本文/…` や英字名）が一覧から漏れていた。`platform::prefix_upper_bound` に置き換え、
+  CJK・空プレフィックスを含むテストを追加した（挿絵の一覧も同じ理由で壊れていた）。
+
+### 2.2.8 CI からのデプロイ (P0e, 2026-09-26 実装)
+
+`worker_entry/ci/deploy_worker.py` が 1 環境分の管理・配信 Worker を配備する:
+
+1. `ci/provision_resources.py` で既存の D1・取得用 Queue・変換用 Queue と各 DLQ を冪等に用意（名前は環境名から導出）
+2. `ci/render_config.py` で管理用 `wrangler.ci.toml` と配信用 `wrangler.reader.ci.toml` をレンダリング（未置換プレースホルダは失敗）
+3. 管理用の設定で `wrangler d1 migrations apply <db> --remote` を実行し、共有 D1 を更新
+4. 管理 Worker を既存の名前・Durable Object namespace のままビルド・配備
+5. 同じビルド済み成果物を `<管理 Worker 名>-reader` として配備。配信側は Queue / cron を持たず、共有 DB / S3・認証と、管理側への Service Binding・既存 PushHub だけを使う
+6. 必須のストレージ確認と契約 smoke を実行（一般 smoke は `NAROU_SMOKE=0` で省略可。必須確認は省略しない）
+
+管理側の `/health/ready` が成功して旧データの属性補完を終えるまで、配信側の
+配備・Route の更新は行わない。Access が前段にある場合は、CI の
+`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` でこの確認を通せるようにする。
+到達できない場合は既存の配信先を維持して配備を失敗させる。S3 LIST プローブの
+「前段の 403 は未検証としてスキップ」という例外は、この切替前提には適用しない。
+
+secret ファイルは `finally` で削除し、配信側へは認証・S3 の資格情報だけを渡す。
+ログイン Cookie の復号鍵と取得リレーの資格情報は管理側に残す。
+管理側を先に配備することで、配信側の Service Binding が参照する script / PushHub を
+初回配備でも確保する。既存の D1 / S3 データを別 Worker 用へコピー・移行しない。
+
+公開ドメインがある場合は、同じホストの `/api/v1*`・`/api/read/v1*`・
+`/api/novels*`・`/api/virtual_novels*`・`/novels/*` を配信用の Route にする。
+EPUB や外部 API の要求は管理 Worker を中継せず、既存 URL・Access の保護を維持する。
+プレフィックスに巻き込まれた編集要求や HTML ページは Service Binding で管理側へ転送する。
+DNS レコード・Access アプリケーション・認証ポリシーは変更しない。
+公開ドメインを持たない develop 検証では、配信用の `workers.dev` URL を直接使う。
+読み取り専用の範囲とメモリ上限は [`external-api.md`](external-api.md#workers-の配信用-worker) を参照。
+
+トリガーは `.github/workflows/platform.yml`:
+
+| きっかけ | GitHub Environment | デプロイ先 (`NAROU_DEPLOY_TARGET`) |
+|---|---|---|
+| `develop` へ push | `Cloudflare` | develop |
+| `main` へ push | `Cloudflare` | production (custom domain) |
+| 手動 `workflow_dispatch` (`target: develop`) | `Cloudflare` | develop |
+| `main` から手動 `workflow_dispatch` (`target: production`) | `Cloudflare` | production (custom domain) |
+
+- リリースタグの push は互換性チェックだけを実行し、Workers は配備しない。既存タグの再実行は旧コミット・旧 workflow を使うため、修正版は `main` の新しい run から配備する。
+- 各ジョブは `needs: [native, native-gpl, wasm, worker, worker-contract, license]` で、テストが緑のときだけ動く。
+- Cloudflare の資格情報が未設定のリポジトリ (fork など) では **理由を出してデプロイだけ省略**する
+  (`check Cloudflare credentials` ステップ)。テストは通常どおり走る。
+- GitHub Environments は**用途で 2 つ**に分ける（target では分けない）:
+  - `Cloudflare` … デプロイ 2 ジョブ用（下の表）
+  - `CodeSining` … `release.yml` の Windows 署名。`CERTUM_USERNAME` / `CERTUM_OTP_URI`（secrets）と
+    `CERTUM_KEY_ID`（var）。Workers のデプロイからは参照しない。
+
+#### `Cloudflare` に置く secret
+
+| 名前 | 必須 | 用途と挙動 |
+|---|---|---|
+| `CLOUDFLARE_API_TOKEN` | 必須 | `wrangler` 用 API トークン。D1 / Queue の provision、`d1 migrations apply --remote`、`deploy` に使う。未設定だと「理由を出してデプロイだけ省略」（ジョブは緑のまま） |
+| `CLOUDFLARE_ACCOUNT_ID` | 必須 | アカウント ID。Dantalian 綴りの `CLOUDFLARE_ACCOUT_ID` でも動く（workflow が `\|\|` で受ける） |
+| `SERVICE_DOMAIN` | production 必須 | production の custom domain（ホスト名のみ。scheme / path 不可）。`[[routes]] pattern=… custom_domain=true` の生成と smoke の宛先に使い、**ログと step summary では伏せる** |
+| `DEVELOP_DOMAIN` | develop 任意 | 同様。未設定なら route を足さず workers.dev で動く |
+| `NAROU_ADMIN_TOKEN` | Zero Trust が境界なら不要 | Worker API の Bearer。`--secrets-file` で Worker secret として投入。auth 有効で未設定ならデプロイを失敗させる（fail-closed） |
+| `NAROU_RS_LOGIN_KEY` | 任意 | 保存したログイン Cookie の AEAD 鍵。base64 で、32 バイトはそのまま、16 バイト以上（例 `openssl rand -base64 24`）は SHA-256 で伸長。native の `.narou/login.key` と同じ値にすると資格情報を共有できる。未設定なら平文行だけを読み、notice を出す |
+| `NAROU_S3_ACCESS_KEY_ID` / `NAROU_S3_SECRET_ACCESS_KEY` | 任意 | S3 資格情報。`S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` という Worker secret として投入する。未設定なら Secrets Store か `wrangler secret put` で別途投入する（notice を出す） |
+| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | 任意 | Access の service token。smoke と必須の S3 検証を custom domain 越しに流す。未設定で Access に弾かれた場合（HTTP 403）は警告つきでスキップし、成功扱いにしない |
+
+#### `Cloudflare` に置く var
+
+| 名前 | 既定 | 用途と挙動 |
+|---|---|---|
+| `NAROU_AUTH_REQUIRED` | `true` | `[vars]` に焼き込み、Worker の Bearer 検査を on/off する。`false` は Zero Trust 前提（`NAROU_ADMIN_TOKEN` 不要）。`true` でトークン未設定なら 500 `authentication_not_configured` |
+| `NAROU_WORKERS_DEV` | 「route があれば `false`」 | workers.dev の開閉。レンダラ専用（Cloudflare へは渡さない）。Access だけが境界のときに迂回口を残さないため |
+| `NAROU_S3_ENDPOINT` | (a) で必須 | `https://…`（query / fragment 不可）。`[vars] S3_ENDPOINT` に焼き込む |
+| `NAROU_S3_REGION` | (a) で必須 | 小文字のリージョン名（例 `us-east-1`） |
+| `NAROU_S3_BUCKET` | (a) で必須 | S3 のバケット名規則を検証する |
+| `NAROU_S3_PREFIX` | `narou/<target>` | キー前置。**設定しない**（両 target で同じバケットを prefix で共有する）。(b) でも GitHub 側に置く |
+| `NAROU_SECRETS_STORE_ID` | (b) で必須 | Secrets Store の ID。(b) の共通値（下の表の名前とセットで使う） |
+| `NAROU_S3_*_SECRET_NAME`（5 つ） | (b) で必須 | 下の表の (b) 列。値ではなく Cloudflare 側の secret 名 |
+| `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` | 任意 | トークン・鍵も Secrets Store に置く。(b) の ID が必要で、設定すると `--secrets-file` を作らない |
+| `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` | `narou-rs` / `narou-jobs` | provision が `<base>-<target>` と `<queue>-dlq` を作る。target サフィックスを含めないこと |
+| `NAROU_DEPLOY_URL` | — | smoke の宛先を明示（workers.dev 以外は伏せる） |
+| `NAROU_SMOKE` | `1` | `0` で smoke を省略 |
+
+##### 値ごとの対応（(a) 値を GitHub から渡す / (b) Secrets Store に置く）
+
+| 値（Worker が読む名前） | (a) GitHub 側 | (b) GitHub 側 | Worker の解決順 |
+|---|---|---|---|
+| `S3_ACCESS_KEY_ID` | secret `NAROU_S3_ACCESS_KEY_ID` | `NAROU_S3_ACCESS_KEY_ID_SECRET_NAME` | `S3_ACCESS_KEY_ID_STORE` → var → secret |
+| `S3_SECRET_ACCESS_KEY` | secret `NAROU_S3_SECRET_ACCESS_KEY` | `NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME` | 同上 |
+| `S3_ENDPOINT` | var `NAROU_S3_ENDPOINT` | `NAROU_S3_ENDPOINT_SECRET_NAME` | 同上（(b) では `[vars] S3_ENDPOINT` を空にする） |
+| `S3_REGION` | var `NAROU_S3_REGION` | `NAROU_S3_REGION_SECRET_NAME` | 同上 |
+| `S3_BUCKET` | var `NAROU_S3_BUCKET` | `NAROU_S3_BUCKET_SECRET_NAME` | 同上 |
+| `NAROU_ADMIN_TOKEN` | secret `NAROU_ADMIN_TOKEN` | `NAROU_ADMIN_TOKEN_SECRET_NAME` | 同上（既定は `--secrets-file` で入れる secret のみ） |
+| `NAROU_RS_LOGIN_KEY` | secret `NAROU_RS_LOGIN_KEY` | `NAROU_RS_LOGIN_KEY_SECRET_NAME` | 同上 |
+
+- S3 の保存先はモード単位で選ぶ。`NAROU_S3_*_SECRET_NAME` を 1 つでも
+  設定したら (b) になり、S3 の 5 値と `NAROU_SECRETS_STORE_ID` を揃える。
+  S3 の secret 名が無ければ (a)（`NAROU_S3_ENDPOINT` / `REGION` / `BUCKET` が必須）。
+- `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` は S3 と独立。
+  `NAROU_SECRETS_STORE_ID` と組み合わせ、S3 は (a) のままトークンだけストアに置ける。
+- 認証が有効で管理トークンが Secrets Store にしか無い場合、CI は値を読み戻せない。
+  配備後は health/live・health/ready と未認証 API の 401 を検査し、認証付き S3 LIST と
+  契約 smoke は「省略」と明示する（成功とは扱わない）。全検査を実行するには
+  CI の secret `NAROU_ADMIN_TOKEN` にも同じ値を渡す。Access の前段認証は別途
+  `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` が必要で、403 を成功にはしない
+  (2026-10-06: service token が無い場合は必須の S3 検証も `::warning::` 付きの
+  スキップとして報告し、ステップサマリを `skipped: …; not verified` にする)。
+- **`wrangler.<target>.toml` に直書きする運用も可**（参考実装の Dantalian はこの形で、`store_id` を
+  3 テンプレートに直書きし、`secret_name` だけ CI から差し込んでいる）。直書きする場合は CI の
+  `NAROU_SECRETS_STORE_ID` / `NAROU_S3_*_SECRET_NAME` は設定しない（両方書くとバインディングが
+  二重定義になる）。CI 差し込みはアカウント固有の値をリポジトリに置かないための既定。
+- **ストア側の secret 名は自由**（既存のストアをそのまま使える）。`*_SECRET_NAME` に渡すのは
+  名前だけなので、`WASABI_*` のような既存名でも、narou.rs 側の識別子（`S3_*`）に揃えた名前でもよい。
+  変更が要るのは「どの名前を読むか」を書く GitHub 側だけ。ストアの ID と secret 名の一覧は
+  `wrangler secrets-store store list` / `wrangler secrets-store secret list <store-id>` で確認できる。
+
+- 手で置かない派生値: `NAROU_DEPLOY_TARGET`（workflow が設定）と
+  `NAROU_D1_DATABASE_NAME` / `NAROU_D1_DATABASE_ID` / `NAROU_JOB_QUEUE` / `NAROU_JOB_DLQ`
+  （`ci/provision_resources.py` が算出して `GITHUB_OUTPUT` で渡す）。
+- Cloudflare 側に現れる形: `[vars]` は `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_PREFIX` /
+  `NAROU_AUTH_REQUIRED`、Worker secret は `NAROU_ADMIN_TOKEN` / `NAROU_RS_LOGIN_KEY` /
+  `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`、(b) モードでは `<NAME>_STORE` バインディング。
+- **実デプロイ検証 (2026-09-26, develop)**: 「Edit Cloudflare Workers」相当に D1 / Queues / Secrets Store を
+  足したトークンで、`d1 list/create` → `d1 migrations apply --remote`（10 件）→ `wrangler deploy` →
+  custom domain の作成 → Secrets Store バインディングの解決まで通過（run 36227905857）。smoke は Access が
+  前段にあるため省略（下記の service token を入れると実行される）。
+- smoke を Access の内側まで通すには、Access の application に **service token** を作り、ポリシーで許可した
+  うえで `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` を secrets に置く（`NAROU_AUTH_REQUIRED=false`
+  の環境では認証系の検査だけが自動で省略され、残り 25 件が実行される）。
+- デプロイ後の疎通先は `NAROU_DEPLOY_URL`（任意）→ custom domain → wrangler が報告した URL の順。
+  custom domain が Access の内側にある場合は service token を渡すか smoke を省略する。
+- 検証: `ci/render_config.py` を両モード・2 target（domain あり/なし、`NAROU_AUTH_REQUIRED` /
+  `NAROU_WORKERS_DEV` の明示と不正値）で実行し、`tomllib` で読み戻して `[vars]`・
+  `[[secrets_store_secrets]]`・`[[routes]]`・`workers_dev`・prefix を確認（ローカル、Cloudflare 不要）。
+
+### 2.3 その他の差分
+
+- サイト YAML はビルド時埋め込みのみでユーザー差し替え不可（`SiteDefinitionProvider` は空実装）。
+- `setting_core` の `VarType::Directory` が `fs::canonicalize` を呼ぶ（`src/setting_core.rs:216,357`）。
+- APNG 挿絵（うごイラ）は **Worker でも組み立てる**。`zip` を `default-features = false` + 純 Rust の deflate バックエンドに絞ることで wasm32-unknown-unknown でビルドでき、`worker-runtime` から `illustration-animation` を有効にした（実測: `image` (jpeg/png) + `zip` + `miniz_oxide` が wasm でコンパイル通過。native のユニットテスト 6 件も green）。
+- D1 に content mirror（`novel_outputs` / `novel_sections`）とバージョン履歴テーブルが無い。
+  ※ 新設計では本文そのものをセクション行として持つ（P0d）ので、`novel_sections` 相当は必須になる。
+- Web UI のルートは native が約 100 本（`src/web/mod.rs`）+ `/ws` push。Worker 側は `[assets]` で
+  フロントエンド一式を配信し、**フロントが呼ぶ API はすべて移植済み**（`src/web/assets/js/**` の
+  呼び出しと native ルート表を突き合わせて確認）:
+  - 表示: `/api/list`、`/api/sort_state`、`/api/webui/config`、`/api/tag_list`、`/api/queue/status`、
+    `/api/get_pending_tasks`、`/api/feature_tour/{pending,all,seen,config}`、`/api/global_setting`、
+    `/api/library_backup`
+  - 操作: `/api/download`、`/api/convert`、`/api/update`、`/api/update_by_tag`、`/api/freeze`、
+    `/api/novels/{freeze,unfreeze,remove}`、`/api/edit_tag`、`/api/tag/change_color`、
+    `/api/queue/clear`、`/api/cancel`、`/api/cancel_running_task`、`/api/remove_pending_task`、
+    `/api/restore_pending_tasks`、`/api/defer_restore_pending_tasks`
+  - 読み取り: `/api/story`、`/api/diff_list`（GET は HTML 断片 / POST は JSON）、`/api/diff_clean`、
+    `/api/notepad/read`・`/api/notepad/save`（`object_id` による楽観ロック）、`/api/history`、
+    `/api/clear_history`、`/api/taginfo.json`、`/api/version/current.json`・`/api/version/latest.json`
+  - ログイン: `/api/login`、`/api/login/set`、`/api/login/import`、`/api/login/order`、`/api/login/{host}`
+  - 実現不能なものは成功を偽装せず 501 + 機械可読コード: `/api/shutdown`、`/api/reboot`、
+    `/api/folder`、`/api/backup`、`/api/backup_bookmark`、`/api/setting_burn`、`/api/csv/*`、
+    `/api/mail`、`/api/send`、`/api/inspect`、`/api/reorder_pending_tasks`、`/api/update/start`、
+    `/api/update_general_lastup`、`/api/storage/mode`(POST)
+  - `/ws` は接続と hello 1 通のみ（push イベントは Durable Object 導入待ち）
+- 設定ページの JSON は `src/application/settings_view.rs` に集約し、native（axum ハンドラ）と Worker が
+  同じコードで組み立てる。`SettingsService`（`SettingsStore` port の上）と `setting_core` /
+  `setting_info` だけで完結するため、両方のビルドでそのまま動く。
+- **コンソールの分離 (2026-10-08 修正)**: `concurrency` は Worker でも設定でき、convert ジョブの行を
+  native の `web::worker::console_target_for_job` と同じ `stdout2` へ送る
+  (`application::messages::Stream::target_console_with` + `PushHubSink::install_with_console`)。
+  Worker は取得用・変換用 Queue の実行枠を別々に持ち、同一サイトの取得は D1 の admission で直列化する。
+  native の「`concurrency=false` = 全ジョブを 1 レーンで逐次」に相当する設定ではないため
+  **既定は有効**とし、明示的に `concurrency=false` を保存したときだけ 1 コンソールへまとめる (`worker_entry/src/convert.rs` と
+  `webui/ui_prefs.rs`)。DL/update の行は `stdout` のままなので、Web UI のデュアルコンソールが
+  native と同じ分け方になる。`concurrency.*` (native コンソールのキュー表示整形) は native 専用の
+  まま無効扱い。
+
+---
+
+## 3. 目標アーキテクチャ
+
+```text
+Browser ──► Worker (fetch)
+             ├── ASSETS        … 現行 frontend (src/web/assets) をそのまま配信 (P3)
+             ├── /api/*        … native Web UI と同名のルート (P3)
+             ├── /ws           … PUSH_HUB (Durable Object) でイベント fan-out (P3)
+             └── /health/*     … 無認証
+                    │
+  cron(毎分) ───────┤ scheduled: planner / リース回復
+  DL Queue ─────────┤ queue:     Download / Update / AuthorCheck
+  Convert Queue ────┤ queue:     Convert
+                    │
+              ┌─────┴───────────────────────────┬──────────────┐
+              ▼                                 ▼              ▼
+        SplitStore                        DO/RATE_LIMITER   DO/PUSH_HUB
+         ├─ 挿絵 (うごイラ含む) → S3         (サイト別 permit)  (進捗配信)
+         └─ ContentStore
+             ├─ 本文・旧本文 → 圧縮 S3 / D1 参照
+             └─ 目次・設定・メタ → D1
+```
+
+### 3.1 binding 名の契約
+
+| 名前 | 種別 | 用途 |
+|---|---|---|
+| `DB` | D1 | メタ・台帳・設定・目次・本文参照 |
+| `NAROU_JOBS` | Queue producer / consumer | 取得用 `narou-jobs-<target>`、最大 4 実行（DLQ は同名 + `-dlq`） |
+| `CONVERT_QUEUE` | Queue producer / consumer | 変換用 `narou-jobs-convert-<target>`、最大 1 実行（独立 DLQ は同名 + `-dlq`） |
+| `CONVERT_QUEUE_NAME` | var | 変換用 Queue の物理名。受信レーンの判定に使い、CI が binding と同じ値を生成 |
+| `RATE_LIMITER` | Durable Object | サイト別 permit 採番（既存） |
+| `PUSH_HUB` | Durable Object | `/ws` の接続保持とイベント配信（P3） |
+| `ASSETS` | Assets | frontend 配信（P3、`run_worker_first` で `/api/*` と `/ws` を Worker へ） |
+| `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_PREFIX` | vars | S3 接続先。`S3_PREFIX=narou/{target}` で環境同居 |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | secret | 資格情報。未設定は fail-closed |
+| `NAROU_AUTH_REQUIRED` | var | 認証要否（ローカル・テスト用の逃げ道） |
+
+#### ジョブ実行の排他と再開
+
+- 全レーンで D1 `worker_jobs` を共有する。取得ジョブは実効 YAML の `domain` を `site_key` に解決し、同一サイトの実行を 1 件に制限する。別ホスト表記・作者確認も同じ定義へ揃え、別サイトは最大 4 件、変換は独立 Queue で最大 1 件実行する。`concurrency` は表示先の設定で、この実行枠を変更しない。
+- 同じ作品の取得・変換はレーンを跨いでも排他する。YAML で解決した TOC URL を `normalized_target` に持ち、ID・ncode・別 URL 表記を原子的な claim SQL で照合する。取得中に初めて作品 ID が作られた場合も保護し、元の計画・表示用 target・checkpoint の同一性は書き換えない。
+- 競合は失敗ではなく `admission_waiting=1` の待機として保存して ACK する。provider の retry や業務上の `attempts` は消費しない。終端時・毎分 cron の waker が空いたサイトの待機と独立した変換を同じ job ID で再配送する。配送予約後に送信を失っても既存 reaper で回復する。
+- キュー移行前の未解決な実行中レコードは、安全に同一性を判断できないため終端・lease 回復まで保守的に新規 claim を止める。キャンセルされた実行も、実際の HTTP が終了するまで token / lease を保持し、後続との重複を防ぐ。
+- 手動中断では `SectionBudget::check_active` が話・未取得画像の開始前に primary D1 の status と execution token を照合する。進行中の取得を保持しつつ次の取得を止め、最後の話で中断された場合も自動変換の新規投入を抑止する。作者・シリーズの子ジョブ投入前も再確認する。共通 UI の「すべてクリア」は「はい／いいえ」の警告後に `/api/queue/cancel` を使い、待機中を先に消してから実行中を中断する。台帳の tombstone は再配信防止に残すが、消去・削除した待機ジョブを失敗集計に含めず、ユーザー中断は中断件数へ分離する。
+- 旧レーンに残った envelope は台帳の kind を使って正しい Queue へ転送し、送信成功後だけ ACK する。cron と手動の再投入も kind で配送する。Queue のメッセージは従来どおり `{version, job_id}` だけで、計画は台帳を正とする。
+- 600 秒の wall-clock / 850 subrequest の soft budget は話の開始前と未取得画像の直前で確認し、checkpoint を保存して同じ job ID で続行する。画像取得中の中断では先に挿絵索引を保存し、checkpoint はその話を指したままにする。再開後は取得済み画像を読み飛ばして残りを取得し、完了した話の本文も再取得しない。失敗回数には数えず、Web コンソールでは自動再開として案内し、上限値・サイトの取得間隔は変更しない。`worker_entry/tests/content_storage.mjs` は実 workerd・D1・S3 fixture で 500 枚入り 1 話の継続実行と EPUB への全画像埋め込みを確認する。
+- 完了済みの話は、本文・挿絵の保存後にメタデータだけを `<novel-prefix>/.download_resume` へ保存する。再開はこの目次と既存オブジェクト一覧を使い、過去の全本文を S3 から GET しない。拡張子を `.yaml` にしないことで、作品フォルダ名が `本文` の場合も本文・履歴・S3 移行対象に混ぜず D1 の管理情報として保存する。旧版のチェックポイント、または定期 checkpoint がメタデータより先に進んだ部分だけ本文から復元する。目次の識別子・URL・ファイル名・更新日が変わった場合や保存済みの話が欠けた場合は既存の破損チェックポイント回復へ渡す。新規取得の位置 0 と正常完了時はメタデータを削除する。`content_storage.mjs` は 1,685 話・目次 17 ページで予算を跨いでも各話を 1 回だけ取得し、EPUB に先頭・中間・最終話が残ることも検証する。
+
+#### D1 読み取り負荷 (2026-11-06 調査)
+
+Cloudflare Analytics の UTC `2026-10-21T00:00:00Z`〜`2026-11-06T06:15:42Z` で、
+アカウント全体の読み取りは 17,707,818,826 行、本番 `narou-rs-production` は
+17,703,563,903 行 (99.976%) だった。`rowsRead` は返却件数ではなく走査行数である。
+調査は Analytics・SELECT・EXPLAIN のみで、本番のデータ・スキーマ・配備は変更していない。
+
+直近17日の Query Insights では旧待機 SQL が 16,081,641,532 行を占めていた。
+直近24時間では仮想属性再計算 395,679,788 行、待機再開 51,407,103 行、
+キュー件数集計 14,674,935 行が上位だった。これらは上記の期間集計と時間窓が異なる。
+
+- キュー表示は migration `0017_worker_job_counts.sql` の `worker_job_counts` を使う。
+  台帳の INSERT / UPDATE / DELETE トリガーで状態・レーン・中断理由区分の件数を
+  同じトランザクションで保持する。任意のエラー文で集計行を増やさず、heartbeat /
+  checkpoint / 同じ区分への更新では集計を書き直さない。旧 Worker の書き込みにも適用される。
+  完了履歴は削除しない。配備時は通常の CI と同じく migration → Worker の順にする。
+- D1 の `meta.changes` はトリガーの変更も含む。真偽判定 (`> 0`) は従来どおり使えるが、
+  一括消去件数は同じ batch の `SELECT changes()` で台帳自身の変更数だけを返す。
+- ローカル workerd / D1 に終了履歴 30,000 件を追加した計測では、キュー状態の SQL は
+  60,235 行 → 5 行の読み取りになり、状態・レーンごとの件数は一致した。
+  これはローカル fixture の結果であり、修正版配備後の本番負荷とは区別する。
+- 仮想属性整合は `json_each(members) CROSS JOIN novels ON novels.id=member` で
+  結合順を固定する。属性索引を起点に無関係な漫画全件を読む計画を防ぎ、キャッシュや
+  TTL で更新を遅らせない。本番の読み取り専用の分類 SELECT で 57,879 行 → 356 行、
+  21 グループの結果一致を確認した (UPDATE 文の配備後測定ではない)。
+- admission の作品同一性は migration `0018_novel_target_aliases.sql` の
+  `novel_target_aliases(target, novel_id)` で引く。正確な URL・ncode・slash 区切り suffix
+  を初回だけ backfill し、作品の INSERT / 識別子 UPDATE / DELETE トリガーで同期する。
+  一般のタイトル・本文更新では索引を書き直さない。最低 ID 優先・旧 URL 表記の意味を
+  保ち、待機選択と claim の両方から全作品走査を除く。
+  ローカル workerd の 2,279 作品・1,196 待機ジョブでは同じ再開候補に対して
+  57,448 行 → 8,375 行。SQLite の無関係な 30,000 作品を追加した単一候補の回帰では
+  5,940,400 → 200 VM steps。VM steps は D1 の課金行数とは別の指標である。
+
+再測定は `wrangler d1 insights narou-rs-production --time-period 1d --sort-type sum --sort-by reads --limit 20 --json`。
+期間別・DB 別の総量は [D1 Analytics](https://developers.cloudflare.com/d1/observability/metrics-analytics/) の
+`d1AnalyticsAdaptiveGroups` で集計し、旧版と修正版の SQL を混同しない。
+
+
+### 3.2 認証
+
+- API/CI は既存の `NAROU_ADMIN_TOKEN`（Bearer、定数時間比較）を継続。
+- ブラウザは token cookie（`narou_api_token`、HttpOnly / SameSite=Lax）+ 同一オリジン検査。
+  実装: `GET /login` が Worker 専用のログインページを返し、`POST /api/auth/login`（本文の
+  トークンを定数時間で照合）が Cookie を配る。Cookie は base64url で持ち、認証は
+  Cookie 復号 + 定数時間照合。Cookie 経由のリクエストは `Origin` がリクエスト URL と
+  一致することを要求する（SameSite=Lax と二重の CSRF 対策）。共有フロントエンドは
+  401 `authentication_required` を受けると `/login?return=<path>` へ誘導する。
+- secret 未設定時は fail-closed（401 ではなく 500 `authentication_not_configured` として設定不備を可視化）。
+- **Zero Trust (Cloudflare Access) を境界にする場合**は CI の `NAROU_AUTH_REQUIRED=false` で
+  Bearer トークン検査を切れる（`NAROU_ADMIN_TOKEN` は不要）。このときは workers.dev を閉じて
+  Access を通らない入口を残さないこと（route を入れた環境では既定で閉じる）。
+- CI の smoke は前段の Access に弾かれた場合（`tests/contract.mjs` が exit 3 で通知）に「省略」とし、
+  `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`（Access の service token）を渡せば内側まで流せる。
+  `NAROU_AUTH_REQUIRED=false` の環境では未認証で通し、認証系の検査だけを自動で省略する。
+- 配備ジョブの env には `NAROU_REQUIRE_S3=true` を置き、smoke 自身にも
+  `/api/storage/mode?probe=s3` の検査をさせる（contract.mjs はこの env が true のときだけ検査する）。
+  Python プローブが前段の 403 でスキップになった場合でも必須の S3 検証が残る。
+
+### 3.3 Workers で提供しない機能（明示的に拒否する）
+
+| 機能 | 挙動 |
+|---|---|
+| `send` / `mail`(SMTP) / MOBI・Kindle 出力 | API は `501`、job は理由付き `blocked` |
+| AozoraEpub3 jar / kindlegen / 外部 diff ツール | 同上（EPUB は Lite で代替済み） |
+| `folder` / `browser` / `login`(ブラウザ起動) / タスクトレイ | `501` |
+| `shutdown` / `reboot` / self-update / `narou db` 保守 | `501` |
+| バージョン履歴系 (`/api/diff` / `diff_history` / `diff_show` / `diff_restore` / `diff_merge`) | `501` (`not_supported_on_worker`)。Workers 側に `novel_versions` 相当の履歴が無い |
+| `/api/download` の `mail:true` | `501` (`mail_not_supported_on_worker`)。送れないオプションを黙って受理しない |
+| `/api/reorder_pending_tasks` | `501` (`queue_reorder_not_supported`)。Cloudflare Queue の配送順は Worker から制御できない |
+
+**既知の差分 (成功はするが native と語彙・文言が違う)**:
+- `/api/update` / `/api/convert` の未解決ターゲットは `results[].status = "unresolved"` として明示し、
+  1 件も投入できなかった場合は `success:false` + 説明を返す (native は文字列のまま子プロセスへ渡し、
+  子プロセスが「存在しません」行を出す)。共有フロントエンドは `success` を見るため、
+  無言の no-op にはならない。
+- `/api/update` の `count` は tag 展開後の計画件数 (native はコマンド引数の個数)。
+- `get_pending_tasks` の `display_target` は 1 ジョブ = 1 作品の文言 (native は 1 ジョブに多数の作品を積む)。
+- `/api/history` は常に空で、`/api/clear_history` は no-op (native の PushServer 履歴に相当するものを持たない)。
+  復元は WebSocket のリプレイ (直近 200 件) が担う。
+
+### 3.4 作者の継続追跡
+
+- 追跡一覧は小説の作者表示名とは別に `app_state(scope='inv', key='author')` へ URL → サイト名で保持する。primary D1 の全スナップショット CAS で登録・解除し、同時操作の取りこぼしを防ぐ。
+- `/api/update`、汎用 Update ジョブの投入、定期更新の最終ページで登録作者ごとの `author_check` を投入する。小説 0 件でも動作し、`update.disabled-author-tracking=true` のときは自動確認しない。
+- 確認ジョブは実効 YAML・Cookie・サイト待機を既存の作者 URL 展開と共有し、URL 索引で管理済み作品を除外して通常の Download ジョブへ流す。登録解除済みの確認はスキップし、一覧取得後にも登録を再確認する。投入済みの通常 Download ジョブをキャンセルする機能ではない。
+- Native と同じ「環境設定 → 作者」で登録・一覧・解除・手動確認を提供する。API は `GET/POST/DELETE /api/authors` と `POST /api/authors/check`（`dry_run:true` は URL 一覧、false はジョブ受付）。作者を解除しても取得済み作品は消さない。
+- CLI は Native のローカルライブラリ専用であり、Workers へリモート接続する作者 CLI は提供しない。Workers の登録・一覧・解除・手動確認は Web UI とその HTTP API で行う。
+- 通常の `download` への作者 URL 入力は従来どおり単発の作品展開であり、継続追跡への登録は行わない。
+
+---
+
+## 4. 参考実装 (Dantalian) から輸入する型
+
+| 型 | 輸入する内容 |
+|---|---|
+| 環境分離 | `wrangler.<target>.toml` をテンプレート化し、CI が置換して `wrangler.ci.toml` を生成（生成物は gitignore）。置換前に形式検証 |
+| プロビジョニング | D1・取得用と変換用の Queue・各 DLQ を list→create→再 list の冪等手順で用意し `GITHUB_OUTPUT` で受け渡す |
+| デプロイ | `develop` push → develop、`main` push → production。必須検査、target 別 `concurrency`、**デプロイ前に `wrangler d1 migrations apply --remote`**、`--secrets-file`、生成した secret ファイルの削除 |
+| アセット | `[assets]` + ハッシュ付きアセット生成（P3） |
+| 契約テスト | `wrangler dev --local` + `node --test tests/*.mjs`。**トークン未設定時に fail-closed になること**も検証。`/cdn-cgi/local/scheduled` で cron を叩ける |
+| 自己修復 | `scheduled` でリース期限切れの回収と再 dispatch |
+| ドキュメント | `DEPLOYMENT_CHECKLIST` / `MIGRATION_RUNBOOK` の節立てと検証記録 |
+
+輸入しないもの: S3 実装そのもの（Dantalian は Wasabi 専用クライアント。narou.rs は S3 互換として汎用に書く）、
+CF Access を唯一のユーザー境界にする設計、音声向けの instance_type / batch 値、FDK-AAC のライセンス機構。
+
+---
+
+## 5. フェーズ計画
+
+| Phase | 内容 | 受け入れ条件 |
+|---|---|---|
+| **P0a 足回り** ✅ | 環境分離テンプレート、`ci/render_config.py`、`ci/provision_resources.py`、ローカル設定の分離 | 3 環境がレンダリングでき、未解決プレースホルダと不正値を拒否する（検証済み） |
+| **P0b 署名と S3 アダプタ** ✅ | `s3_sigv4`（署名）、`s3_request`（URL + ListObjectsV2）、`s3_object_store`（ObjectStore/AssetStore） | botocore と一致する署名 9 ケース、wasm ビルド通過（検証済み） |
+| **P0c 挿絵を S3 へ** ✅ | core の `is_illustration_key`（`挿絵` セグメント + 拡張子判定、テスト付き）、`SplitStore`（core）、`composition` の差し替え、`asset_backend`（`d1`/`s3`）、`object_backend` の撤去 | 挿絵は S3 側、それ以外は一次ストア（D1 / `ContentStore`）へ振り分ける。`asset_backend` は本文の `content_backend` と独立している |
+| **P0d 本文の S3 保存と移行** | 話単位の圧縮 S3 オブジェクトと D1 参照、`content_backend`、再開可能な copy/verify/cutover/purge/gc | ローカル Worker で移行・破損拒否・EPUB・再起動・削除を確認。旧来の本文列展開計画は撤回 |
+| **P0e 契約テスト + CI** | `worker_entry/tests/*.mjs`（health / 認証 fail-closed / オブジェクト往復）、CI に worker テスト + `d1 migrations apply --remote` + deploy を追加 | ローカルと CI で契約テストが green、デプロイが 3 環境で通る |
+| **P1 取得系** | SSRF 検証の port 化、`DownloaderSettings` を D1 読みに、`CookieStore`(D1) 注入、`SiteDefinitionProvider` をストア経由に、`setting_core` の Directory 検証 port 化 | ログイン必須サイトを含む DL/更新が Worker で完走し、native と同じキー集合・本文バイトになる |
+| **P2 変換** | 共通 `ConvertService` が D1 目次と S3 本文を読み、`convert.keep-txt=false` では全文を保存せず都度変換。EPUB は要求時に生成 | Worker 単独で取得・変換・EPUB が閉じる |
+| **P3 Web UI** | ルート移植、`[assets]` 配信、`/ws` を `PUSH_HUB` で実装、token cookie 認証（`/login` + `POST /api/auth/login` 実装済み）、非対応機能の `501` | ブラウザから一覧・タグ・凍結・設定・キュー・進捗・EPUB DL が native UI と同等に操作できる |
+| **P4 運用** | D1/S3 の容量・コスト設計、バックアップと復旧手順 | 本文参照に対応する版の間でバイナリを戻せる。`purge` 後に旧 D1 専用版へ戻すには本文も復元する必要があり、marker だけの切替は禁止 |
+
+各 Phase は独立 commit 単位。P1 完了までは「Worker はまだ本番運用しない」前提を維持する。
+
+---
+
+## 6. リスクと緩和
+
+| リスク | 緩和 |
+|---|---|
+| SigV4 実装の誤り（時刻ずれ・payload hash・path encoding） | 署名は botocore 生成の 9 ケースで一致を固定。`UNSIGNED-PAYLOAD` は使わず常にボディのハッシュを渡す |
+| S3 資格情報の漏洩・ログ混入 | Secrets Store / `env.secret` 優先、CI は `--secrets-file`、`if: always()` で生成物削除。値はリポジトリに置かない |
+| 保存先や本文キーの判定ミス | 挿絵と本文の設定を分離し、キー末尾とディレクトリ境界で判定。目次・設定・版マーカーは D1 に維持 |
+| D1 容量・行サイズ | 本文・履歴と挿絵の実体を S3 へ。D1 は管理情報と参照を保持 |
+| Worker の CPU / subrequest 上限 | `cpu_ms = 300000` を維持、`WorkerBudget` の section 境界 yield を継続、EPUB は 1 エントリずつ書き出し（挿絵は 512 枚 / 1 枚 16 MiB 超で 413） |
+| cron 毎分の計画コスト | 100 件ページ + generation/lease の早期 exit を維持 |
+| 移行中の二重書き・欠落 | S3 保存後の参照公開、旧書き込みの SQL ガード、再開可能な copy/verify、検証完了後だけ cutover/purge。marker だけの巻き戻しは行わない |
+| GPL 整合（worker は `lite` を含む） | `worker_entry/Cargo.toml` の license 表記と CI の license job を維持 |
+| native との挙動差が残ったまま移行 | P1 の受け入れ条件に「native と同じキー集合・バイト一致」を入れる |
+
+---
+
+## 7. 検証コマンド
+
+```bash
+# ローカル (ビルド → ローカル D1 へ migration → wrangler dev → 契約テスト)
+cd worker_entry
+node tests/run.mjs --release    # CI と同じ契約検査 / --keep で dev を残す
+# NAROU_CHECK_UNCONFIGURED=1 で、トークンを外した構成の fail-closed も確認する（CI は有効）
+
+# 本文・履歴の S3 移行と取得・更新・差分・EPUB（隔離した D1 と S3 HTTP fixture）
+# ビルド済み release Wasm を使い、本番データ・本番 S3 には接続しない
+node tests/content_storage.mjs
+python -m unittest discover -s tests -p test_content_storage_sql.py
+# 切替後の環境で既存 HTTP 契約もまとめて確認する場合
+CONTENT_SMOKE_CONTRACT=1 node tests/content_storage.mjs
+
+# 既に動いている環境に対する契約テスト (デプロイ後の smoke test もこれ)
+BASE_URL=https://... NAROU_ADMIN_TOKEN=... node tests/contract.mjs
+# queue consumer の Convert 終端待ちを含める場合は CONTRACT_QUEUE=1
+
+# 型・ビルド
+cargo check -p narou_rs --target wasm32-unknown-unknown --no-default-features --features worker-runtime
+cargo check -p narou_worker --target wasm32-unknown-unknown
+worker-build --release          # cwd: worker_entry
+
+# デプロイ（CI と同じ順序）
+python ci/provision_resources.py
+python ci/render_config.py
+npx wrangler d1 migrations apply <db> --remote --config wrangler.ci.toml
+npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
+```
+
+---
+
+## 8. 未解決・確認事項
+
+- **変換済み本文の持ち方**（§1.4）: セクション行の列に持つ前提で書いている。変換が Worker に載る
+  （P2）までは、native で変換した値をどう入れるか（移行時に一緒に取り込む / P2 まで DL を 501 に保つ）を決める。
+- **raw HTML を保存しない影響**: `diff`（raw 比較）は Workers では提供しない。本文レベルの差分が
+  必要になったら履歴テーブルを足す（native の `diff` とは別物として扱う）。
+- **S3 のバケット構成**: 1 バケット + prefix（環境同居）を既定とする。本番だけ別バケットにするかは
+  P0e の実測後に決める。
+- **EPUB 応答のメモリ (2026-09 解消)**: `download.epub` は Lite の `EpubStreamWriter`
+  （`next_entry` / `write_current` / `finish`）で 1 エントリずつ書き出し、挿絵はそのエントリの
+  直前で 1 枚だけ ObjectStore から読んで `LazyImageSource` に注入する。チャンクは
+  `worker::Response::from_stream` で流す（isolate は単一スレッドだが、`wasm-streams` が HWM 0 で
+  1 プルずつ取り出すためストリーミングできる）。ピークは「書き出し中の 1 エントリ + 挿絵 1 枚」で、
+  完成アーカイブ・応答コピー・挿絵の集合をどれも保持しない。
+  当初は先読みが要ると見ていたが、narou の構築経路 (`build_book_from_source`) は挿絵の
+  **パス一覧しか読まない**（`read_image` を呼ぶのは書き出し時の `resolve` だけ）ため不要だった。
+  そのため Lite 側に逐次収集 API を足す必要も無い。
+  挿絵の読み出しに失敗すると応答は途中で切れる (ストリーム開始後にステータスは変えられない) ため、
+  列挙時に判定できるもの (枚数・1 枚のサイズ) は先に 413 で断る。
+- **Worker の本文に残る挿絵 URL (2026-10-06 修正)**: Worker の変換は native と違い挿絵を
+  ローカライズしない (`src/converter/mod.rs` の非 native 経路は no-op) ため、変換済みテキストの
+  挿絵注記は取得元 URL のままになる。保存済みの実体は `.illustration_cache.yaml`
+  (取得元 URL → ファイル名) が知っているので、`download.epub` は
+  `epub_lite::rewrite_illustration_references` で参照を `挿絵/<file>` へ寄せてから組み立てる。
+  併せて、本文が参照している挿絵が入力に無い場合は `warn_illustration_missing` を必ず出し、
+  内訳 (参照数・未解決・除外した拡張子・一覧件数) を `webui.debug-mode` の詳細ログへ流す。
+  注意: Lite の `image_references` はパス正規化で空セグメントを弾くため `https://…` を参照として
+  認識しない。narou.rs 側の URL 対応スキャナ (`epub_lite::illustration_references`) を使うこと
+  (AozoraEpub3_Lite 側は無改造)。
+- **S3 の Range 付き存在確認 (2026-10-11 修正)**: `S3Store::stat_object` は `GET` +
+  `Range: bytes=0-0` を使う。取得経路のキャッシュが Range を変更・除去しても SigV4 が壊れない
+  よう、GET では必須ヘッダだけを署名し、Range は署名に含めず送る。`206` と Range が外れた
+  `200` のサイズ取得は従来どおり。PUT の Content-Type 署名・保存キー・索引は変更しない。
+  `tests/s3_range_transport.rs` が、Range の除去・変更・維持と保存画像の読み出しを検証する。
+  Worker のテキストエラー応答は `text/plain; charset=utf-8` とし、ブラウザの文字コード推測で
+  日本語のキーが壊れて見えることも防ぐ。JSON エラーは既存の Content-Type を保つ。
+- **挿絵の取得はダウンロード時の既定パターンまで (2026-10-08 修正)**: Worker では挿絵の実体を
+  ダウンロード時にしか取得しないため、サイト定義が `illust_grep_pattern` を持たないサイト
+  (なろう / R18なろう / カクヨム / Arcadia) は挿絵が 1 枚も S3 に入らなかった。narou.rb は
+  `HTML#initialize` の既定 `<img>` パターンで変換時に拾うので、同じ既定
+  (`downloader::DEFAULT_ILLUST_GREP_PATTERN`) をダウンロード時にも使う。既定パターンでは
+  narou.rb `Illustration#scanner` と同じく URL でない注記 (相対パス) は取得せず、挿絵 URL は
+  protocol-relative (`//host/...`) を本文のスキームで解決し (`build_section_url` が以前は
+  `<top_url>//host/...` に壊していた)、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ
+  寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない。
+- **索引と実体の突き合わせ (自己修復, 2026-10-08 修正)**: `.illustration_cache.yaml` は
+  メタデータなので実体の存在を保証しない。索引が「取得済み」と言っていても `<prefix>/挿絵` の
+  一覧に無ければ取り直す (`PersistenceService::list_illustration_names`)。索引が空でない
+  ときだけ 1 小説 1 回の一覧なので、通常の更新に余分な往復は付かない。この経路は
+  「挿絵が S3 に無い (別ストアに書かれた・手で消した) のに EPUB が実体を見つけられない」を
+  次の更新で自動的に直す。debug-mode では `挿絵: 保存済み N 件 / 索引 M 件 (<prefix>)` を出す。
+- **D1 の `objects`/`object_chunks` の扱い**: 本文の移行後もしばらく残す。削除（容量回収）は P4 の判断。
+- **APNG 挿絵**: `zip` の feature を純 Rust 構成に絞ったため Worker でも組み立て可能（`worker-runtime` が
+  `illustration-animation` を有効化済み）。組み立ては**フレームを 1 枚ずつ復号 → 符号化 → 追記して即解放**し、
+  全フレームを溜めない（`src/illustration_animation.rs` の `build_apng`）。実測で
+  **ピーク 48.7 MiB**（Pixiv 69642452: 19 フレーム 1920×1080、zip 4.3 MiB → APNG 20.3 MiB）/
+  **23.5 MiB**（合成 60 フレーム 1600×900）。旧実装（全フレーム保持）は復号だけで 150〜330 MiB になり
+  Workers の 128 MiB に収まらない。上限はフレーム 512 / 1 フレーム 1920×1080 画素 / 出力 56 MiB で、
+  超えたら OOM ではなく明示エラーにし、呼び出し側は取得したアーカイブをそのまま保存する。
+- **バージョン履歴 / diff**: D1 にテーブルが無いため、P3 で `diff` を出すなら先にスキーマを追加する。
+- **ユーザー YAML の差し替え**: P1 でストア経由の読み込みに戻すが、UI から編集させるかは別判断。
+- **移行ツール (挿絵)**: `worker_entry/src/object_migration.rs` + `lib.rs` の
+  `/api/admin/object-migration`。挿絵だけを D1 から S3 へ写し、`copy` / `verify` / `status` を持つ。
+  進捗は `app_state('inv','migrate_illustrations')` のカーソルで再開できる。
+- **挿絵の共通プール (2026-10-22)**: Worker も `illustration_dedup: true` にし、新規挿絵は
+  全作品・漫画で共通の `illustrations/<base64url(sha256)>.<ext>` に置く。既存の
+  小説別 `挿絵/<sha256-hex>.<ext>` は `POST /api/admin/illustration-dedup`
+  (`action: plan|copy|reset|status`) でページ単位にプールへ移行できる。読み出しは
+  プールに無ければ旧配置へフォールバックする。hex 名でない mitemin の `iNNN` は対象外。
+- **未着手 (P0d の残り)**: 本文の行構造化 (「テキスト blob → セクション行」) と raw を書かない経路。
+
+## S3 必須配備
+
+CI の develop/production テンプレートは `NAROU_REQUIRE_S3="true"` を固定する。
+管理・本文・設定は D1 のまま、挿絵は旧 `asset_backend=d1` または未設定でも S3 を選択する。
+これは開発用 D1 挿絵を移行せず切り替える方針であり、D1 の既存行を物理削除しない。
+旧挿絵の代替読取や自動コピーは行わない。S3 に無い旧挿絵は表示・EPUBへ埋め込まれない。
+旧 Worker の書込みが残っても、それを S3 へ移行したとは扱わない。
+
+保存済み marker は canonical JSON 文字列と既存の raw TEXT `d1`/`s3` を受け付ける。
+未知の値、SQL NULL、読取失敗、必須フラグの不正値は拒否する。
+S3 資格情報が無い・LIST などの要求が失敗する場合にも D1 へ fallback しない。
+ローカルの移行検証用構成では必須フラグなし・選択行なしに限り従来の D1 を維持する。
+
+旧実装では `value_json` の JSON 復号を欠いたため、JSON 文字列 `"s3"` で
+D1 を選んだ可能性がある。raw TEXT `s3` は旧実装でも S3 を選択できる。
+実運用の行形式は未確認であり、今回の変更は実際の過去保存先を断定しない。
+
+配備後は認証済み `/api/storage/mode?probe=s3` により、実際の選択が S3、
+必須フラグが true、S3 の LIST が成功することを確認する。
+一般 smoke を省略しても、この検査は省略しない。プローブはアプリ本体と同じ
+ブラウザ風の `User-Agent` を送る (urllib 既定の UA は Cloudflare のボット判定で
+403 になる)。それでも前段の Cloudflare Access が 403 を返した場合だけは、CI から
+回避できないため `::warning::` 付きのスキップとして報告する (成功扱いにはせず、
+サマリも `skipped`)。401 / 503 / 到達不可は失敗させる。
+LIST は読取のみ・最大1件で、キーや資格情報、プロバイダー本文を応答やログに出さない。
+HTTP200でも正しい ListBucketResult の外側要素が無い応答は成功としない。
+この確認は GET/PUT 権限や既存データの移行完了を証明せず、署名403の解消も主張しない。
+
+CI の手動配備では `target=develop|production` を選ぶ。ホスティング先による
+Workers 検証の切り替えやリレー自動配備の待ち合わせは行わず、通常のアプリ検証を配備の前提にする。
+外部リレーは任意の `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` を Worker に渡し、
+別途配置・更新する（[リレーの契約と配置](platform-abstraction.md)）。

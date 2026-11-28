@@ -1,0 +1,997 @@
+//! Novel record repository abstraction.
+//!
+//! The domain layer reads and writes novel records through this interface
+//! instead of holding the whole database in memory (`db::DATABASE`,
+//! `all_records()`). The native backend keeps the current YAML database file
+//! (see `native::novel_repository`); a Worker backend uses D1.
+//!
+//! Design constraints (Phase 3):
+//! - async interface via [`PlatformFuture`] so D1 can be implemented naturally
+//! - filter/sort expressed as data ([`NovelFilter`], [`NovelSortKey`]), never
+//!   as arbitrary closures — every query maps to SQL on D1
+//! - no "load everything" query: paginated [`NovelQuery`] for display, ID
+//!   keyset [`NovelRepository::scan_ids`] for bulk processing
+//! - ID allocation is an atomic reservation ([`NovelRepository::allocate_id`]),
+//!   never `max(id) + 1` caller logic
+//! - batch mutations ([`NovelMutation`] / [`NovelRepository::apply_batch`]) so
+//!   native saves the YAML once per batch
+
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
+use super::{PlatformFuture, PlatformService};
+use crate::db::NovelRecord;
+
+/// Novel identifier (the numeric record id used across the codebase).
+///
+/// `transparent` serde keeps the on-the-wire form a plain number so job
+/// payloads (`JobTarget::Id`) stay compact and readable.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct NovelId(pub i64);
+
+impl From<i64> for NovelId {
+    fn from(id: i64) -> Self {
+        Self(id)
+    }
+}
+
+impl From<NovelId> for i64 {
+    fn from(id: NovelId) -> Self {
+        id.0
+    }
+}
+
+/// Opaque native ownership resource, retained by every in-flight writer clone.
+/// The portable layer never needs to know whether it is an OS lock handle.
+#[doc(hidden)]
+pub trait ReservationLiveness: std::fmt::Debug + Send + Sync {}
+impl<T: std::fmt::Debug + Send + Sync> ReservationLiveness for T {}
+
+/// An owned, generation-fenced reservation for an unpublished novel ID.
+///
+/// Publish a record with this ID, or return the reservation through
+/// [`NovelRepository::release_id`]. The generation prevents a delayed release
+/// from freeing the same numeric ID after another download has reserved it.
+#[must_use = "Publish the reserved record or release the unused ID reservation"]
+pub struct NovelIdReservation {
+    id: NovelId,
+    generation: i64,
+    liveness: Option<std::sync::Arc<dyn ReservationLiveness>>,
+    job_owner: Option<std::sync::Arc<super::JobExecutionOwner>>,
+}
+
+impl NovelIdReservation {
+    pub fn new(id: NovelId, generation: i64) -> Self {
+        Self { id, generation, liveness: None, job_owner: None }
+    }
+
+    pub fn id(&self) -> NovelId {
+        self.id
+    }
+
+    pub fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    #[cfg(any(feature = "native-runtime", test))]
+    pub(crate) fn with_liveness<T: ReservationLiveness + 'static>(
+        mut self, resource: std::sync::Arc<T>,
+    ) -> Self {
+        self.liveness = Some(resource);
+        self
+    }
+
+    pub(crate) fn liveness(&self) -> Option<std::sync::Arc<dyn ReservationLiveness>> {
+        self.liveness.clone()
+    }
+
+    #[cfg(feature = "native-runtime")]
+    pub(crate) fn has_liveness(&self) -> bool {
+        self.liveness.is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn with_job_owner(
+        mut self, owner: std::sync::Arc<super::JobExecutionOwner>,
+    ) -> crate::error::Result<Self> {
+        if let Some(current) = &self.job_owner {
+            if current.as_ref() != owner.as_ref() {
+                return Err(crate::error::NarouError::Platform("job_owner_changed: reservation belongs to another execution".into()));
+            }
+        } else {
+            self.job_owner = Some(owner);
+        }
+        Ok(self)
+    }
+
+    #[doc(hidden)]
+    pub fn job_owner(&self) -> Option<&std::sync::Arc<super::JobExecutionOwner>> {
+        self.job_owner.as_ref()
+    }
+
+    /// Consume ownership only after the authoritative record commit succeeds.
+    pub fn adopt(self) {
+        drop(self.liveness);
+    }
+}
+
+impl std::fmt::Debug for NovelIdReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("NovelIdReservation")
+            .field("id", &self.id).field("generation", &self.generation).finish()
+    }
+}
+
+impl PartialEq for NovelIdReservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.generation == other.generation
+    }
+}
+
+impl Eq for NovelIdReservation {}
+
+/// Which field a [`SearchTerm`] matches against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SearchField {
+    /// Unqualified: title / author / sitename / status text / tags.
+    Any,
+    Title,
+    Author,
+    Site,
+    Status,
+    Tag,
+}
+
+/// One search term: a field plus OR-combined lowercase values, optionally
+/// negated. Multiple terms in a filter are AND-combined (the Web UI's
+/// `filter`/`search[value]` semantics). Stored as data so a D1 backend can
+/// translate it to SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTerm {
+    pub field: SearchField,
+    pub negated: bool,
+    pub values: Vec<String>,
+}
+
+impl SearchTerm {
+    pub fn new(field: SearchField, negated: bool, values: Vec<String>) -> Self {
+        Self {
+            field,
+            negated,
+            values,
+        }
+    }
+}
+
+/// Typed filter over novel records. Every field maps to a WHERE clause on D1.
+#[derive(Debug, Clone, Default)]
+pub struct NovelFilter {
+    pub ids: Option<Vec<NovelId>>,
+    /// Free-text substring over title OR author (lowercase).
+    pub keyword: Option<String>,
+    pub site: Option<String>,
+    pub domain: Option<String>,
+    /// Any of the record's tags equals this tag.
+    pub tag: Option<String>,
+    /// Include the separately stored classification as a searchable tag.
+    pub attribute_tags_enabled: bool,
+    pub ncode: Option<String>,
+    pub is_narou: Option<bool>,
+    pub suspend: Option<bool>,
+    pub novel_type: Option<u8>,
+    pub end: Option<bool>,
+    /// AND-combined free-text/fielded search terms (Web UI list).
+    pub terms: Vec<SearchTerm>,
+    /// Native hint: ids frozen via the freeze inventory, used only for
+    /// `Status`/`Any` term matching. D1 backends ignore this and join their
+    /// freeze table instead.
+    pub frozen_ids: Option<HashSet<i64>>,
+    /// 非表示設定 (表示用の一覧だけが設定する)。作品 ID。
+    pub exclude_ids: Vec<i64>,
+    /// 非表示タグ。いずれかを持つ作品を除外する。
+    pub exclude_tags: Vec<String>,
+    /// 非表示作者 (fold 済み)。author_fold が一致する作品を除外する。
+    pub exclude_authors: Vec<String>,
+    /// 非表示サイト (fold 済み)。domain_fold / sitename_fold が一致する
+    /// 作品を除外する。
+    pub exclude_sites: Vec<String>,
+}
+
+impl NovelFilter {
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Context alone (freeze IDs or attribute projection) does not select rows.
+    pub fn is_unrestricted(&self) -> bool {
+        let Self {
+            ids, keyword, site, domain, tag, ncode, is_narou, suspend, novel_type, end,
+            terms, exclude_ids, exclude_tags, exclude_authors, exclude_sites,
+            frozen_ids: _, attribute_tags_enabled: _,
+        } = self;
+        ids.is_none() && keyword.is_none() && site.is_none() && domain.is_none()
+            && tag.is_none() && ncode.is_none() && is_narou.is_none() && suspend.is_none()
+            && novel_type.is_none() && end.is_none() && terms.is_empty()
+            && exclude_ids.is_empty() && exclude_tags.is_empty()
+            && exclude_authors.is_empty() && exclude_sites.is_empty()
+    }
+}
+
+/// Typed sort key. CLI/Web string keys are converted at the boundary via
+/// [`NovelSortKey::from_db_key`]; the key never flows into the repository as
+/// an arbitrary string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NovelSortKey {
+    Id,
+    LastUpdate,
+    GeneralLastup,
+    LastCheckDate,
+    Title,
+    Author,
+    SiteName,
+    NovelType,
+    Tags,
+    GeneralAllNo,
+    Length,
+    Status,
+    TocUrl,
+    NewArrivalsDate,
+    AverageLength,
+}
+
+impl NovelSortKey {
+    pub const ALL: &'static [NovelSortKey] = &[
+        NovelSortKey::Id,
+        NovelSortKey::LastUpdate,
+        NovelSortKey::GeneralLastup,
+        NovelSortKey::LastCheckDate,
+        NovelSortKey::Title,
+        NovelSortKey::Author,
+        NovelSortKey::SiteName,
+        NovelSortKey::NovelType,
+        NovelSortKey::Tags,
+        NovelSortKey::GeneralAllNo,
+        NovelSortKey::Length,
+        NovelSortKey::Status,
+        NovelSortKey::TocUrl,
+        NovelSortKey::NewArrivalsDate,
+        NovelSortKey::AverageLength,
+    ];
+
+    /// Map to the `db::SORT_KEYS` string so the canonical comparator
+    /// (`db::compare_records_by_key`, BUG-9 None-stable order) is shared
+    /// between the repository and the existing CLI/Web sort paths.
+    pub fn as_db_key(self) -> &'static str {
+        match self {
+            NovelSortKey::Id => "id",
+            NovelSortKey::LastUpdate => "last_update",
+            NovelSortKey::GeneralLastup => "general_lastup",
+            NovelSortKey::LastCheckDate => "last_check_date",
+            NovelSortKey::Title => "title",
+            NovelSortKey::Author => "author",
+            NovelSortKey::SiteName => "sitename",
+            NovelSortKey::NovelType => "novel_type",
+            NovelSortKey::Tags => "tags",
+            NovelSortKey::GeneralAllNo => "general_all_no",
+            NovelSortKey::Length => "length",
+            NovelSortKey::Status => "status",
+            NovelSortKey::TocUrl => "toc_url",
+            NovelSortKey::NewArrivalsDate => "new_arrivals_date",
+            NovelSortKey::AverageLength => "average_length",
+        }
+    }
+
+    pub fn from_db_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_db_key() == key)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NovelSort {
+    pub key: NovelSortKey,
+    pub reverse: bool,
+}
+
+impl Default for NovelSort {
+    fn default() -> Self {
+        Self {
+            key: NovelSortKey::Id,
+            reverse: false,
+        }
+    }
+}
+
+impl NovelSort {
+    pub fn by(key: NovelSortKey) -> Self {
+        Self {
+            key,
+            reverse: false,
+        }
+}
+}
+
+
+/// `update.sort-by` の設定値をスキャン順へ解決する。
+///
+/// native `commands::update` (`sort_update_ids_by_key`) と同じ規則: 日付系
+/// キー (`last_update` / `general_lastup` / `last_check_date` /
+/// `new_arrivals_date`) は新しい順 (降順)、それ以外は昇順。空・未知キー・
+/// `id` は `None` を返す — `id` 昇順は既定のキーセットスキャンと同じ順序
+/// なので、呼び出し側は従来どおり `scan_ids` を使えばよい。キーの大小文字は
+/// 吸収する (native `resolve_sort_key` が `to_lowercase` するのと同じ)。
+pub fn resolve_update_scan_sort(configured: &str) -> Option<NovelSort> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return None;
+    }
+    match NovelSortKey::from_db_key(&configured.to_lowercase())? {
+        NovelSortKey::Id => None,
+        key => Some(NovelSort {
+            key,
+            reverse: matches!(
+                key,
+                NovelSortKey::LastUpdate
+                    | NovelSortKey::GeneralLastup
+                    | NovelSortKey::LastCheckDate
+                    | NovelSortKey::NewArrivalsDate
+            ),
+        }),
+    }
+}
+
+/// Paginated, sorted query. `limit` must be non-zero; use
+/// [`NovelRepository::scan_ids`] for unbounded bulk processing.
+#[derive(Debug, Clone)]
+pub struct NovelQuery {
+    pub filter: NovelFilter,
+    pub sort: NovelSort,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl NovelQuery {
+    pub fn page(filter: NovelFilter, sort: NovelSort, offset: usize, limit: usize) -> Self {
+        Self {
+            filter,
+            sort,
+            offset,
+            limit,
+        }
+    }
+}
+
+/// A metadata-only library page captured with its counts and admission state.
+/// Frozen IDs come from the same snapshot; legacy `frozen` tags remain on rows.
+pub struct NovelMetadataPage {
+    pub records_total: u64,
+    pub records_filtered: u64,
+    pub records: Vec<NovelRecord>,
+    pub frozen_ids: HashSet<i64>,
+}
+
+/// A single record mutation; several are applied atomically by
+/// [`NovelRepository::apply_batch`] (native: one YAML save; D1: one
+/// transaction/batch).
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum NovelMutation {
+    Upsert(NovelRecord),
+    Remove(NovelId),
+}
+
+/// CRUD + query access to novel records.
+///
+/// Implementations decide persistence and indexing. Full-table scans are an
+/// implementation detail; the D1 backend must paginate/filter at the SQL
+/// level and never `SELECT` the whole table.
+pub trait NovelRepository: PlatformService {
+    fn resume_id(&self,id:NovelId,generation:i64)->PlatformFuture<'_,crate::error::Result<NovelIdReservation>>{let _=(id,generation);Box::pin(async{Err(crate::error::NarouError::Platform("exact numeric reservation resume unsupported".into()))})}
+    fn allocate_id_for_job<'a>(&'a self,owner:&'a std::sync::Arc<super::JobExecutionOwner>)->PlatformFuture<'a,crate::error::Result<NovelIdReservation>>{let _=owner;Box::pin(async{Err(crate::error::NarouError::Platform("job-owned numeric allocation unsupported".into()))})}
+    fn resume_id_for_job<'a>(&'a self,owner:&'a std::sync::Arc<super::JobExecutionOwner>,id:NovelId,generation:i64)->PlatformFuture<'a,crate::error::Result<NovelIdReservation>>{let _=(owner,id,generation);Box::pin(async{Err(crate::error::NarouError::Platform("job-owned numeric resume unsupported".into()))})}
+    fn reserve_create<'a>(&'a self,fence:&'a super::WriteFence,reservation:&'a NovelIdReservation,toc_url:&'a str)->PlatformFuture<'a,crate::error::Result<()>>{let _=(fence,reservation,toc_url);Box::pin(async{Err(crate::error::NarouError::Platform("atomic creation identity reservation unsupported".into()))})}
+    fn apply_create_guarded<'a>(&'a self,fence:&'a super::WriteFence,reservation:&'a NovelIdReservation,record:NovelRecord)->PlatformFuture<'a,crate::error::Result<()>>{let _=(fence,reservation,record);Box::pin(async{Err(crate::error::NarouError::Platform("reserved creation commit unsupported".into()))})}
+    fn apply_batch_guarded<'a>(&'a self,fence:&'a super::WriteFence,mutations:Vec<NovelMutation>)->PlatformFuture<'a,crate::error::Result<()>>{
+        self.apply_batch_guarded_many(std::slice::from_ref(fence),mutations)
+    }
+    fn apply_batch_guarded_many<'a>(&'a self,fences:&'a [super::WriteFence],mutations:Vec<NovelMutation>)->PlatformFuture<'a,crate::error::Result<()>>{
+        let _=(fences,mutations);Box::pin(async{Err(crate::error::NarouError::Platform("epoch-guarded record commits unsupported".into()))})
+    }
+    fn remove_closed<'a>(&'a self,prefix:&'a super::ObjectPrefix,owner:&'a str,epoch:u64,id:NovelId)->PlatformFuture<'a,crate::error::Result<()>>{let _=(prefix,owner,epoch,id);Box::pin(async{Err(crate::error::NarouError::Platform("closed-owner record removal unsupported".into()))})}
+    /// Authoritative metadata, never an isolate/process planning cache.
+    fn get_current<'a>(&'a self,id:NovelId)->PlatformFuture<'a,crate::error::Result<Option<NovelRecord>>>{Box::pin(async move{let mut rows=self.get_many_current(std::slice::from_ref(&id)).await?;if rows.len()!=1{return Err(crate::error::NarouError::Platform("unaligned authoritative record result".into()));}Ok(rows.pop().flatten())})}
+    /// One current metadata snapshot, aligned with requested IDs (including
+    /// missing and repeated IDs). Native YAML decodes the map once per batch.
+    fn get_many_current<'a>(&'a self,ids:&'a [NovelId])->PlatformFuture<'a,crate::error::Result<Vec<Option<NovelRecord>>>>{let _=ids;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative batch metadata reads unsupported".into()))})}
+    fn query_current<'a>(&'a self,query:&'a NovelQuery)->PlatformFuture<'a,crate::error::Result<Vec<NovelRecord>>>{let _=query;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative metadata query unsupported".into()))})}
+    /// Optional atomic metadata-only list read. A successful snapshot must
+    /// include page rows, both counts, freeze state and open admission for
+    /// every selected row's actual namespace, including unbound legacy rows.
+    /// It must reject unavailable/recovering namespaces, not silently omit them.
+    /// No content or mutable metadata may be read through this result later.
+    /// `filter.frozen_ids` is only a legacy hint; the snapshot owns freeze state.
+    /// Backends without that atomic boundary return `None` and use leased reads.
+    fn metadata_page_snapshot<'a>(
+        &'a self,
+        query: &'a NovelQuery,
+    ) -> PlatformFuture<'a, crate::error::Result<Option<NovelMetadataPage>>> {
+        let _ = query;
+        Box::pin(async { Ok(None) })
+    }
+    fn find_by_toc_url_current<'a>(&'a self,url:&'a str)->PlatformFuture<'a,crate::error::Result<Option<NovelRecord>>>{let _=url;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative URL lookup unsupported".into()))})}
+    fn find_by_storage_prefix_current<'a>(&'a self,prefix:&'a super::ObjectKey)->PlatformFuture<'a,crate::error::Result<Option<NovelRecord>>>{let _=prefix;Box::pin(async{Err(crate::error::NarouError::Platform("authoritative storage-prefix lookup unsupported".into()))})}
+
+    fn get<'a>(
+        &'a self,
+        id: NovelId,
+    ) -> PlatformFuture<'a, crate::error::Result<Option<NovelRecord>>>;
+
+    fn find_by_toc_url<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> PlatformFuture<'a, crate::error::Result<Option<NovelRecord>>>;
+
+    /// Membership in input order, without copying full novel records.
+    /// Remote stores override this with bounded indexed batch lookups.
+    fn contains_toc_urls<'a>(&'a self, urls: &'a [String]) -> PlatformFuture<'a, crate::error::Result<Vec<bool>>> {
+        Box::pin(async move {
+            let mut known = Vec::with_capacity(urls.len());
+            for url in urls { known.push(self.find_by_toc_url(url).await?.is_some()); }
+            Ok(known)
+        })
+    }
+
+    fn find_by_title<'a>(
+        &'a self,
+        title: &'a str,
+    ) -> PlatformFuture<'a, crate::error::Result<Option<NovelRecord>>>;
+
+    /// Resolve a record by ncode, including the legacy `toc_url` suffix
+    /// fallback (records without an `ncode` field). D1: `WHERE ncode = ? OR
+    /// lower(toc_url) LIKE '%/' || ?`.
+    fn find_by_ncode<'a>(
+        &'a self,
+        ncode: &'a str,
+    ) -> PlatformFuture<'a, crate::error::Result<Option<NovelRecord>>>;
+
+    fn count<'a>(
+        &'a self,
+        filter: &'a NovelFilter,
+    ) -> PlatformFuture<'a, crate::error::Result<u64>>;
+
+    /// Paginated sorted query for display (Web UI list, CLI list).
+    fn query<'a>(
+        &'a self,
+        query: &'a NovelQuery,
+    ) -> PlatformFuture<'a, crate::error::Result<Vec<NovelRecord>>>;
+
+    /// Bulk-processing ID scan in ascending ID order:
+    /// `WHERE id > after_id [AND filter] ORDER BY id LIMIT limit`.
+    /// D1 uses keyset pagination (no OFFSET) for background bulk jobs.
+    fn scan_ids<'a>(
+        &'a self,
+        filter: &'a NovelFilter,
+        after_id: Option<NovelId>,
+        limit: usize,
+    ) -> PlatformFuture<'a, crate::error::Result<Vec<NovelId>>>;
+
+    /// Atomically reserve a unique novel ID. Unpublished reservations returned
+    /// through `release_id` are reused; committed IDs are never released.
+    fn allocate_id(&self) -> PlatformFuture<'_, crate::error::Result<NovelIdReservation>>;
+
+    /// Return an unused reservation without freeing a committed ID or a newer
+    /// reservation of the same numeric ID. Safe after ambiguous write failures.
+    fn release_id(
+        &self,
+        reservation: NovelIdReservation,
+    ) -> PlatformFuture<'_, crate::error::Result<()>>;
+
+    /// Apply several mutations atomically and persist once.
+    fn apply_batch<'a>(
+        &'a self,
+        mutations: Vec<NovelMutation>,
+    ) -> PlatformFuture<'a, crate::error::Result<()>>;
+}
+
+/// Move unique rows into input order; only repeated IDs clone their record.
+pub fn align_current_records(ids:&[NovelId],records:impl IntoIterator<Item=NovelRecord>)->Vec<Option<NovelRecord>>{
+    let mut by_id=records.into_iter().map(|record|(record.id,(record,0usize))).collect::<std::collections::HashMap<_,_>>();
+    for id in ids{if let Some((_,remaining))=by_id.get_mut(&id.0){*remaining+=1;}}
+    ids.iter().map(|id|{let(_,remaining)=by_id.get_mut(&id.0)?;*remaining-=1;if *remaining==0{by_id.remove(&id.0).map(|(record,_)|record)}else{by_id.get(&id.0).map(|(record,_)|record.clone())}}).collect()
+}
+
+/// Synchronous counterpart of [`NovelRepository`] for native CLI resolution
+/// paths.
+///
+/// Native CLI commands run without an executor and resolve targets through
+/// `NativeNovelRepository`'s `*_sync` methods (which lock the shared YAML
+/// state directly). `application::target_lookup` drives both this port and
+/// the async repository with the same ordered lookup plan.
+pub trait NovelLookup: Send + Sync {
+    /// See [`NovelRepository::get`].
+    fn get(&self, id: NovelId) -> crate::error::Result<Option<NovelRecord>>;
+
+    /// See [`NovelRepository::find_by_toc_url`].
+    fn find_by_toc_url(&self, url: &str) -> crate::error::Result<Option<NovelRecord>>;
+
+    /// See [`NovelRepository::find_by_ncode`] (includes the legacy `toc_url`
+    /// suffix fallback).
+    fn find_by_ncode(&self, ncode: &str) -> crate::error::Result<Option<NovelRecord>>;
+
+    /// See [`NovelRepository::find_by_title`].
+    fn find_by_title(&self, title: &str) -> crate::error::Result<Option<NovelRecord>>;
+
+    /// See [`NovelRepository::scan_ids`].
+    fn scan_ids(
+        &self,
+        filter: &NovelFilter,
+        after_id: Option<NovelId>,
+        limit: usize,
+    ) -> crate::error::Result<Vec<NovelId>>;
+}
+
+// ---------------------------------------------------------------------------
+// Pure matching / sorting helpers shared by native and memory backends.
+// ---------------------------------------------------------------------------
+
+/// Which freeze sources a read observes.
+///
+/// Upstream `Narou.novel_frozen?` reads the freeze inventory (native
+/// `freeze.yaml`) only; the Web UI additionally honors the legacy `frozen`
+/// tag. Both modes live here so the difference is an explicit parameter
+/// instead of per-caller drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeReadMode {
+    /// The freeze store only (`narou list`'s frozen filter, upstream
+    /// `compat::record_is_frozen`).
+    InventoryOnly,
+    /// Freeze store or the legacy `frozen` tag (Web UI, search, `is_frozen`).
+    InventoryOrTag,
+}
+
+/// True when `record` counts as frozen under `mode`.
+pub fn record_is_frozen(
+    record: &NovelRecord,
+    frozen_ids: Option<&HashSet<i64>>,
+    mode: FreezeReadMode,
+) -> bool {
+    let in_store = frozen_ids.is_some_and(|ids| ids.contains(&record.id));
+    match mode {
+        FreezeReadMode::InventoryOnly => in_store,
+        FreezeReadMode::InventoryOrTag => in_store || record.tags.iter().any(|tag| tag == "frozen"),
+    }
+}
+
+/// Section search semantics: freeze store or legacy `frozen` tag.
+pub(crate) fn record_is_frozen_for_search(
+    record: &NovelRecord,
+    frozen_ids: Option<&HashSet<i64>>,
+) -> bool {
+    record_is_frozen(record, frozen_ids, FreezeReadMode::InventoryOrTag)
+}
+
+/// Status text used by `Status`/`Any` search terms. Matches the Web UI's
+/// `record_status_text` semantics (lowercase, comma-separated).
+pub(crate) fn record_status_text(record: &NovelRecord, frozen: bool) -> String {
+    let mut status = Vec::new();
+    if frozen {
+        status.push("凍結");
+    }
+    if record.tags.iter().any(|tag| tag == "end") || record.end {
+        status.push("完結");
+    }
+    if record.tags.iter().any(|tag| tag == "404") {
+        status.push("削除");
+    }
+    if record.suspend {
+        status.push("中断");
+    }
+    status.join(", ").to_lowercase()
+}
+
+/// Match one term against a record (values are OR-combined; negation flips
+/// the result). Mirrors the Web UI's `record_matches_token`.
+pub(crate) fn record_matches_term(
+    record: &NovelRecord,
+    term: &SearchTerm,
+    frozen: bool,
+    attribute_tags_enabled: bool,
+) -> bool {
+    let title = record.title.to_lowercase();
+    let author = record.author.to_lowercase();
+    let sitename = record.sitename.to_lowercase();
+    let status = record_status_text(record, frozen);
+    let tags: Vec<String> = record.tags.iter().map(|tag| tag.to_lowercase()).collect();
+    let attribute = attribute_tags_enabled.then(|| record.attribute_tag()).flatten();
+
+    let matched = match term.field {
+        SearchField::Tag => term
+            .values
+            .iter()
+            .any(|value| tags.iter().any(|tag| tag.contains(value)) || attribute.is_some_and(|tag| tag.contains(value))),
+        SearchField::Author => term.values.iter().any(|value| author.contains(value)),
+        SearchField::Site => term.values.iter().any(|value| sitename.contains(value)),
+        SearchField::Title => term.values.iter().any(|value| title.contains(value)),
+        SearchField::Status => term.values.iter().any(|value| status.contains(value)),
+        SearchField::Any => term.values.iter().any(|value| {
+            title.contains(value)
+                || author.contains(value)
+                || sitename.contains(value)
+                || status.contains(value)
+                || tags.iter().any(|tag| tag.contains(value))
+                || attribute.is_some_and(|tag| tag.contains(value))
+                || record.ncode.as_ref().is_some_and(|ncode| ncode.to_lowercase().contains(value))
+                || (value.contains("://")
+                    && record.toc_url.to_lowercase().contains(value.trim_end_matches('/')))
+                || record.toc_url.trim_end_matches('/').rsplit('/').next()
+                    .is_some_and(|segment| segment.eq_ignore_ascii_case(value))
+                || record.id.to_string() == value.as_str()
+        }),
+    };
+
+    if term.negated {
+        !matched
+    } else {
+        matched
+    }
+}
+
+/// All terms are AND-combined.
+pub(crate) fn record_matches_terms(
+    record: &NovelRecord,
+    terms: &[SearchTerm],
+    frozen: bool,
+    attribute_tags_enabled: bool,
+) -> bool {
+    terms
+        .iter()
+        .all(|term| record_matches_term(record, term, frozen, attribute_tags_enabled))
+}
+
+/// Typed-filter match. Every branch maps to a D1 WHERE clause.
+pub(crate) fn record_matches_filter(record: &NovelRecord, filter: &NovelFilter) -> bool {
+    let keyword = filter.keyword.as_ref().map(|keyword| keyword.to_lowercase());
+    if let Some(ids) = &filter.ids
+        && !ids.iter().any(|id| id.0 == record.id)
+    {
+        return false;
+    }
+    if let Some(keyword) = keyword
+        && !record.title.to_lowercase().contains(&keyword)
+        && !record.author.to_lowercase().contains(&keyword)
+    {
+        return false;
+    }
+    if let Some(site) = &filter.site
+        && !record.sitename.eq_ignore_ascii_case(site)
+    {
+        return false;
+    }
+    if let Some(domain) = &filter.domain
+        && record.domain.as_deref() != Some(domain.as_str())
+    {
+        return false;
+    }
+    if let Some(tag) = &filter.tag
+        && !record.tags.iter().any(|record_tag| record_tag == tag)
+        && !(filter.attribute_tags_enabled && record.attribute_tag() == Some(tag))
+    {
+        return false;
+    }
+    if let Some(ncode) = &filter.ncode
+        && record.ncode.as_deref() != Some(ncode.as_str())
+    {
+        return false;
+    }
+    if let Some(is_narou) = filter.is_narou
+        && record.is_narou != is_narou
+    {
+        return false;
+    }
+    if let Some(suspend) = filter.suspend
+        && record.suspend != suspend
+    {
+        return false;
+    }
+    if let Some(novel_type) = filter.novel_type
+        && record.novel_type != novel_type
+    {
+        return false;
+    }
+    if let Some(end) = filter.end
+        && record.end != end
+    {
+        return false;
+    }
+    if !filter.terms.is_empty()
+        && !record_matches_terms(
+            record,
+            &filter.terms,
+            record_is_frozen_for_search(record, filter.frozen_ids.as_ref()),
+            filter.attribute_tags_enabled,
+        )
+    {
+        return false;
+    }
+    if filter.exclude_ids.contains(&record.id) {
+        return false;
+    }
+    if filter
+        .exclude_tags
+        .iter()
+        .any(|hidden| record.tags.iter().any(|tag| tag == hidden)
+            || (filter.attribute_tags_enabled && record.attribute_tag() == Some(hidden)))
+    {
+        return false;
+    }
+    if !filter.exclude_authors.is_empty() {
+        let author = crate::db::novel_codec::fold(&record.author);
+        if filter.exclude_authors.iter().any(|hidden| hidden == &author) {
+            return false;
+        }
+    }
+    if !filter.exclude_sites.is_empty() {
+        let sitename = crate::db::novel_codec::fold(&record.sitename);
+        let domain = record.domain.as_deref().map(crate::db::novel_codec::fold);
+        if filter.exclude_sites.iter().any(|hidden| {
+            hidden == &sitename || domain.as_deref() == Some(hidden.as_str())
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compare two records by a typed key, delegating to the canonical
+/// `db::compare_records_by_key` so repository sorting matches the existing
+/// CLI/Web sort semantics (BUG-9 None-stable order).
+pub(crate) fn compare_records_by_sort_key(
+    a: &NovelRecord,
+    b: &NovelRecord,
+    key: NovelSortKey,
+) -> Ordering {
+    crate::db::compare_records_by_key(a, b, key.as_db_key())
+}
+
+/// Select a page from an in-memory snapshot without cloning discarded records.
+pub(crate) fn query_records<'a>(
+    records: impl Iterator<Item = &'a NovelRecord>,
+    query: &NovelQuery,
+) -> Vec<NovelRecord> {
+    if query.limit == 0 {
+        return Vec::new();
+    }
+    let mut records: Vec<_> = records
+        .filter(|record| record_matches_filter(record, &query.filter))
+        .collect();
+    records.sort_unstable_by(|a, b| {
+        compare_records_by_sort_key(a, b, query.sort.key).then_with(|| a.id.cmp(&b.id))
+    });
+    if query.sort.reverse {
+        records.reverse();
+    }
+    records.into_iter().skip(query.offset).take(query.limit).cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn novel_id_conversions() {
+        let id = NovelId::from(42_i64);
+        assert_eq!(id.0, 42);
+        let back: i64 = id.into();
+        assert_eq!(back, 42);
+    }
+
+    #[test]
+    fn sort_key_roundtrips_through_db_keys() {
+        for key in NovelSortKey::ALL {
+            let db_key = key.as_db_key();
+            assert_eq!(NovelSortKey::from_db_key(db_key), Some(*key));
+        }
+        assert_eq!(NovelSortKey::from_db_key("nonsense"), None);
+    }
+
+    #[test]
+    fn update_scan_sort_mirrors_native_update_order() {
+        // 未設定・id・未知キーは既定の id スキャン。
+        assert!(resolve_update_scan_sort("").is_none());
+        assert!(resolve_update_scan_sort("  ").is_none());
+        assert!(resolve_update_scan_sort("id").is_none());
+        assert!(resolve_update_scan_sort("no_such_key").is_none());
+        // 日付系は native `sort_update_ids_by_key` と同じく新しい順。
+        for key in ["last_update", "general_lastup", "last_check_date", "new_arrivals_date"] {
+            let sort = resolve_update_scan_sort(key).unwrap();
+            assert!(sort.reverse, "{key} should sort descending");
+        }
+        // それ以外は昇順、大小文字は吸収。
+        let sort = resolve_update_scan_sort("Title").unwrap();
+        assert_eq!(sort.key, NovelSortKey::Title);
+        assert!(!sort.reverse);
+    }
+
+    fn sample_record(id: i64) -> NovelRecord {
+        NovelRecord {
+            id,
+            author: "author".into(),
+            title: "title".into(),
+            file_title: "title".into(),
+            toc_url: format!("https://example.com/novel/{id}"),
+            sitename: "example".into(),
+            novel_type: 1,
+            end: false,
+            last_update: chrono::Utc::now(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+            requires_login: false,
+            login_session: None,
+            extra_fields: Default::default(),
+        }
+    }
+
+    #[test]
+    fn typed_filter_matches_typed_fields() {
+        let mut record = sample_record(1);
+        record.sitename = "カクヨム".into();
+        record.is_narou = false;
+        record.novel_type = 2;
+        record.tags = vec!["sf".into(), "frozen".into()];
+
+        assert!(record_matches_filter(
+            &record,
+            &NovelFilter {
+                site: Some("カクヨム".into()),
+                novel_type: Some(2),
+                tag: Some("sf".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(!record_matches_filter(
+            &record,
+            &NovelFilter {
+                tag: Some("coffee".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(record_matches_filter(
+            &record,
+            &NovelFilter {
+                ids: Some(vec![NovelId::from(1)]),
+                ..Default::default()
+            }
+        ));
+        assert!(!record_matches_filter(
+            &record,
+            &NovelFilter {
+                ids: Some(vec![NovelId::from(2)]),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn keyword_matches_title_or_author_case_insensitively() {
+        let record = sample_record(1);
+        assert!(record_matches_filter(
+            &record,
+            &NovelFilter {
+                keyword: Some("TITLE".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(record_matches_filter(
+            &record,
+            &NovelFilter {
+                keyword: Some("AUTHOR".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(!record_matches_filter(
+            &record,
+            &NovelFilter {
+                keyword: Some("missing".into()),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn search_terms_support_fielded_or_and_negation() {
+        let mut record = sample_record(1);
+        record.title = "テスト小説".into();
+        record.author = "作者".into();
+        record.tags = vec!["sf".into(), "coffee".into()];
+
+        let terms = vec![SearchTerm::new(
+            SearchField::Tag,
+            false,
+            vec!["sf".into(), "mystery".into()],
+        )];
+        assert!(record_matches_terms(&record, &terms, false, false));
+
+        let negated = vec![SearchTerm::new(
+            SearchField::Tag,
+            true,
+            vec!["mystery".into()],
+        )];
+        assert!(record_matches_terms(&record, &negated, false, false));
+        assert!(!record_matches_terms(
+            &record,
+            &[SearchTerm::new(SearchField::Tag, true, vec!["sf".into()])],
+            false, false
+        ));
+    }
+
+    #[test]
+    fn status_terms_include_frozen_when_frozen() {
+        let mut record = sample_record(1);
+        record.end = true;
+        let frozen_ids = HashSet::from([1]);
+
+        assert!(record_matches_terms(
+            &record,
+            &[SearchTerm::new(SearchField::Status, false, vec!["完結".into()])],
+            false, false
+        ));
+        assert!(record_matches_terms(
+            &record,
+            &[SearchTerm::new(SearchField::Status, false, vec!["凍結".into()])],
+            frozen_ids.contains(&record.id), false
+        ));
+        assert!(!record_matches_terms(
+            &record,
+            &[SearchTerm::new(SearchField::Status, false, vec!["凍結".into()])],
+            false, false
+        ));
+        assert_eq!(record_status_text(&record, true), "凍結, 完結");
+    }
+
+    #[test]
+    fn ncode_and_domain_filters_are_exact() {
+        let mut record = sample_record(1);
+        record.ncode = Some("n1234ab".into());
+        record.domain = Some("ncode.syosetu.com".into());
+
+        assert!(record_matches_filter(
+            &record,
+            &NovelFilter {
+                ncode: Some("n1234ab".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(record_matches_filter(
+            &record,
+            &NovelFilter {
+                domain: Some("ncode.syosetu.com".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(!record_matches_filter(
+            &record,
+            &NovelFilter {
+                ncode: Some("n9999zz".into()),
+                ..Default::default()
+            }
+        ));
+    }
+}

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -9,10 +10,10 @@ use axum::{
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
-use crate::db::{with_database, with_database_mut};
-use crate::downloader::site_setting::SiteSetting;
-use crate::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
-use crate::downloader::{Downloader, TargetType};
+use crate::application::webui::{diff, queue_view, tag_views};
+use crate::db::inventory::{Inventory, InventoryScope};
+use crate::db::with_database_mut;
+use crate::downloader::types::SECTION_SAVE_DIR;
 use crate::queue::{
     JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
     WEBUI_MESSAGE_TEXT_META_KEY, WEBUI_MESSAGE_TYPE_META_KEY, WEBUI_UPDATE_START_MESSAGE_TYPE,
@@ -21,7 +22,7 @@ use crate::queue::{
 use super::AppState;
 use super::sort_state::{
     CurrentSortState, current_sort_from_server_setting, load_current_sort_state, request_sort_state,
-    sort_column_key, sort_column_label, sort_ids_for_request, sort_records,
+    sort_column_key, sort_display_label, sort_ids_from_records, sort_records,
 };
 use super::state::{
     ApiResponse, ConfirmRunningTasksBody, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody,
@@ -44,29 +45,10 @@ pub struct DiffListQuery {
     pub target: Option<String>,
 }
 
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
+use super::targets_to_strings;
 
-fn tag_color_class(color: &str) -> &'static str {
-    match color {
-        "green" => "tag-green",
-        "yellow" => "tag-yellow",
-        "blue" => "tag-blue",
-        "magenta" => "tag-magenta",
-        "cyan" => "tag-cyan",
-        "red" => "tag-red",
-        "white" => "tag-white",
-        _ => "tag-default",
-    }
-}
-
-fn validate_download_targets(targets: &[String]) -> Result<(), String> {
-    if targets.len() > super::max_web_targets_per_request() {
+fn validate_download_targets(targets: &[String], max_targets: usize) -> Result<(), String> {
+    if targets.len() > max_targets {
         return Err("too many targets".to_string());
     }
     for target in targets {
@@ -111,17 +93,15 @@ fn log_web_failure(context: &str, error: impl std::fmt::Display) {
     eprintln!("web {} failed: {}", context, error);
 }
 
-fn log_immediate_command_failure(context: &str, output: &std::process::Output) {
+fn log_immediate_command_failure(
+    context: &str,
+    output: &crate::application::WebActionOutput,
+) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.trim().is_empty() {
-        eprintln!("web {} failed with status {}", context, output.status);
+        eprintln!("web {} failed", context);
     } else {
-        eprintln!(
-            "web {} failed with status {}: {}",
-            context,
-            output.status,
-            stderr.trim()
-        );
+        eprintln!("web {} failed: {}", context, stderr.trim());
     }
 }
 
@@ -153,83 +133,20 @@ fn update_job_matches_request(
     legacy_cmd != "update_general_lastup" || update_job_requests_modified(&spec.meta) == update_modified
 }
 
-fn queue_target_fallback_text(target: &str) -> String {
-    target
-        .split('\t')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" / ")
-}
-
-fn describe_update_targets(targets: &[String]) -> String {
-    match targets {
-        [] => "全ての小説".to_string(),
-        [target] => {
-            if let Some(tag) = target.strip_prefix("tag:") {
-                format!("タグ「{}」の小説", tag)
-            } else if target.chars().all(|ch| ch.is_ascii_digit()) {
-                format!("ID {} の小説", target)
-            } else {
-                target.to_string()
-            }
-        }
-        _ => format!("{}件の小説", targets.len()),
-    }
-}
-
+/// native の meta にある開始メッセージを共有実装へ渡すアダプタ。
 fn format_update_queue_target(args: &[String], meta: Option<&Mapping>) -> String {
-    if let Some(message) = meta.and_then(update_start_message) {
-        return message;
-    }
-
-    if args.first().map(String::as_str) == Some("--gl") {
-        return format_general_lastup_queue_target(&args[1..]);
-    }
-
-    let mut force = false;
-    let mut targets = Vec::new();
-    let mut skip_next = false;
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if arg == "--force" {
-            force = true;
-            continue;
-        }
-        if arg == "--sort-by" {
-            skip_next = true;
-            continue;
-        }
-        targets.push(arg.clone());
-    }
-
-    let target_text = describe_update_targets(&targets);
-    if force {
-        format!("{}を凍結済みも含めて更新", target_text)
-    } else {
-        format!("{}を更新", target_text)
-    }
-}
-
-fn format_general_lastup_queue_target(args: &[String]) -> String {
-    match args.first().map(String::as_str) {
-        Some("narou") => "なろうAPIで最新話掲載日を確認".to_string(),
-        Some("other") => "その他サイトの最新話掲載日を確認".to_string(),
-        _ => "最新話掲載日を確認".to_string(),
-    }
+    queue_view::format_update_queue_target(args, meta.and_then(update_start_message).as_deref(), None)
 }
 
 fn format_queue_job_target(job: &QueueJob, spec: Option<&QueueExecutionSpec>) -> String {
     let Some(spec) = spec else {
-        return queue_target_fallback_text(&job.target);
+        return queue_view::queue_target_fallback_text(&job.target);
     };
 
     match spec.cmd.as_str() {
-        "update_general_lastup" => format_general_lastup_queue_target(&spec.args),
+        "update_general_lastup" => queue_view::general_lastup_queue_target(&spec.args),
         "update" | "update_by_tag" => format_update_queue_target(&spec.args, Some(&spec.meta)),
-        _ => queue_target_fallback_text(&job.target),
+        _ => queue_view::queue_target_fallback_text(&job.target),
     }
 }
 
@@ -246,8 +163,7 @@ fn job_type_key(job_type: JobType) -> &'static str {
 }
 
 fn format_queue_job_type(job: &QueueJob, spec: Option<&QueueExecutionSpec>) -> String {
-    spec.map(|spec| spec.cmd.clone())
-        .unwrap_or_else(|| job_type_key(job.job_type).to_string())
+    queue_view::queue_type_label(spec.map(|spec| spec.cmd.as_str()), job_type_key(job.job_type))
 }
 
 fn queue_display_target(queue: &PersistentQueue, job: &QueueJob) -> String {
@@ -266,7 +182,7 @@ fn queue_lane_sizes(queue: &PersistentQueue) -> [usize; 2] {
     ]
 }
 
-fn sort_records_for_web_update(records: &mut Vec<&crate::db::NovelRecord>, sort_state: &CurrentSortState) {
+fn sort_records_for_web_update(records: &mut [crate::db::NovelRecord], sort_state: &CurrentSortState) {
     sort_records(records, sort_state);
 }
 
@@ -287,38 +203,37 @@ fn current_web_update_sort_key_for_cli() -> Option<&'static str> {
     web_update_sort_key_for_cli(&current_web_update_sort_state())
 }
 
-fn sorted_update_all_ids() -> Vec<String> {
+fn sorted_update_all_ids(mut records: Vec<crate::db::NovelRecord>) -> Vec<String> {
+    records.retain(|record| !crate::virtual_novel::is_virtual_record(record));
     let sort_state = current_web_update_sort_state();
-    with_database(|db| {
-        let mut records: Vec<_> = db.all_records().values().collect();
-        sort_records_for_web_update(&mut records, &sort_state);
-        Ok(records.into_iter().map(|record| record.id.to_string()).collect())
-    })
-    .unwrap_or_default()
+    sort_records_for_web_update(&mut records, &sort_state);
+    records.into_iter().map(|record| record.id.to_string()).collect()
 }
 
-fn sort_numeric_targets_for_request(
+
+async fn sort_numeric_targets_for_state(
+    state: &AppState,
     targets: &[String],
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let Some(ids) = targets
         .iter()
         .map(|target| target.parse::<i64>().ok())
         .collect::<Option<Vec<_>>>()
     else {
-        return targets.to_vec();
+        return Ok(targets.to_vec());
     };
-    let sorted_ids = sort_ids_for_request(&ids, sort_state, timestamp);
-    sorted_ids
+    let records = state.services.library.records_by_ids(&ids).await.map_err(|error| error.to_string())?;
+    Ok(sort_ids_from_records(&ids, &records, sort_state, timestamp)
         .into_iter()
         .map(|id| id.to_string())
-        .collect()
+        .collect())
 }
-
 fn build_update_by_tag_queue_payload(
     tag_params: &[String],
     snapshot_ids: &[i64],
+
     sort_display: &str,
 ) -> (String, Vec<Value>, Mapping) {
     let target_args = snapshot_ids
@@ -354,11 +269,8 @@ fn build_update_by_tag_queue_payload(
 }
 
 fn build_webui_update_start_message(is_update_all: bool, count: usize, sort_display: &str) -> String {
-    if is_update_all {
-        format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display)
-    } else {
-        format!("更新を開始します（{}件を{}で処理）", count, sort_display)
-    }
+    // 文言は Worker (`worker_entry` の update 投入経路) と同じ共有実装。
+    crate::application::messages::jobs::update_started(is_update_all, count, sort_display)
 }
 
 fn build_update_start_message_meta(message: String) -> Mapping {
@@ -379,8 +291,9 @@ fn queue_download_jobs(
     targets: &[String],
     force: bool,
     mail: bool,
+    max_targets: usize,
 ) -> Result<Vec<String>, String> {
-    validate_download_targets(targets)?;
+    validate_download_targets(targets, max_targets)?;
     let jobs: Vec<(JobType, String)> = targets
         .iter()
         .map(|target| {
@@ -398,43 +311,6 @@ fn queue_download_jobs(
     queue.push_batch(&jobs).map_err(|e| e.to_string())
 }
 
-fn resolve_existing_id_for_target(target: &str) -> Option<i64> {
-    match Downloader::get_target_type(target) {
-        TargetType::Id => {
-            let id = target.parse::<i64>().ok()?;
-            with_database(|db| Ok(db.get(id).map(|record| record.id)))
-                .ok()
-                .flatten()
-        }
-        TargetType::Url => {
-            let settings = SiteSetting::load_all().ok()?;
-            let setting = settings
-                .iter()
-                .find(|setting| setting.matches_url(target))?;
-            let toc_url = setting
-                .toc_url_with_url_captures(target)
-                .unwrap_or_else(|| setting.toc_url());
-            with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|record| record.id)))
-                .ok()
-                .flatten()
-        }
-        TargetType::Ncode => {
-            let ncode = target.to_lowercase();
-            with_database(|db| {
-                Ok(db
-                    .all_records()
-                    .values()
-                    .find(|record| record.ncode.as_deref() == Some(ncode.as_str()))
-                    .map(|record| record.id))
-            })
-            .ok()
-            .flatten()
-        }
-        _ => with_database(|db| Ok(db.find_by_title(target).map(|record| record.id)))
-            .ok()
-            .flatten(),
-    }
-}
 
 fn existing_update_job_id(
     queue: &PersistentQueue,
@@ -457,6 +333,25 @@ fn existing_update_job_id(
         .chain(queue.get_pending_tasks())
         .find(|job| update_job_matches_request(queue, job, target, legacy_cmd, update_modified))
         .map(|job| job.id)
+}
+async fn resolve_existing_id_for_target_with_library(
+    state: &AppState,
+    target: &str,
+) -> Result<Option<i64>, String> {
+    state
+        .services
+        .library
+        .resolve_target(
+            crate::application::target_lookup::TargetLookupPlan::READ,
+            &std::collections::HashMap::new(),
+            crate::application::target_lookup::UrlSource::Provider(
+                &*state.services.site_definitions,
+            ),
+            target,
+        )
+        .await
+        .map(|record| record.map(|record| record.id))
+        .map_err(|error| error.to_string())
 }
 
 fn push_update_job_if_needed(
@@ -522,6 +417,48 @@ fn restorable_tasks_available(state: &AppState) -> bool {
     state.restorable_tasks_available.load(Ordering::Relaxed) && state.queue.has_restorable_tasks()
 }
 
+/// 中断した子プロセスでは `NovelLockGuard::drop` が走らないため、子が書いた
+/// `.narou/lock.yaml` のエントリだけが残る。`worker::pop_next_job` は新鮮な
+/// ロックを持つ小説のジョブを延期するので、中断したジョブの対象小説だけを
+/// ここで解放する。子が先に正常終了して既に消している場合もあるため冪等。
+fn release_novel_locks(novel_ids: &HashSet<i64>) {
+    if novel_ids.is_empty() {
+        return;
+    }
+    let released = Inventory::with_default_root().and_then(|inventory| {
+        inventory.update_yaml::<(), HashMap<i64, serde_yaml::Value>, _>(
+            "lock",
+            InventoryScope::Local,
+            |mut locked| {
+                for id in novel_ids {
+                    locked.remove(id);
+                }
+                Ok((locked, ()))
+            },
+        )
+    });
+    if let Err(error) = released {
+        log_web_failure("novel lock release", error);
+    }
+}
+
+/// `running_jobs` のうち `job_ids` のジョブが対象にしている小説 ID を集める。
+fn cancelled_novel_ids(
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+    job_ids: &[String],
+) -> HashSet<i64> {
+    let running = running_jobs.lock();
+    running
+        .iter()
+        .filter(|job| job_ids.contains(&job.id))
+        .flat_map(|job| crate::application::extract_novel_ids(&job.target))
+        .collect()
+}
+
+fn release_cancelled_novel_locks(state: &AppState, job_ids: &[String]) {
+    release_novel_locks(&cancelled_novel_ids(&state.running_jobs, job_ids));
+}
+
 fn kill_running_child(state: &AppState) {
     let jobs: Vec<(String, u32)> = {
         let mut guard = state.running_child_pids.lock();
@@ -529,10 +466,14 @@ fn kill_running_child(state: &AppState) {
         guard.clear();
         values
     };
+    let cancelled_ids: Vec<String> = jobs.iter().map(|(job_id, _)| job_id.clone()).collect();
     for (job_id, pid) in jobs {
         state.cancelled_job_ids.lock().insert(job_id);
         kill_process_tree(pid, &state.push_server);
     }
+    // kill は子の後始末 (`NovelLockGuard::drop`) を走らせない。残ったロックを
+    // 解放しないと同じ小説のジョブが 30 分間延期され続ける。
+    release_cancelled_novel_locks(state, &cancelled_ids);
 }
 
 fn kill_running_child_for_job(state: &AppState, job_id: &str) -> bool {
@@ -573,11 +514,18 @@ fn kill_running_child_for_job(state: &AppState, job_id: &str) -> bool {
     if running_pids.is_empty() {
         return cancelled_pending;
     }
+    let killed_job_ids: Vec<String> = running_pids
+        .iter()
+        .map(|(job_id, _)| job_id.clone())
+        .collect();
     let mut cancelled_job_ids = state.cancelled_job_ids.lock();
     for (running_job_id, pid) in running_pids {
         cancelled_job_ids.insert(running_job_id);
         kill_process_tree(pid, &state.push_server);
     }
+    drop(cancelled_job_ids);
+    // レーン内で kill した子のロックを解放する (子の後始末は走らない)。
+    release_cancelled_novel_locks(state, &killed_job_ids);
     true
 }
 
@@ -588,108 +536,102 @@ fn kill_process_tree(pid: u32, push_server: &std::sync::Arc<super::push::PushSer
     }
 }
 
-fn read_sorted_cache_dirs(cache_root: &PathBuf) -> Result<Vec<PathBuf>, String> {
-    let mut list = Vec::new();
-    for entry in std::fs::read_dir(cache_root).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.is_dir() {
-            list.push(path);
+fn cache_version_dirs(archive_root: &std::path::Path, base_dir: &std::path::Path) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = Vec::new();
+    for name in diff::DIFF_CACHE_DIR_NAMES {
+        let root = base_dir.join(SECTION_SAVE_DIR).join(name);
+        super::reject_symlink_ancestors(&root, archive_root)?;
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        for entry in entries {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            super::reject_symlink_ancestors(&path, archive_root)?;
+            if path.is_dir() {
+                dirs.push(path);
+            }
         }
     }
-    list.sort_by(|a, b| {
-        let a_name = a
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        let b_name = b
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        b_name.cmp(a_name)
-    });
-    Ok(list)
+    Ok(dirs)
 }
 
-fn read_sorted_section_files(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
-    let mut list = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("yaml") {
-            list.push(path);
-        }
-    }
-    list.sort_by_key(|path| {
-        path.file_stem()
-            .and_then(|value| value.to_str())
-            .and_then(|value| value.split_once(' ').map(|(index, _)| index.to_string()))
-            .and_then(|index| index.parse::<usize>().ok())
-            .unwrap_or(0)
-    });
-    Ok(list)
-}
-
-fn render_diff_list_html_for_target(target: &str) -> String {
-    let Some(id) = resolve_existing_id_for_target(target) else {
-        return String::new();
-    };
-    let Ok((record, archive_root)) =
-        with_database(|db| Ok((db.get(id).cloned(), db.archive_root().to_path_buf())))
-    else {
-        return String::new();
-    };
-    let Some(record) = record else {
-        return String::new();
-    };
-
-    let Ok(base_dir) = super::safe_existing_novel_dir(&archive_root, &record) else {
-        return String::new();
-    };
-    let cache_root = base_dir.join(SECTION_SAVE_DIR).join(CACHE_SAVE_DIR);
-    let Ok(cache_dirs) = read_sorted_cache_dirs(&cache_root) else {
-        return String::new();
-    };
-    if cache_dirs.is_empty() {
-        return String::new();
-    }
-
-    let mut html = String::new();
-    for (number, cache_dir) in cache_dirs.iter().enumerate() {
-        let version = cache_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        html.push_str("<div class=\"diff-list-group\">");
-        html.push_str(&format!(
-            "<div class=\"diff-list-version\">{}&nbsp;&nbsp;-{}</div>",
-            html_escape(version),
-            number + 1
-        ));
-        let Ok(section_paths) = read_sorted_section_files(cache_dir) else {
-            html.push_str("</div>");
+fn native_cache_version_hints(
+    archive_root: &std::path::Path,
+    base_dir: &std::path::Path,
+) -> Result<Vec<diff::CacheVersionHint>, String> {
+    let mut hints = Vec::new();
+    for dir in cache_version_dirs(archive_root, base_dir)? {
+        let Some(version) = dir.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if section_paths.is_empty() {
-            html.push_str("<div class=\"diff-list-entry\">(最新話のみのアップデート)</div></div>");
-            continue;
-        }
-        for section_path in section_paths {
-            let Ok(content) = std::fs::read_to_string(&section_path) else {
-                continue;
-            };
-            let Ok(section) = serde_yaml::from_str::<SectionFile>(&content) else {
-                continue;
-            };
-            html.push_str(&format!(
-                "<div class=\"diff-list-entry\">第{}部分　{}</div>",
-                html_escape(&section.index),
-                html_escape(section.subtitle.trim_end())
-            ));
-        }
-        html.push_str("</div>");
+        let enumeration_succeeded = std::fs::read_dir(&dir)
+            .and_then(|entries| {
+                for entry in entries {
+                    entry?;
+                }
+                Ok(())
+            })
+            .is_ok();
+        hints.push(diff::CacheVersionHint {
+            version: version.to_string(),
+            enumeration_succeeded,
+        });
     }
-    html
+    Ok(hints)
+}
+
+async fn render_diff_list_html_for_target(state: &AppState, target: &str) -> Result<String, String> {
+    let Some(id) = resolve_existing_id_for_target_with_library(state, target).await? else {
+        return Ok(String::new());
+    };
+    let mut reads = state.services.content.read_scope("native-diff-catalog");
+    let result = async {
+        let Some(record) = state.services.content.read_record(&mut reads, id.into()).await
+            .map_err(|error| error.to_string())? else {
+            return Ok(String::new());
+        };
+        let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+            .map_err(|error| error.to_string())?;
+        let base_dir = super::safe_existing_novel_dir(&archive_root, &record)?;
+        let prefix = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+            .map_err(|error| error.to_string())?.prefix().clone();
+        let hints = native_cache_version_hints(&archive_root, &base_dir)?;
+        let versions = diff::read_diff_cache_catalog(&mut reads, state.services.content.object_store(), &prefix, &hints)
+            .await.map_err(|error| error.to_string())?;
+        Ok(diff::render_diff_list_html(&versions))
+    }.await;
+    let released = reads.release_all().await;
+    result.and_then(|value| released.map(|_| value).map_err(|error| error.to_string()))
+}
+
+#[cfg(test)]
+mod cache_catalog_tests {
+    use super::*;
+    use crate::native::object_store::NativeObjectStore;
+
+    #[test]
+    fn legacy_empty_cache_directory_is_read_without_creating_a_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path();
+        let base = archive.join("site/title");
+        let version_dir = base.join("本文/.cache/2026.10.13@01.02.03");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let objects: std::sync::Arc<dyn crate::platform::ObjectStore> = std::sync::Arc::new(NativeObjectStore::from_root(archive.to_path_buf()).unwrap());
+        let prefix = crate::native::object_store::novel_object_prefix(archive, &base).unwrap();
+        let hints = native_cache_version_hints(archive, &base).unwrap();
+        let mut reads = crate::application::novel_access::NovelReadScope::new(&objects, "diff-test");
+        let versions = futures::executor::block_on(
+            diff::read_diff_cache_catalog(&mut reads, objects.as_ref(), &prefix, &hints),
+        ).unwrap();
+        futures::executor::block_on(reads.release_all()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "2026.10.13@01.02.03");
+        assert!(versions[0].only_latest_update);
+        assert!(std::fs::read_dir(&version_dir).unwrap().next().is_none(),
+            "GET-time catalog reads must not create .version or YAML objects");
+    }
 }
 
 fn gif_response() -> Response {
@@ -703,13 +645,19 @@ fn gif_response() -> Response {
     )
         .into_response()
 }
-
 pub async fn api_download(
     State(state): State<AppState>,
     Json(body): Json<DownloadBody>,
 ) -> Json<serde_json::Value> {
+    let max_targets = super::max_web_targets_per_request(&state).await;
     let targets = body.targets;
-    let ids = match queue_download_jobs(state.queue.as_ref(), &targets, body.force, body.mail) {
+    let ids = match queue_download_jobs(
+        state.queue.as_ref(),
+        &targets,
+        body.force,
+        body.mail,
+        max_targets,
+    ) {
         Ok(ids) => ids,
         Err(message) => {
             return serde_json::json!({
@@ -738,7 +686,8 @@ pub async fn api_update(
     Json(body): Json<UpdateBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    let targets = match normalize_update_targets(&raw_targets) {
+    let max_targets = super::max_web_targets_per_request(&state).await;
+    let targets = match normalize_update_targets(&raw_targets, max_targets) {
         Ok(targets) => targets,
         Err(message) => {
             return serde_json::json!({
@@ -763,12 +712,32 @@ pub async fn api_update(
         (targets.join("\t"), None)
     } else {
         let mut args = if is_update_all {
-            sorted_update_all_ids()
+            let records = match state.services.library.records().await {
+                Ok(records) => records,
+                Err(error) => return serde_json::json!({ "success": false, "message": error.to_string() }).into(),
+            };
+            sorted_update_all_ids(records)
         } else {
-            sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp)
+            match sort_numeric_targets_for_state(
+                &state, &targets, body.sort_state.as_ref(), body.timestamp,
+            ).await {
+                Ok(targets) => targets,
+                Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+            }
         };
         count = args.len();
-        if count == 0 {
+        let author_only = if count == 0 && is_update_all {
+            let disabled = state.services.settings.get_many(&["update.disabled-author-tracking"]).await;
+            match disabled {
+                Ok(values) if values.first().and_then(Option::as_ref).and_then(crate::setting_core::setting_bool_value).unwrap_or(false) => false,
+                Ok(_) => match crate::author::authors_for_current_root() {
+                    Ok(authors) => !authors.is_empty(),
+                    Err(error) => return Json(serde_json::json!({"success":false,"message":error.to_string(),"count":0})),
+                },
+                Err(error) => return Json(serde_json::json!({"success":false,"message":error.to_string(),"count":0})),
+            }
+        } else { false };
+        if count == 0 && !author_only {
             return serde_json::json!({
                 "success": true,
                 "status": "queued",
@@ -835,9 +804,8 @@ pub async fn api_update(
     })
     .into()
 }
-
-fn normalize_update_targets(targets: &[String]) -> Result<Vec<String>, String> {
-    if targets.len() > super::max_web_targets_per_request() {
+fn normalize_update_targets(targets: &[String], max_targets: usize) -> Result<Vec<String>, String> {
+    if targets.len() > max_targets {
         return Err("too many targets".to_string());
     }
     let mut normalized = Vec::with_capacity(targets.len());
@@ -873,7 +841,7 @@ pub async fn api_convert(
     State(state): State<AppState>,
     Json(body): Json<ConvertBody>,
 ) -> Json<serde_json::Value> {
-    if body.targets.len() > super::max_web_targets_per_request() {
+    if body.targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -908,8 +876,10 @@ pub async fn api_convert(
             .into();
         }
     };
-    let ordered_targets =
-        sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
+    let ordered_targets = match sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp).await {
+        Ok(targets) => targets,
+        Err(error) => return serde_json::json!({ "success": false, "message": error, "results": [] }).into(),
+    };
     let mut meta = Mapping::new();
     if let Some(device) = device.as_deref() {
         meta.insert(
@@ -960,11 +930,13 @@ pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Val
     let running_jobs = state.queue.get_running_tasks();
     let running_count = running_jobs.len();
     let lane_sizes = queue_lane_sizes(state.queue.as_ref());
-    let running_label = match running_jobs.as_slice() {
-        [] => serde_json::Value::Null,
-        [job] => serde_json::Value::String(queue_display_target(state.queue.as_ref(), job)),
-        jobs => serde_json::Value::String(format!("{} 件実行中", jobs.len())),
-    };
+    let running_label = queue_view::queue_running_label(
+        running_count,
+        running_jobs
+            .first()
+            .filter(|_| running_count == 1)
+            .map(|job| queue_display_target(state.queue.as_ref(), job)),
+    );
     Json(serde_json::json!({
         "pending": state.queue.pending_count(),
         "completed": state.queue.completed_count(),
@@ -974,6 +946,8 @@ pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Val
         "running": running_label,
         "running_count": running_count,
         "lane_sizes": lane_sizes,
+        "restorable_tasks_available": restorable_tasks_available(&state),
+        "restore_prompt_pending": state.restore_prompt_pending.load(Ordering::Relaxed),
     }))
 }
 
@@ -1003,52 +977,8 @@ pub async fn queue_clear(State(state): State<AppState>) -> Json<ApiResponse> {
     }
 }
 
-/// Helper: convert mixed JSON values (numbers or strings) into string targets
-fn targets_to_strings(targets: &[serde_json::Value]) -> Vec<String> {
-    targets
-        .iter()
-        .map(|v| match v {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        })
-        .collect()
-}
-
 fn encode_convert_job_target(targets: &[String]) -> String {
     targets.join("\t")
-}
-
-fn run_immediate_blocking(args: &[String]) -> Result<std::process::Output, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut command = std::process::Command::new(exe);
-    command
-        .args(args)
-        .current_dir(std::env::current_dir().unwrap_or_default())
-        .stdin(std::process::Stdio::null());
-    crate::compat::configure_web_subprocess_command(&mut command);
-    command.output().map_err(|e| e.to_string())
-}
-
-async fn run_immediate(args: Vec<String>) -> Result<std::process::Output, String> {
-    tokio::task::spawn_blocking(move || run_immediate_blocking(&args))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-pub(crate) async fn run_cli_and_broadcast(
-    state: &AppState,
-    args: Vec<String>,
-    target_console: &str,
-) -> Result<std::process::Output, String> {
-    let output = run_immediate(args).await?;
-    broadcast_captured_web_output(&state.push_server, &output.stdout, target_console);
-    broadcast_captured_web_output(&state.push_server, &output.stderr, target_console);
-    Ok(output)
-}
-
-fn csv_download_args() -> Vec<String> {
-    vec!["csv".to_string()]
 }
 
 fn broadcast_captured_web_output(
@@ -1061,7 +991,7 @@ fn broadcast_captured_web_output(
         if let Some(json) = routed.strip_prefix(crate::progress::WS_LINE_PREFIX)
             && let Ok(value) = serde_json::from_str::<serde_json::Value>(json)
         {
-            push_server.broadcast_raw(&value);
+            push_server.broadcast_raw(value);
         }
     }
 }
@@ -1089,7 +1019,7 @@ pub async fn api_send(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1110,8 +1040,10 @@ pub async fn api_send(
             .into();
         }
     };
-    let ordered_targets =
-        sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
+    let ordered_targets = match sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp).await {
+        Ok(targets) => targets,
+        Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+    };
     let legacy_args = ordered_targets
         .iter()
         .cloned()
@@ -1149,7 +1081,7 @@ pub async fn api_inspect(
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return Json(ApiResponse {
             success: false,
             message: "too many targets".to_string(),
@@ -1168,13 +1100,21 @@ pub async fn api_inspect(
             });
         }
     };
-    let mut args = vec!["inspect".to_string()];
-    args.extend(targets);
-    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+    match state.services.web_actions.inspect(&targets).await {
         Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
             Json(ApiResponse {
-                success: output.status.success(),
-                message: if output.status.success() {
+                success: output.success,
+                message: if output.success {
                     "OK".to_string()
                 } else {
                     log_immediate_command_failure("inspect", &output);
@@ -1198,7 +1138,7 @@ pub async fn api_folder(
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return Json(ApiResponse {
             success: false,
             message: "too many targets".to_string(),
@@ -1217,13 +1157,21 @@ pub async fn api_folder(
             });
         }
     };
-    let mut args = vec!["folder".to_string()];
-    args.extend(targets);
-    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+    match state.services.web_actions.folder(&targets).await {
         Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
             Json(ApiResponse {
-                success: output.status.success(),
-                message: if output.status.success() {
+                success: output.success,
+                message: if output.success {
                     "OK".to_string()
                 } else {
                     log_immediate_command_failure("folder", &output);
@@ -1247,7 +1195,7 @@ pub async fn api_backup(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1268,8 +1216,10 @@ pub async fn api_backup(
             .into();
         }
     };
-    let ordered_targets =
-        sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
+    let ordered_targets = match sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp).await {
+        Ok(targets) => targets,
+        Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+    };
     let legacy_args = ordered_targets
         .iter()
         .cloned()
@@ -1335,7 +1285,7 @@ pub async fn api_mail(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1383,7 +1333,7 @@ pub async fn api_setting_burn(
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return Json(ApiResponse {
             success: false,
             message: "too many targets".to_string(),
@@ -1402,13 +1352,21 @@ pub async fn api_setting_burn(
             });
         }
     };
-    let mut args = vec!["setting".to_string(), "--burn".to_string()];
-    args.extend(targets);
-    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+    match state.services.web_actions.setting_burn(&targets).await {
         Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
             Json(ApiResponse {
-                success: output.status.success(),
-                message: if output.status.success() {
+                success: output.success,
+                message: if output.success {
                     "設定を焼き込みました".to_string()
                 } else {
                     log_immediate_command_failure("setting --burn", &output);
@@ -1428,93 +1386,69 @@ pub async fn api_setting_burn(
 
 // POST /api/diff_list
 pub async fn api_diff_list(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let targets = targets_to_strings(&body.targets);
-    if targets.len() > super::max_web_targets_per_request() {
+    if targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({ "error": "too many targets" }).into();
     }
     let mut diffs = Vec::new();
-
     for target in &targets {
         let id: i64 = match target.parse() {
             Ok(id) => id,
             Err(_) => continue,
         };
-
-        let result = with_database(|db| {
-            let record = db.get(id).cloned();
-            let archive_root = db.archive_root().to_path_buf();
-            Ok((record, archive_root))
-        });
-
-        let (record, archive_root) = match result {
-            Ok((Some(record), root)) => (record, root),
-            _ => {
-                diffs.push(serde_json::json!({
-                    "id": id,
-                    "title": format!("ID: {}", id),
-                    "content": "Novel not found",
-                }));
-                continue;
-            }
+        let mut reads = state.services.content.read_scope("native-diff-list");
+        let outcome = async {
+            let Some(record) = state.services.content.read_record(&mut reads, id.into()).await? else {
+                return Ok(None);
+            };
+            let result = state.services.content.diff(&mut reads, id.into()).await;
+            Ok::<_, crate::application::error::ApplicationError>(Some((record.title, result)))
+        }.await;
+        let released = reads.release_all().await;
+        let Ok(resolved) = outcome.and_then(|value| released.map(|_| value).map_err(crate::application::error::ApplicationError::platform))
+        else {
+            diffs.push(diff::diff_list_entry(id, "", diff::DIFF_READ_ERROR));
+            continue;
         };
-
-        let novel_dir = match super::safe_existing_novel_dir(&archive_root, &record) {
-            Ok(dir) => dir,
-            Err(_) => {
-                diffs.push(serde_json::json!({
-                    "id": id,
-                    "title": record.title,
-                    "content": "Invalid novel storage path",
-                }));
-                continue;
-            }
+        let Some((title, result)) = resolved else {
+            diffs.push(diff::diff_missing_entry(id));
+            continue;
         };
-        let diff_path = novel_dir.join("diff.txt");
-
-        let content = if diff_path.exists() {
-            std::fs::read_to_string(&diff_path).unwrap_or_else(|_| "読み取りエラー".to_string())
-        } else {
-            "No diff".to_string()
-        };
-
-        diffs.push(serde_json::json!({
-            "id": id,
-            "title": record.title,
-            "content": content,
-        }));
+        let content = diff::diff_content_label(result);
+        diffs.push(diff::diff_list_entry(id, &title, &content));
     }
-
     serde_json::json!({ "diffs": diffs }).into()
 }
 
 // GET /api/diff_list
 pub async fn api_diff_list_get(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<DiffListQuery>,
-) -> Html<String> {
-    Html(
-        params
-            .target
-            .as_deref()
-            .map(render_diff_list_html_for_target)
-            .unwrap_or_default(),
-    )
+) -> Response {
+    let html = match params.target.as_deref() {
+        Some(target) => render_diff_list_html_for_target(&state, target).await,
+        None => Ok(String::new()),
+    };
+    match html {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
 }
 
 // GET /api/downloadable.gif
 pub async fn api_downloadable_gif(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<BookmarkletDownloadQuery>,
 ) -> Response {
     let _number = match params.target.as_deref() {
         Some(target) if !target.trim().is_empty() => {
-            if resolve_existing_id_for_target(target).is_some() {
-                1
-            } else {
-                0
+            match resolve_existing_id_for_target_with_library(&state, target).await {
+                Ok(Some(_)) => 1,
+                Ok(None) => 0,
+                Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
             }
         }
         _ => 2,
@@ -1526,21 +1460,15 @@ pub async fn api_downloadable_gif(
 pub async fn api_diff(
     State(state): State<AppState>,
     Json(body): Json<DiffBody>,
-) -> Json<ApiResponse> {
+) -> Json<serde_json::Value> {
     let diff_number = match validate_diff_number(&body.number) {
         Ok(number) => number,
         Err(message) => {
-            return Json(ApiResponse {
-                success: false,
-                message,
-            });
+            return serde_json::json!({ "success": false, "message": message }).into();
         }
     };
-    if body.ids.len() > super::max_web_targets_per_request() {
-        return Json(ApiResponse {
-            success: false,
-            message: "too many ids".to_string(),
-        });
+    if body.ids.len() > super::max_web_targets_per_request(&state).await {
+        return serde_json::json!({ "success": false, "message": "too many ids" }).into();
     }
     let ids: Vec<String> = match body
         .ids
@@ -1555,49 +1483,58 @@ pub async fn api_diff(
     {
         Ok(ids) => ids,
         Err(message) => {
-            return Json(ApiResponse {
-                success: false,
-                message,
-            });
+            return serde_json::json!({ "success": false, "message": message }).into();
         }
     };
 
     for id in &ids {
-        let args = vec![
-            "diff".to_string(),
-            "--no-tool".to_string(),
-            id.clone(),
-            "--number".to_string(),
-            diff_number.clone(),
-        ];
-        match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+        match state.services.web_actions.diff(id, &diff_number).await {
             Ok(output) => {
-                if !output.status.success() {
+                broadcast_captured_web_output(
+                    &state.push_server,
+                    &output.stdout,
+                    crate::native::non_external_console_target(),
+                );
+                broadcast_captured_web_output(
+                    &state.push_server,
+                    &output.stderr,
+                    crate::native::non_external_console_target(),
+                );
+                if !output.success {
                     log_immediate_command_failure("diff", &output);
-                    return Json(ApiResponse {
-                        success: false,
-                        message: format!("diff の実行に失敗しました ({id})"),
-                    });
+                    return serde_json::json!({
+                        "success": false,
+                        "message": format!("diff の実行に失敗しました ({id})"),
+                    }).into();
                 }
             }
             Err(e) => {
                 log_web_failure("diff", &e);
                 state.push_server.broadcast_echo(
                     &format!("diff error: {}", e),
-                    super::non_external_console_target(),
+                    crate::native::non_external_console_target(),
                 );
-                return Json(ApiResponse {
-                    success: false,
-                    message: format!("diff の実行に失敗しました ({id})"),
-                });
+                return serde_json::json!({
+                    "success": false,
+                    "message": format!("diff の実行に失敗しました ({id})"),
+                }).into();
             }
         }
     }
 
-    Json(ApiResponse {
-        success: true,
-        message: format!("Diff completed for {} novel(s)", ids.len()),
+    let mut history = serde_json::Map::new();
+    for id in ids.iter().filter_map(|id| id.parse::<i64>().ok()) {
+        match diff_history_versions(&state, id).await {
+            Ok(versions) => { history.insert(id.to_string(), serde_json::json!(versions)); }
+            Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+        }
+    }
+    serde_json::json!({
+        "success": true,
+        "message": format!("Diff completed for {} novel(s)", ids.len()),
+        "history": history,
     })
+    .into()
 }
 
 // POST /api/diff_clean
@@ -1621,16 +1558,25 @@ pub async fn api_diff_clean(
         }
     };
 
-    let args = vec!["diff".to_string(), "--clean".to_string(), target.clone()];
-    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+    match state.services.web_actions.diff_clean(&target).await {
         Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
             Json(ApiResponse {
-                success: output.status.success(),
-                message: if output.status.success() {
-                    format!("Diff cleaned for {}", target)
+                success: output.success,
+                message: if output.success {
+                    diff::diff_cleaned_message(&target)
                 } else {
                     log_immediate_command_failure("diff --clean", &output);
-                    "差分の削除に失敗しました".to_string()
+                    diff::DIFF_CLEAN_FAILED.to_string()
                 },
             })
         }
@@ -1638,10 +1584,212 @@ pub async fn api_diff_clean(
             log_web_failure("diff --clean", &e);
             Json(ApiResponse {
                 success: false,
-                message: "差分の削除に失敗しました".to_string(),
+                message: diff::DIFF_CLEAN_FAILED.to_string(),
             })
         }
     }
+}
+
+/// Read version data through the same original admission as its current
+/// record. YAML deliberately has no SQLite version history; storage failures
+/// are errors, never a fabricated empty catalog.
+async fn with_diff_history<T>(
+    state: &AppState,
+    id: i64,
+    read: impl FnOnce(&rusqlite::Connection) -> crate::error::Result<T>,
+) -> Result<Option<T>, String> {
+    let mut reads = state.services.content.read_scope("native-diff-history");
+    let result = async {
+        let record = state.services.content.read_record(&mut reads, id.into()).await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("ID: {id}"))?;
+        let store = crate::native::object_store::NativeStore::for_current_root().map_err(|error| error.to_string())?;
+        if !matches!(&store, crate::native::object_store::NativeStore::Sqlite(_)) {
+            return Ok(None);
+        }
+        let keys = crate::platform::NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+            .map_err(|error| error.to_string())?;
+        let prefix = crate::platform::ObjectPrefix::from(keys.prefix().clone());
+        let lease = reads.lease_for(&prefix).await.map_err(|error| error.to_string())?;
+        store.with_reader_transaction(&prefix, lease.lease(), read).map(Some).map_err(|error| error.to_string())
+    }.await;
+    let released = reads.release_all().await;
+    result.and_then(|value| released.map(|_| value).map_err(|error| error.to_string()))
+}
+
+async fn diff_history_versions(state: &AppState, id: i64) -> Result<Vec<serde_json::Value>, String> {
+    let versions = with_diff_history(state, id, |connection| {
+        crate::native::sqlite::versions::list_versions(connection, id)
+    }).await?.unwrap_or_default();
+    Ok(versions.into_iter().map(|version| serde_json::json!({
+        "id": version.id,
+        "parent_id": version.parent_id,
+        "origin": version.origin,
+        "note": version.note,
+        "created_at": version.created_at,
+        "section_count": version.section_count,
+    })).collect())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffHistoryQuery {
+    pub id: Option<i64>,
+}
+
+// GET /api/diff_history?id=N — P4b version history (newest first).
+pub async fn api_diff_history(
+    State(state): State<AppState>,
+    Query(params): Query<DiffHistoryQuery>,
+) -> Json<serde_json::Value> {
+    let Some(id) = params.id else {
+        return serde_json::json!({ "success": false, "message": "id is required" }).into();
+    };
+    let versions = match diff_history_versions(&state, id).await {
+        Ok(versions) => versions,
+        Err(error) => return serde_json::json!({ "success": false, "message": error }).into(),
+    };
+    serde_json::json!({
+        "success": true,
+        "id": id,
+        "versions": versions,
+    })
+    .into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffShowQuery {
+    pub id: Option<i64>,
+    pub version: Option<i64>,
+}
+
+// GET /api/diff_show?id=N&version=V — stored unified diff for one version.
+pub async fn api_diff_show(
+    State(state): State<AppState>,
+    Query(params): Query<DiffShowQuery>,
+) -> Json<serde_json::Value> {
+    let (Some(id), Some(version_id)) = (params.id, params.version) else {
+        return serde_json::json!({ "success": false, "message": "id and version are required" })
+            .into();
+    };
+    match with_diff_history(&state, id, |connection| {
+        crate::native::sqlite::versions::version_diff(connection, id, version_id)
+    }).await {
+        Ok(None) => serde_json::json!({ "success": false, "message": "SQLite backend is not active" }).into(),
+        Ok(Some(Some(diff))) => serde_json::json!({
+            "success": true,
+            "id": id,
+            "version": version_id,
+            "diff": diff,
+        })
+        .into(),
+        Ok(Some(None)) => serde_json::json!({
+            "success": false,
+            "message": format!("バージョン{version_id}の差分はありません"),
+        })
+        .into(),
+        Err(error) => serde_json::json!({
+            "success": false,
+            "message": error.to_string(),
+        })
+        .into(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffVersionBody {
+    pub target: serde_json::Value,
+    pub version: i64,
+    #[serde(default)]
+    pub sections: Option<String>,
+}
+
+fn diff_version_target(body: &DiffVersionBody) -> std::result::Result<String, String> {
+    let target = match &body.target {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    super::validate_web_target_value(&target)
+}
+
+async fn run_diff_version_action(
+    state: &AppState,
+    body: DiffVersionBody,
+    action: &str,
+) -> Json<ApiResponse> {
+    let target = match diff_version_target(&body) {
+        Ok(target) => target,
+        Err(message) => {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            })
+        }
+    };
+    let result = match action {
+        "restore" => {
+            state
+                .services
+                .web_actions
+                .diff_restore(&target, body.version)
+                .await
+        }
+        _ => {
+            state
+                .services
+                .web_actions
+                .diff_merge(&target, body.version, body.sections.as_deref())
+                .await
+        }
+    };
+    match result {
+        Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
+            if !output.success {
+                log_immediate_command_failure(action, &output);
+            }
+            Json(ApiResponse {
+                success: output.success,
+                message: if output.success {
+                    format!("バージョン{}の{action}を実行しました", body.version)
+                } else {
+                    format!("バージョン{}の{action}に失敗しました", body.version)
+                },
+            })
+        }
+        Err(e) => {
+            log_web_failure(action, &e);
+            Json(ApiResponse {
+                success: false,
+                message: format!("バージョン{}の{action}に失敗しました", body.version),
+            })
+        }
+    }
+}
+
+// POST /api/diff_restore — copy-forward restore of one version.
+pub async fn api_diff_restore(
+    State(state): State<AppState>,
+    Json(body): Json<DiffVersionBody>,
+) -> Json<ApiResponse> {
+    run_diff_version_action(&state, body, "restore").await
+}
+
+// POST /api/diff_merge — merge sections of one version into the working set.
+pub async fn api_diff_merge(
+    State(state): State<AppState>,
+    Json(body): Json<DiffVersionBody>,
+) -> Json<ApiResponse> {
+    run_diff_version_action(&state, body, "merge").await
 }
 
 // POST /api/csv/import
@@ -1657,47 +1805,19 @@ pub async fn api_csv_import(
             message,
         });
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            log_web_failure("csv import", &e);
-            return Json(ApiResponse {
-                success: false,
-                message: "CSVインポートに失敗しました".to_string(),
-            });
-        }
-    };
-
-    let mut command = std::process::Command::new(exe);
-    command
-        .args(["csv", "--import", "-"])
-        .current_dir(std::env::current_dir().unwrap_or_default())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    crate::compat::configure_web_subprocess_command(&mut command);
-    let result = command.spawn().and_then(|mut child| {
-        use std::io::Write;
-        if let Some(ref mut stdin) = child.stdin {
-            let _ = stdin.write_all(body.csv.as_bytes());
-        }
-        drop(child.stdin.take());
-        child.wait_with_output()
-    });
-
-    match result {
+    match state.services.web_actions.csv_import(&body.csv).await {
         Ok(output) => {
             broadcast_captured_web_output(
                 &state.push_server,
                 &output.stdout,
-                super::non_external_console_target(),
+                crate::native::non_external_console_target(),
             );
             broadcast_captured_web_output(
                 &state.push_server,
                 &output.stderr,
-                super::non_external_console_target(),
+                crate::native::non_external_console_target(),
             );
-            if output.status.success() {
+            if output.success {
                 match with_database_mut(|db| db.refresh()) {
                     Ok(()) => {
                         state.push_server.broadcast_event("table.reload", "");
@@ -1736,11 +1856,11 @@ pub async fn api_csv_import(
 }
 
 // GET /api/csv/download
-pub async fn api_csv_download(State(_state): State<AppState>) -> axum::response::Response {
+pub async fn api_csv_download(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
 
-    let output = match run_immediate(csv_download_args()).await {
+    let output = match state.services.web_actions.csv_download().await {
         Ok(output) => output,
         Err(e) => {
             log_web_failure("csv download", &e);
@@ -1752,7 +1872,7 @@ pub async fn api_csv_download(State(_state): State<AppState>) -> axum::response:
         }
     };
 
-    if !output.status.success() {
+    if !output.success {
         log_immediate_command_failure("csv download", &output);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1775,13 +1895,15 @@ pub async fn api_csv_download(State(_state): State<AppState>) -> axum::response:
         .into_response()
 }
 
-// POST /api/queue/cancel — cancel all: kill running + clear pending
+// POST /api/queue/cancel — clear waiting work before stopping running work.
 pub async fn queue_cancel(State(state): State<AppState>) -> Json<ApiResponse> {
-    // Kill running subprocess if any
+    // Do not let a worker take the next waiting job as its current child exits.
+    if let Err(error) = state.queue.clear_pending() {
+        return Json(ApiResponse { success: false, message: error.to_string() });
+    }
     kill_running_child(&state);
-
-    // Clear pending tasks from queue
-    let _ = state.queue.clear_pending();
+    state.restore_prompt_pending.store(state.queue.restore_prompt_pending(), Ordering::Relaxed);
+    state.restorable_tasks_available.store(state.queue.has_restorable_tasks(), Ordering::Relaxed);
 
     state.push_server.broadcast_event("notification.queue", "");
     Json(ApiResponse {
@@ -1843,13 +1965,13 @@ pub async fn get_pending_tasks(State(state): State<AppState>) -> Json<serde_json
     let pending_json: Vec<serde_json::Value> = pending
         .iter()
         .map(|j| {
-            serde_json::json!({
-                "id": j.id,
-                "type": queue_display_type(state.queue.as_ref(), j),
-                "target": j.target,
-                "display_target": queue_display_target(state.queue.as_ref(), j),
-                "created_at": j.created_at,
-            })
+            queue_view::queue_job_payload(
+                &j.id,
+                &queue_display_type(state.queue.as_ref(), j),
+                &j.target,
+                &queue_display_target(state.queue.as_ref(), j),
+                Some(j.created_at),
+            )
         })
         .collect();
 
@@ -1858,13 +1980,13 @@ pub async fn get_pending_tasks(State(state): State<AppState>) -> Json<serde_json
     let running_json: Vec<serde_json::Value> = running
         .iter()
         .map(|job| {
-            serde_json::json!({
-                "id": job.id,
-                "type": queue_display_type(state.queue.as_ref(), job),
-                "target": job.target,
-                "display_target": queue_display_target(state.queue.as_ref(), job),
-                "created_at": job.created_at,
-            })
+            queue_view::queue_job_payload(
+                &job.id,
+                &queue_display_type(state.queue.as_ref(), job),
+                &job.target,
+                &queue_display_target(state.queue.as_ref(), job),
+                Some(job.created_at),
+            )
         })
         .collect();
 
@@ -1991,35 +2113,31 @@ pub async fn api_update_by_tag(
     // Snapshot current matching novel IDs before queuing, then run through the
     // same update worker path used by normal selected-ID updates.
     let server_sort_state = current_web_update_sort_state();
-    let snapshot_ids = with_database(|db| {
-        let all = db.all_records();
-        let mut matching: Vec<&crate::db::NovelRecord> = Vec::new();
-
-        for (_id, record) in all {
-            let record_tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
-            let mut include = false;
-            let mut exclude = false;
-
-            for tag in &tags {
-                if record_tags.contains(&tag.as_str()) {
-                    include = true;
-                }
-            }
-            for tag in &exclusion_tags {
-                if record_tags.contains(&tag.as_str()) {
-                    exclude = true;
-                }
-            }
-
-            // Include if matches any inclusion tag and no exclusion tag
-            if (tags.is_empty() || include) && !exclude {
-                matching.push(record);
-            }
-        }
+    let mut records = match state.services.library.records().await {
+        Ok(records) => records,
+        Err(error) => return serde_json::json!({ "success": false, "message": error.to_string() }).into(),
+    };
+    crate::application::attribute_tags::project(
+        &mut records,
+        crate::application::attribute_tags::enabled(&state.services.settings).await,
+    );
+    let snapshot_ids: Vec<i64> = {
+        let mut matching = records
+            .into_iter()
+            .filter(|record| !crate::virtual_novel::is_virtual_record(record))
+            .filter(|record| {
+                let include = tags
+                    .iter()
+                    .any(|tag| record.tags.iter().any(|value| value == tag));
+                let exclude = exclusion_tags
+                    .iter()
+                    .any(|tag| record.tags.iter().any(|value| value == tag));
+                (tags.is_empty() || include) && !exclude
+            })
+            .collect::<Vec<_>>();
         sort_records_for_web_update(&mut matching, &server_sort_state);
-        Ok(matching.into_iter().map(|r| r.id).collect::<Vec<i64>>())
-    })
-    .unwrap_or_default();
+        matching.into_iter().map(|record| record.id).collect()
+    };
 
     let count = snapshot_ids.len();
     if snapshot_ids.is_empty() {
@@ -2065,7 +2183,7 @@ pub async fn api_update_by_tag(
 
 // POST /api/taginfo.json — return tag information for update-by-tag dialog
 pub async fn api_taginfo(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<TagInfoBody>,
 ) -> Json<serde_json::Value> {
     let with_exclusion = body.with_exclusion.unwrap_or(false);
@@ -2078,66 +2196,34 @@ pub async fn api_taginfo(
             _ => None,
         })
         .collect();
-    let selected_ids = sort_ids_for_request(&selected_ids, body.sort_state.as_ref(), body.timestamp);
+    let mut records = match state.services.library.records().await {
+        Ok(records) => records,
+        Err(error) => return serde_json::json!({ "success": false, "message": error.to_string() }).into(),
+    };
+    crate::application::attribute_tags::project(
+        &mut records,
+        crate::application::attribute_tags::enabled(&state.services.settings).await,
+    );
+    let selected_ids = sort_ids_from_records(
+        &selected_ids,
+        &records,
+        body.sort_state.as_ref(),
+        body.timestamp,
+    );
+    let new_tag_color = super::configured_tag_color(&state).await;
+    let tag_colors = state
+        .services
+        .tag_colors
+        .for_tags(tag_views::tag_names(&records), new_tag_color.as_deref())
+        .await
+        .unwrap_or_default();
 
-    let new_tag_color = crate::tag_colors::configured_new_tag_color();
-    let tag_info = with_database(|db| {
-        let tag_index = db.tag_index();
-        let inventory = db.inventory();
-        let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
-        let tag_names = tag_index.keys().map(String::as_str);
-        if crate::tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            tag_names,
-            new_tag_color.as_deref(),
-        ) {
-            crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
-        }
-        let tag_colors = tag_colors.into_map();
-
-        let mut selected_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for id in selected_ids.iter().copied() {
-            let Some(record) = db.get(id) else {
-                continue;
-            };
-            for tag in &record.tags {
-                *selected_counts.entry(tag.clone()).or_insert(0) += 1;
-            }
-        }
-
-        let mut sorted_tags: Vec<(&String, &Vec<i64>)> = tag_index.iter().collect();
-        sorted_tags.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut result: Vec<serde_json::Value> = Vec::with_capacity(sorted_tags.len());
-        for (tag, ids) in sorted_tags {
-            let color = tag_colors.get(tag).map(|c| c.as_str()).unwrap_or("");
-            let class = tag_color_class(color);
-            let escaped_tag = html_escape(tag);
-            let html = format!(
-                "<span class=\"tag-label {}\">{}</span>",
-                class, escaped_tag
-            );
-            let mut entry = serde_json::json!({
-                "tag": tag,
-                "count": selected_counts.get(tag.as_str()).copied().unwrap_or(0),
-                "total_count": ids.len(),
-                "html": html,
-            });
-            if with_exclusion {
-                let exc_html = format!(
-                    "<span class=\"tag-label {} tag-exclusion\">{}</span>",
-                    class, escaped_tag
-                );
-                entry["exclusion_html"] = serde_json::json!(exc_html);
-            }
-            result.push(entry);
-        }
-        Ok(result)
-    })
-    .unwrap_or_default();
-
-    Json(serde_json::json!(tag_info))
+    Json(serde_json::json!(tag_views::taginfo_entries(
+        &records,
+        &selected_ids,
+        with_exclusion,
+        &tag_colors,
+    )))
 }
 
 // POST /api/restore_pending_tasks
@@ -2282,24 +2368,27 @@ pub async fn api_reboot(
     State(state): State<AppState>,
     Json(_body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                message: e.to_string(),
-            });
+    match schedule_server_reboot(state.clone()).await {
+        Ok(()) => {
+            state.push_server.broadcast_event("reboot", "");
+            Json(ApiResponse {
+                success: true,
+                message: "Rebooting".to_string(),
+            })
         }
-    };
-    let current_dir = match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                message: e.to_string(),
-            });
-        }
-    };
+        Err(message) => Json(ApiResponse {
+            success: false,
+            message,
+        }),
+    }
+}
+
+/// Spawns a replacement server process with the same CLI args, then exits this
+/// process after the new one is running. Used by `POST /api/reboot` and by
+/// `POST /api/storage/mode` (backend switch requires a restart).
+pub async fn schedule_server_reboot(state: AppState) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let current_dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let hide_console = crate::compat::inherited_hide_console_requested();
     let args = reboot_args_with_no_browser(std::env::args().skip(1).collect(), hide_console);
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2323,21 +2412,8 @@ pub async fn api_reboot(
         }
     });
     match rx.await {
-        Ok(Ok(())) => {
-            state.push_server.broadcast_event("reboot", "");
-            Json(ApiResponse {
-                success: true,
-                message: "Rebooting".to_string(),
-            })
-        }
-        Ok(Err(message)) => Json(ApiResponse {
-            success: false,
-            message,
-        }),
-        Err(_) => Json(ApiResponse {
-            success: false,
-            message: "failed to schedule reboot".to_string(),
-        }),
+        Ok(result) => result,
+        Err(_) => Err("failed to schedule reboot".to_string()),
     }
 }
 
@@ -2351,7 +2427,9 @@ fn reboot_args_with_no_browser(mut args: Vec<String>, hide_console: bool) -> Vec
     args
 }
 
-/// Ruby parity: build sort display string like "タイトル昇順" or "ID順"
+/// Ruby parity: build sort display string like "タイトル昇順" or "ID順".
+/// 文言組み立て自体は Worker でも使う共有実装 (`application::webui::
+/// sort_display_label`) に寄せる — 両環境の更新開始案内が同じ表示名になる。
 fn current_sort_display_string() -> String {
     let sort_state = (|| {
         let inv = crate::db::inventory::Inventory::with_default_root().ok()?;
@@ -2364,34 +2442,18 @@ fn current_sort_display_string() -> String {
         current_sort_from_server_setting(&server_setting)
     })();
 
-    match sort_state {
-        Some(sort_state) => {
-            let label = sort_column_label(&sort_state).unwrap_or("不明");
-            let dir_label = if sort_state.dir == "desc" {
-                "降順"
-            } else {
-                "昇順"
-            };
-            format!("{}{}", label, dir_label)
-        }
-        None => "ID順".to_string(),
-    }
+    sort_display_label(sort_state.as_ref())
 }
 
 fn requested_sort_display_string(
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
 ) -> String {
+    // `request_sort_state` は常に None (サーバー保存のソートが真実源) なので、
+    // 実質 `current_sort_display_string` に委譲する。Some が返る経路ができても
+    // native と同じく保存済み表示名へ倒す。
     match request_sort_state(sort_state, timestamp) {
-        Some(sort_state) => {
-            let label = sort_column_label(&sort_state).unwrap_or("不明");
-            let dir_label = if sort_state.dir == "desc" {
-                "降順"
-            } else {
-                "昇順"
-            };
-            format!("{}{}", label, dir_label)
-        }
+        Some(sort_state) => sort_display_label(Some(&sort_state)),
         None => current_sort_display_string(),
     }
 }
@@ -2399,8 +2461,11 @@ fn requested_sort_display_string(
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex;
+    use std::collections::HashSet;
     use std::sync::Arc;
+    use std::time::Duration;
 
+    use axum::extract::State;
     use chrono::{TimeZone, Utc};
     use serde_yaml::{Mapping, Value};
     use crate::db::NovelRecord;
@@ -2408,14 +2473,14 @@ mod tests {
     use crate::web::sort_state::CurrentSortState;
 
     use super::{
-        broadcast_captured_web_output, build_update_by_tag_queue_payload,
+        build_update_by_tag_queue_payload,
         build_update_general_lastup_meta, build_update_start_message_meta,
-        build_webui_update_start_message, encode_convert_job_target, existing_update_job_id,
-        csv_download_args, format_general_lastup_queue_target, format_queue_job_type,
+        build_webui_update_start_message, cancelled_novel_ids, encode_convert_job_target,
+        existing_update_job_id, format_queue_job_type,
         format_update_queue_target, normalize_update_targets, push_update_job_if_needed,
-        push_update_job_with_legacy_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
-        restorable_tasks_available,
-        sort_records_for_web_update, tag_color_class, validate_diff_number,
+        push_update_job_with_legacy_if_needed, queue_lane_sizes, queue_status, reboot_args_with_no_browser,
+        release_novel_locks,
+        sort_records_for_web_update, validate_diff_number,
         validate_download_targets, validate_general_lastup_option, web_update_sort_key_for_cli,
     };
 
@@ -2445,8 +2510,22 @@ mod tests {
             is_narou: true,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
+    }
+
+    #[test]
+    fn update_all_keeps_real_members_but_excludes_virtual_parents() {
+        let mut member = sample_record(1, 0);
+        member.tags.push("vs_2".into());
+        let mut parent = sample_record(2, 0);
+        parent.ncode = Some("vs_2".into());
+        let mut ordinary = sample_record(3, 0);
+        ordinary.ncode = Some("vs_not_numeric".into());
+        let ids = super::sorted_update_all_ids(vec![member, parent, ordinary]);
+        assert_eq!(ids.into_iter().collect::<HashSet<_>>(), HashSet::from(["1".into(), "3".into()]));
     }
 
     #[test]
@@ -2462,10 +2541,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn csv_download_uses_cli_csv_command() {
-        assert_eq!(csv_download_args(), vec!["csv".to_string()]);
-    }
 
     #[test]
     fn push_update_job_if_needed_reuses_pending_update_job() {
@@ -2565,7 +2640,7 @@ mod tests {
             column: 2,
             dir: "desc".to_string(),
         };
-        let mut records = vec![&first, &second, &third];
+        let mut records = vec![first.clone(), second.clone(), third.clone()];
 
         sort_records_for_web_update(&mut records, &sort_state);
 
@@ -2644,11 +2719,22 @@ mod tests {
     #[test]
     fn validate_download_targets_rejects_flag_like_values() {
         assert!(
-            validate_download_targets(&["1".to_string(), "https://example.com".to_string()])
+            validate_download_targets(
+                &["1".to_string(), "https://example.com".to_string()],
+                crate::web::MAX_WEB_TARGETS_PER_REQUEST,
+            )
                 .is_ok()
         );
-        assert!(validate_download_targets(&["--remove".to_string()]).is_err());
-        assert!(validate_download_targets(&["1\t2".to_string()]).is_err());
+        assert!(validate_download_targets(
+            &["--remove".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
+        assert!(validate_download_targets(
+            &["1\t2".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
     }
 
     #[test]
@@ -2673,22 +2759,6 @@ mod tests {
     }
 
     #[test]
-    fn general_lastup_queue_target_uses_human_readable_labels() {
-        assert_eq!(
-            format_general_lastup_queue_target(&["narou".to_string()]),
-            "なろうAPIで最新話掲載日を確認"
-        );
-        assert_eq!(
-            format_general_lastup_queue_target(&["other".to_string()]),
-            "その他サイトの最新話掲載日を確認"
-        );
-        assert_eq!(
-            format_general_lastup_queue_target(&[]),
-            "最新話掲載日を確認"
-        );
-    }
-
-    #[test]
     fn update_queue_target_prefers_webui_start_message() {
         let meta = build_update_start_message_meta(
             "全ての小説の更新を開始します（3件をID順で処理）".to_string(),
@@ -2699,29 +2769,6 @@ mod tests {
                 Some(&meta)
             ),
             "全ての小説の更新を開始します（3件をID順で処理）"
-        );
-    }
-
-    #[test]
-    fn update_queue_target_describes_tag_and_force_jobs() {
-        assert_eq!(
-            format_update_queue_target(&["tag:modified".to_string()], None),
-            "タグ「modified」の小説を更新"
-        );
-        assert_eq!(
-            format_update_queue_target(
-                &[
-                    "--sort-by".to_string(),
-                    "general_lastup".to_string(),
-                    "tag:modified".to_string(),
-                ],
-                None
-            ),
-            "タグ「modified」の小説を更新"
-        );
-        assert_eq!(
-            format_update_queue_target(&["--force".to_string(), "tag:modified".to_string()], None),
-            "タグ「modified」の小説を凍結済みも含めて更新"
         );
     }
 
@@ -2752,13 +2799,6 @@ mod tests {
             meta.get(Value::String("snapshot_count".to_string())),
             Some(&Value::Number(serde_yaml::Number::from(2)))
         );
-    }
-
-    #[test]
-    fn tag_color_class_uses_existing_webui_tag_classes() {
-        assert_eq!(tag_color_class("green"), "tag-green");
-        assert_eq!(tag_color_class("yellow"), "tag-yellow");
-        assert_eq!(tag_color_class("unknown"), "tag-default");
     }
 
     #[test]
@@ -2825,62 +2865,46 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_captured_web_output_wraps_plain_text_as_echo() {
-        let push_server = Arc::new(crate::web::push::PushServer::new());
-        let mut receiver = push_server.channel().subscribe();
-
-        broadcast_captured_web_output(&push_server, b"hello\n", "stdout2");
-
-        let message = receiver.try_recv().unwrap();
-        let value: serde_json::Value = serde_json::from_str(&message).unwrap();
-        assert_eq!(value["type"], "echo");
-        assert_eq!(value["body"], "hello");
-        assert_eq!(value["target_console"], "stdout2");
-    }
-
-    #[test]
-    fn broadcast_captured_web_output_retargets_structured_messages() {
-        let push_server = Arc::new(crate::web::push::PushServer::new());
-        let mut receiver = push_server.channel().subscribe();
-        let line = format!(
-            "{}{}",
-            crate::progress::WS_LINE_PREFIX,
-            serde_json::json!({
-                "type": "progressbar.step",
-                "data": { "topic": "download", "current": 1, "total": 2, "percent": 50.0 }
-            })
-        );
-
-        broadcast_captured_web_output(&push_server, line.as_bytes(), "stdout2");
-
-        let message = receiver.try_recv().unwrap();
-        let value: serde_json::Value = serde_json::from_str(&message).unwrap();
-        assert_eq!(value["type"], "progressbar.step");
-        assert_eq!(value["target_console"], "stdout2");
-        assert_eq!(value["data"]["topic"], "download");
-    }
-
-    #[test]
     fn normalize_update_targets_converts_tag_flag() {
         let normalized =
-            normalize_update_targets(&["--tag".to_string(), "modified".to_string()]).unwrap();
+            normalize_update_targets(
+                &["--tag".to_string(), "modified".to_string()],
+                crate::web::MAX_WEB_TARGETS_PER_REQUEST,
+            )
+            .unwrap();
         assert_eq!(normalized, vec!["tag:modified"]);
     }
 
     #[test]
     fn normalize_update_targets_rejects_missing_tag_name() {
-        assert!(normalize_update_targets(&["--tag".to_string()]).is_err());
-        assert!(normalize_update_targets(&["--tag".to_string(), "--gl".to_string()]).is_err());
+        assert!(normalize_update_targets(
+            &["--tag".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
+        assert!(normalize_update_targets(
+            &["--tag".to_string(), "--gl".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
     }
 
     #[test]
     fn normalize_update_targets_rejects_unexpected_flags() {
-        assert!(normalize_update_targets(&["--remove".to_string()]).is_err());
-        assert!(normalize_update_targets(&["bad\ttarget".to_string()]).is_err());
+        assert!(normalize_update_targets(
+            &["--remove".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
+        assert!(normalize_update_targets(
+            &["bad\ttarget".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
     }
 
-    #[test]
-    fn restorable_tasks_follow_explicit_availability_flag() {
+    #[tokio::test]
+    async fn queue_summary_reports_restore_prompt_without_fetching_job_details() {
         let temp = tempfile::tempdir().unwrap();
         let queue_path = temp.path().join("queue.yaml");
         std::fs::write(
@@ -2893,23 +2917,117 @@ mod tests {
             port: 0,
             ws_port: 0,
             push_server: Arc::new(crate::web::push::PushServer::new()),
-            basic_auth_header: None,
+            services: crate::web::default_app_services(Arc::new(
+                crate::platform::mocks::MemoryNovelRepository::new(),
+            )),
+            server_security: crate::web::test_server_security(
+                None,
+                vec!["localhost".to_string()],
+                false,
+            ),
+            bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: vec!["localhost".to_string()],
-            reverse_proxy_mode: false,
+            ui_token: "ui-token".to_string(),
+            ui_bootstrap_ticket: "bootstrap-ticket".to_string(),
+            ui_bootstrap_hosts: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             queue,
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            library_backup: Arc::new(crate::web::library_backup::LibraryBackupState::new()),
             running_jobs: Arc::new(Mutex::new(Vec::new())),
             running_child_pids: Arc::new(Mutex::new(std::collections::HashMap::new())),
             cancelled_job_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             auto_update_scheduler: Arc::new(Mutex::new(None)),
         };
 
-        assert!(restorable_tasks_available(&state));
+        let summary = queue_status(State(state.clone())).await.0;
+        assert_eq!(summary["restore_prompt_pending"], true);
+        assert_eq!(summary["restorable_tasks_available"], true);
         state
             .restorable_tasks_available
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        assert!(!restorable_tasks_available(&state));
+        let summary = queue_status(State(state)).await.0;
+        assert_eq!(summary["restorable_tasks_available"], false);
+    }
+
+    fn seed_lock_file(dir: &std::path::Path, ids: &[i64]) {
+        std::fs::create_dir_all(dir.join(".narou")).unwrap();
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.9f %:z");
+        let content = ids
+            .iter()
+            .map(|id| format!("{id}: {now}\n"))
+            .collect::<String>();
+        std::fs::write(dir.join(".narou").join("lock.yaml"), content).unwrap();
+    }
+
+    fn sample_queue_job(id: &str, job_type: JobType, target: &str) -> QueueJob {
+        QueueJob {
+            id: id.to_string(),
+            job_type,
+            target: target.to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+            available_at: None,
+        }
+    }
+
+    /// 中断した子プロセスの `NovelLockGuard::drop` は走らないため、その小説は
+    /// `lock.yaml` のエントリが消えるまで 30 分間延期され続ける。解放は対象 ID
+    /// だけを消し、他の小説のロックは残す (二重解放でも冪等)。
+    #[test]
+    fn release_novel_locks_removes_only_cancelled_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+        seed_lock_file(temp.path(), &[12, 99]);
+        let lock_path = temp.path().join(".narou").join("lock.yaml");
+
+        release_novel_locks(&HashSet::from([12]));
+        // 子の後始末と競合しても、同じ ID の二重解放で他のロックを失わない。
+        release_novel_locks(&HashSet::from([12]));
+
+        let locked: std::collections::HashMap<i64, Value> =
+            serde_yaml::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+        assert_eq!(
+            locked.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([99])
+        );
+    }
+
+    /// 解放した小説は `worker::pop_next_job` の延期条件
+    /// (`load_active_locked_ids`) に現れなくなる。
+    #[test]
+    fn released_novel_is_no_longer_treated_as_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+        seed_lock_file(temp.path(), &[12, 99]);
+
+        release_novel_locks(&HashSet::from([12]));
+
+        let active = crate::compat::load_active_locked_ids(Duration::from_secs(30 * 60)).unwrap();
+        assert!(!active.contains(&12), "解放した小説は延期対象から外れる");
+        assert!(active.contains(&99), "他の小説のロックは残す");
+    }
+
+    #[test]
+    fn cancelled_novel_ids_reads_targets_of_cancelled_running_jobs() {
+        let running_jobs = Mutex::new(vec![
+            sample_queue_job("job-1", JobType::Download, "--force\t12"),
+            sample_queue_job("job-2", JobType::Update, "--force\t12\t99"),
+            sample_queue_job("job-3", JobType::Download, "42"),
+        ]);
+
+        assert_eq!(
+            cancelled_novel_ids(&running_jobs, &["job-1".to_string()]),
+            HashSet::from([12])
+        );
+        assert_eq!(
+            cancelled_novel_ids(
+                &running_jobs,
+                &["job-1".to_string(), "job-2".to_string()]
+            ),
+            HashSet::from([12, 99])
+        );
+        assert!(cancelled_novel_ids(&running_jobs, &["missing".to_string()]).is_empty());
     }
 }

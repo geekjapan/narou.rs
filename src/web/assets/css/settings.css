@@ -96,6 +96,16 @@
   background: var(--danger-bg, #f2dede);
 }
 
+.list-group-item.setting-worker-ineffective {
+  opacity: 0.6;
+}
+
+.list-group-item.setting-worker-ineffective input,
+.list-group-item.setting-worker-ineffective select,
+.list-group-item.setting-worker-ineffective label {
+  cursor: not-allowed;
+}
+
 .list-group-item-heading {
   font-size: 0.9375rem;
   font-weight: 600;
@@ -108,59 +118,8 @@
   font-size: 0.875rem;
 }
 
-/* Boolean toggle (checkbox style matching narou.rb switch-light) */
-.switch-light {
-  display: inline-flex;
-  align-items: center;
-  cursor: pointer;
-  user-select: none;
-  gap: 0.5rem;
-}
 
-.switch-light input[type="checkbox"] {
-  display: none;
-}
-
-.switch-track {
-  position: relative;
-  width: 3.5rem;
-  height: 1.75rem;
-  background: var(--switch-off-bg, #ccc);
-  border: 0.0625rem solid var(--border-color, #ddd);
-  box-sizing: border-box;
-  border-radius: 1rem;
-  transition: background 0.20s, border-color 0.20s, box-shadow 0.20s;
-  flex-shrink: 0;
-}
-
-.switch-track::after {
-  content: '';
-  position: absolute;
-  top: 0.125rem;
-  left: 0.125rem;
-  width: 1.5rem;
-  height: 1.5rem;
-  background: var(--body-bg, #fff);
-  border-radius: 50%;
-  transition: transform 0.20s;
-}
-
-.switch-light input:checked + .switch-track {
-  background: var(--btn-primary-border, #2e6da4);
-  border-color: var(--btn-primary-border, #2e6da4);
-  box-shadow: inset 0 0 0 0.0625rem var(--btn-primary-bg, #337ab7);
-}
-
-.switch-light input:checked + .switch-track::after {
-  transform: translateX(1.75rem);
-}
-
-.switch-label-text {
-  font-size: 0.875rem;
-  color: var(--text-muted, #777);
-}
-
-/* Three-way toggle for default.* / force.* booleans */
+/* Three-way toggle keeps native radio keyboard and accessibility behavior. */
 .switch-3way {
   display: inline-flex;
   align-items: center;
@@ -172,7 +131,11 @@
 }
 
 .switch-3way input[type="radio"] {
-  display: none;
+  position: absolute;
+  width: var(--settings-hidden-control-size);
+  height: var(--settings-hidden-control-size);
+  clip-path: inset(var(--settings-hidden-control-clip));
+  overflow: hidden;
 }
 
 .switch-3way label {
@@ -192,6 +155,11 @@
 .switch-3way input:checked + label {
   background: var(--primary-color, #337ab7);
   color: var(--btn-text, #fff);
+}
+
+.switch-3way input:focus-visible + label {
+  outline: var(--control-focus-width) solid var(--text-color);
+  outline-offset: calc(-1 * var(--control-focus-width));
 }
 
 /* Select / input fields */
@@ -348,4 +316,198 @@
     padding: 0.25rem 0.5rem;
     font-size: 0.8125rem;
   }
+}
+
+/* Login tab */
+.login-hosts {
+  margin: 0.375rem 0;
+}
+
+.login-site {
+  border: 0.0625rem solid var(--border-color, #ddd);
+  border-radius: var(--border-radius, 0.25em);
+  margin-bottom: 0.5rem;
+}
+
+.login-site-head {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.375rem 0.625rem;
+  border-bottom: 0.0625rem solid var(--border-color, #ddd);
+  background: var(--well-bg, #f5f5f5);
+}
+
+.login-site-name {
+  font-weight: bold;
+}
+
+.login-site-state {
+  flex: 1;
+  font-size: 0.8125rem;
+  color: var(--text-muted, #777);
+}
+
+.login-cred-row {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.375rem 0.625rem;
+  border-bottom: 0.0625rem solid var(--border-color, #eee);
+}
+
+.login-cred-row:last-child {
+  border-bottom: none;
+}
+
+.login-cred-index {
+  min-width: 1.5rem;
+  text-align: right;
+  color: var(--text-muted, #777);
+}
+
+.login-cred-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.login-cred-label {
+  font-weight: bold;
+}
+
+.login-cred-names {
+  font-weight: normal;
+  font-size: 0.8125rem;
+  color: var(--text-muted, #777);
+}
+
+.login-cred-cookies {
+  color: var(--text-muted, #777);
+  font-family: monospace;
+  font-size: 0.8125rem;
+  word-break: break-all;
+}
+
+.login-cred-added {
+  font-size: 0.75rem;
+  color: var(--text-muted, #777);
+}
+
+.login-cred-hosts {
+  margin-top: 0.25rem;
+}
+
+.login-cred-host {
+  font-size: 0.8125rem;
+  color: var(--text-color, #333);
+  word-break: break-all;
+}
+
+.login-cred-host + .login-cred-host {
+  margin-top: 0.25rem;
+}
+
+.login-cred-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.login-cred-up,
+.login-cred-down {
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0.125rem;
+  color: var(--text-color, #333);
+}
+
+.login-cred-up:hover,
+.login-cred-down:hover {
+  opacity: 0.70;
+}
+
+.login-cred-up:disabled,
+.login-cred-down:disabled {
+  opacity: 0.30;
+  cursor: default;
+}
+
+.login-cred-up .material-symbols-outlined,
+.login-cred-down .material-symbols-outlined {
+  font-size: 1em;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.login-form .setting-input {
+  max-width: 32rem;
+}
+
+.login-replace {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.875rem;
+  color: var(--text-color, #333);
+}
+
+.login-envelope {
+  min-height: 8rem;
+}
+
+.login-envelope-file {
+  font-size: 0.875rem;
+  color: var(--text-color, #333);
+  max-width: 32rem;
+}
+
+.login-file-name {
+  font-size: 0.8125rem;
+  color: var(--text-muted, #777);
+}
+
+/* データ管理方式 (設定 → WEB UI) */
+.storage-mode-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  margin-top: 0.5em;
+}
+
+.storage-mode-current {
+  margin: 0.25em 0;
+}
+
+.storage-mode-paths {
+  word-break: break-all;
+}
+
+.author-form {
+  display: grid;
+  gap: var(--container-padding);
+}
+
+.author-actions, .author-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--container-padding);
+}
+
+.author-row {
+  justify-content: space-between;
+}
+
+.author-url {
+  overflow-wrap: anywhere;
+}
+
+.author-error {
+  color: var(--danger-color);
 }

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parking_lot::Mutex;
@@ -44,6 +43,47 @@ pub fn safe_stderr_println(line: &str) {
     let _ = writeln!(stderr, "{line}");
 }
 
+/// Console-backed [`MessageSink`](crate::application::messages::MessageSink) — the default sink for native execution.
+///
+/// Line output (`emit`) takes [`STDOUT_LOCK`] so parallel workers don't
+/// interleave bytes mid-line, then goes through the logger (`println!` /
+/// `eprintln!` override) so messages also land in the log file exactly like
+/// the pre-sink call sites did. `emit_fragment` is the `print!` equivalent
+/// (interactive prompts) and writes without the trailing newline.
+pub struct ConsoleSink;
+
+impl crate::application::messages::MessageSink for ConsoleSink {
+    fn emit(&self, stream: crate::application::messages::Stream, text: &str) {
+        use crate::application::messages::Stream;
+        let _guard = STDOUT_LOCK.lock();
+        match stream {
+            Stream::Stdout => crate::logger::emit_stdout(text, true),
+            Stream::Stderr => crate::logger::emit_stderr(text, true),
+        }
+    }
+
+    fn emit_fragment(&self, stream: crate::application::messages::Stream, text: &str) {
+        use crate::application::messages::Stream;
+        let _guard = STDOUT_LOCK.lock();
+        match stream {
+            Stream::Stdout => crate::logger::emit_stdout(text, false),
+            Stream::Stderr => crate::logger::emit_stderr(text, false),
+        }
+    }
+}
+
+/// `Arc<dyn MessageSink>` で CLI コマンドへ渡す共有コンソール sink を作る。
+///
+/// native の送出先はこれ 1 本で、`Downloader` の report 行 (話ごとの進捗や
+/// 「小説が削除されているか非公開な可能性があります」) も必ずこれを使う。
+/// narou.rb は `$stdout` への write をすべてログにも追記する
+/// (`lib/narou_logger.rb` の `append_log`) ため、logger を迂回する sink を
+/// 併用すると「コンソールには出るがログに残らない行」ができてしまう。
+/// `safe_println` 直結の sink が存在した時期にそれが起きている (issue #36)。
+pub fn console_sink() -> Arc<dyn crate::application::messages::MessageSink> {
+    Arc::new(ConsoleSink)
+}
+
 /// Check if running under the web server (subprocess mode)
 pub fn is_web_mode() -> bool {
     std::env::var("NAROU_RS_WEB_MODE").is_ok()
@@ -69,27 +109,12 @@ pub fn emit_novel_refresh(id: i64) {
     emit_web_event("novel.refresh", serde_json::json!({ "id": id }));
 }
 
-pub trait ProgressReporter: Send + Sync {
-    fn set_length(&self, len: u64);
-    fn set_position(&self, pos: u64);
-    fn inc(&self, delta: u64);
-    fn set_message(&self, msg: &str);
-    fn finish_with_message(&self, msg: &str);
-    fn println(&self, msg: &str);
-}
+/// Portable progress sink used by the shared downloader/converter core.
+/// Implementations live in this native module (terminal bars, WebSocket
+/// events); the trait itself is defined in `platform::progress` so core
+/// modules never depend on this native-only module.
+pub use crate::platform::ProgressReporter;
 
-pub struct NoProgress;
-
-impl ProgressReporter for NoProgress {
-    fn set_length(&self, _len: u64) {}
-    fn set_position(&self, _pos: u64) {}
-    fn inc(&self, _delta: u64) {}
-    fn set_message(&self, _msg: &str) {}
-    fn finish_with_message(&self, _msg: &str) {}
-    fn println(&self, msg: &str) {
-        eprintln!("{}", msg);
-    }
-}
 
 pub struct CliProgress {
     pb: ProgressBar,
@@ -186,6 +211,16 @@ impl ProgressReporter for CliProgress {
             self.pb.println(msg);
         }
     }
+
+    fn with_suspended(&self, action: &mut dyn FnMut()) {
+        // ダイジェスト選択ダイアログ等の表示中はスピナーがプロンプトを
+        // 上書きしないよう、indicatif の suspend でバー描画を止める。
+        if let Some(ref multi) = self.multi {
+            multi.suspend(action);
+        } else {
+            self.pb.suspend(action);
+        }
+    }
 }
 
 impl Drop for CliProgress {
@@ -194,91 +229,74 @@ impl Drop for CliProgress {
     }
 }
 
-/// Progress reporter for web mode — outputs structured lines to stdout
-/// that the web worker intercepts and converts to WebSocket events.
+/// Native stdout transport for the shared Web progress lifecycle.
 pub struct WebProgress {
-    topic: String,
-    scope: String,
-    length: AtomicU64,
-    position: AtomicU64,
+    state: crate::platform::progress::ProgressState,
 }
+
+static PROCESS_INSTANCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    hex::encode(crate::login::crypto::random_bytes::<16>().expect("progress instance entropy"))
+});
 
 impl WebProgress {
     pub fn new(topic: &str) -> Self {
-        let wp = Self {
-            topic: topic.to_string(),
-            scope: current_web_progress_scope(topic),
-            length: AtomicU64::new(0),
-            position: AtomicU64::new(0),
+        let progress = Self {
+            state: crate::platform::progress::ProgressState::new(
+                topic, &current_web_progress_scope(topic), &*PROCESS_INSTANCE,
+            ),
         };
-        wp.send(
-            "progressbar.init",
-            serde_json::json!({ "topic": topic, "scope": wp.scope }),
-        );
-        wp
+        progress.state.init(|phase, identity, snapshot| {
+            progress.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
+        progress
     }
 
-    fn send(&self, event_type: &str, data: serde_json::Value) {
-        let msg = serde_json::json!({ "type": event_type, "data": data });
-        println!("{}{}", WS_LINE_PREFIX, msg);
-    }
-
-    fn emit_step(&self) {
-        let len = self.length.load(Ordering::Relaxed);
-        let pos = self.position.load(Ordering::Relaxed);
-        if len > 0 {
-            let percent = (pos as f64 / len as f64) * 100.0;
-            self.send(
-                "progressbar.step",
-                serde_json::json!({
-                    "current": pos,
-                    "total": len,
-                    "percent": percent,
-                    "topic": self.topic,
-                    "scope": self.scope
-                }),
-            );
-        }
+    fn send(&self, event: serde_json::Value) {
+        use crate::application::messages::{MessageSink, Stream};
+        ConsoleSink.emit(Stream::Stdout, &format!("{WS_LINE_PREFIX}{event}"));
     }
 }
 
 impl ProgressReporter for WebProgress {
     fn set_length(&self, len: u64) {
-        self.length.store(len, Ordering::Relaxed);
+        self.state.set_length(len, |phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn set_position(&self, pos: u64) {
-        self.position.store(pos, Ordering::Relaxed);
-        self.emit_step();
+        self.state.set_position(pos, |phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn inc(&self, delta: u64) {
-        self.position.fetch_add(delta, Ordering::Relaxed);
-        self.emit_step();
+        self.state.inc(delta, |phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
-    fn set_message(&self, _msg: &str) {
-        // Web mode doesn't display message updates (progress bar only)
+    fn set_message(&self, msg: &str) {
+        self.state.set_message(msg, |phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn finish_with_message(&self, _msg: &str) {
-        self.send(
-            "progressbar.clear",
-            serde_json::json!({ "topic": self.topic, "scope": self.scope }),
-        );
+        self.state.finish(|phase, identity, snapshot| {
+            self.send(crate::application::push_events::progress_update(phase, identity, snapshot));
+        });
     }
 
     fn println(&self, msg: &str) {
-        println!("{}", msg);
+        use crate::application::messages::{MessageSink, Stream};
+        ConsoleSink.emit(Stream::Stdout, msg);
     }
 }
 
 impl Drop for WebProgress {
     fn drop(&mut self) {
-        self.send(
-            "progressbar.clear",
-            serde_json::json!({ "topic": self.topic, "scope": self.scope }),
-        );
+        self.finish_with_message("");
     }
 }
 
@@ -292,12 +310,20 @@ fn current_web_progress_scope(topic: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{STDOUT_LOCK, WEB_PROGRESS_SCOPE_ENV, current_web_progress_scope};
-    use std::sync::Arc;
-    use std::thread;
+    use super::{WEB_PROGRESS_SCOPE_ENV, current_web_progress_scope};
+    use std::sync::Mutex;
+
+    /// 環境変数はプロセス全体で共有されるため、書き換えるテストは直列化する
+    /// (並列実行だと片方の `remove_var` がもう片方の `set_var` を消してしまう)。
+    static SCOPE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_scope_env() -> std::sync::MutexGuard<'static, ()> {
+        SCOPE_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
 
     #[test]
     fn web_progress_scope_uses_env_override_when_present() {
+        let _guard = lock_scope_env();
         unsafe { std::env::set_var(WEB_PROGRESS_SCOPE_ENV, "job-123"); }
         assert_eq!(current_web_progress_scope("convert"), "job-123");
         unsafe { std::env::remove_var(WEB_PROGRESS_SCOPE_ENV); }
@@ -305,44 +331,9 @@ mod tests {
 
     #[test]
     fn web_progress_scope_falls_back_to_topic() {
+        let _guard = lock_scope_env();
         unsafe { std::env::remove_var(WEB_PROGRESS_SCOPE_ENV); }
         assert_eq!(current_web_progress_scope("convert"), "convert");
     }
 
-    #[test]
-    fn stdout_lock_serializes_workers() {
-        use std::sync::Barrier;
-
-        let barrier = Arc::new(Barrier::new(4));
-        let mut handles = Vec::new();
-
-        for worker_id in 0..4 {
-            let barrier = Arc::clone(&barrier);
-            handles.push(thread::spawn(move || {
-                barrier.wait();
-                let mut out = Vec::new();
-                for k in 0..100 {
-                    let _guard = STDOUT_LOCK.lock();
-                    out.push(format!("worker={worker_id} iter={k}"));
-                }
-                out
-            }));
-        }
-
-        let mut all: Vec<String> = Vec::new();
-        for handle in handles {
-            all.extend(handle.join().expect("worker should finish"));
-        }
-
-        // Each worker emits its lines in a single critical section.
-        // We can verify per-line integrity by ensuring each emitted
-        // line stays intact (no foreign prefix/suffix). All entries
-        // must follow the `worker=N iter=M` shape with N and M intact.
-        for line in &all {
-            assert!(
-                line.starts_with("worker=") && line.contains(" iter="),
-                "interleaved line detected: {line}"
-            );
-        }
-    }
 }

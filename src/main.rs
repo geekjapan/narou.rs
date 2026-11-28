@@ -3,17 +3,22 @@ mod output_macros;
 mod backtracer;
 mod cli;
 mod commands;
-mod logger;
 #[cfg(test)]
 mod test_support;
 
 use std::any::Any;
-use std::io::{IsTerminal, Read};
+use std::io::IsTerminal;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use clap::Parser;
 use futures::FutureExt;
+
+// ロガーは lib 側 (`narou_rs::logger`) をそのまま使う。bin にも同じ
+// `src/logger.rs` をコンパイルすると `LoggerState` が 2 つになり、
+// `logger::init()` が bin 側しか初期化しないため、lib 側の logger 経由で
+// 出した行 (MessageSink / Downloader のレポート行) がログに残らなくなる。
+use narou_rs::logger;
 
 use cli::{Cli, Commands};
 use commands::illust::IllustSubcommand;
@@ -123,23 +128,38 @@ fn read_targets_from_stdin() -> Vec<String> {
         return Vec::new();
     }
 
+    // narou.rb CommandLine.run は STDIN.gets で 1 行だけ読み込んで引数に
+    // 連結する。残りの入力はコマンド側が読むか捨てられる。
     let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    if std::io::stdin().read_line(&mut input).is_err() {
         return Vec::new();
     }
     parse_stdin_targets(&input)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_stdin_targets;
-
-    #[test]
-    fn parse_stdin_targets_splits_piped_ids_like_ruby_argv() {
-        assert_eq!(
-            parse_stdin_targets("3 2\r\n1\t4\n"),
-            vec!["3", "2", "1", "4"]
-        );
+/// stdin を引数ではなくデータとして読む Rust 拡張コマンドを判定する。
+/// narou.rb には stdin をデータとして読むコマンドが無いが、`csv --import -`
+/// (web UI の CSV インポートが使う) と `login set` (cookie を stdin から読む)
+/// は 1 行目を引数として奪われると壊れるため除外する。
+fn stdin_is_command_data(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("login") => true,
+        Some("csv") => {
+            let mut expects_path = false;
+            for arg in args.iter().skip(1) {
+                if expects_path {
+                    return arg == "-";
+                }
+                match arg.as_str() {
+                    "-i" | "--import" => expects_path = true,
+                    "--import=-" | "-i-" => return true,
+                    "--" => return false,
+                    _ => {}
+                }
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -178,6 +198,16 @@ async fn main() {
 
     narou_rs::updater_promote::try_promote_pending_updater();
 
+    // セルフアップデート経由の再起動では updater が install_dir (exe 側) を
+    // cwd にして本体を起動する。`.narou` はライブラリ dir にあるため、
+    // 親が渡した `NAROU_RS_RESTART_CWD` へ戻してから通常処理に入る。
+    // 旧 updater でも環境変数は透過するため後方互換。
+    if let Ok(dir) = std::env::var("NAROU_RS_RESTART_CWD")
+        && !dir.is_empty()
+    {
+        let _ = std::env::set_current_dir(&dir);
+    }
+
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
     let global_flags = cli::preprocess_args(&mut args);
@@ -203,6 +233,17 @@ async fn main() {
         cli::inject_default_args(&mut args);
         cli::inject_command_defaults(&mut args);
     }
+
+    // narou.rb CommandLine.run はパイプ接続時に stdin から 1 行だけ読み込み、
+    // 全コマンドの引数の末尾に連結する。stdin をデータとして読む拡張コマンド
+    // (csv --import - / login) だけは除外する。
+    if !stdin_is_command_data(&args) {
+        args.extend(read_targets_from_stdin());
+    }
+
+    // 0.4.0 未満からのアップデート後の初回起動では、小説データの
+    // 一括バックアップを提案する (web/help/version 等では出さない)。
+    narou_rs::startup_backup::maybe_offer(&args[0]);
 
     let start = if show_time {
         Some(Instant::now())
@@ -254,6 +295,14 @@ async fn run_command(
     let cli = match Cli::try_parse_from(std::iter::once("narou".to_string()).chain(args)) {
         Ok(cli) => cli,
         Err(e) => {
+            if matches!(e.kind(), clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion) {
+                logger::without_logging(|| print!("{e}"));
+                return 0;
+            }
+            if let Some(message) = cli::parse_error_message(&e) {
+                commands::log::report_error(&message);
+                return 127;
+            }
             if backtrace {
                 eprintln!("{}", e);
             } else {
@@ -266,8 +315,47 @@ async fn run_command(
         }
     };
 
-    let ua = user_agent.or(cli.user_agent);
+    let ua = user_agent.clone().or(cli.user_agent);
     logger::use_convert_log_postfix(matches!(&cli.command, Commands::Convert { .. }));
+
+    // 中断した転送公開は他のライブラリ利用より先に回復する (client-transfer §11.2)。
+    // `recover_startup` は DB シングルトンを初期化しないため、ストレージ方式を
+    // 解決した `init_database` の後で呼ぶ。ライブラリを触らないコマンドは除外する。
+    if narou_rs::db::narou_root_exists()
+        && !matches!(
+            &cli.command,
+            Commands::Init { .. }
+                | Commands::Version { .. }
+                | Commands::Trace
+                | Commands::Log { .. }
+                | Commands::Alias { .. }
+                | Commands::Login { .. }
+                | Commands::Api { .. }
+        )
+    {
+        if let Err(error) = narou_rs::db::init_database() {
+            eprintln!("Error initializing database: {error}");
+            return 1;
+        }
+        if let Err(error) = narou_rs::native::transfer::recover_startup() {
+            eprintln!("Error: {error}");
+            return 1;
+        }
+        if let Err(error) = narou_rs::native::application::recover_removals() {
+            eprintln!("Error recovering removals: {error}");
+            return 1;
+        }
+    }
+    // サイト定義は保存方式に応じて読み込む（SQLite モードではオブジェクトストア）。
+    // 未初期化のディレクトリ (.narou/ が無い) には読み込む対象が無いので、警告を
+    // 出さずに飛ばす。init はこの後で .narou/ を作る。
+    if narou_rs::db::narou_root_exists()
+        && let Err(error) =
+            narou_rs::native::site_definitions::install_effective_site_settings().await
+    {
+        eprintln!("[WARN] サイト定義の読み込みに失敗しました: {error}");
+    }
+
 
     match cli.command {
         Commands::Web {
@@ -278,28 +366,27 @@ async fn run_command(
             commands::web::run_web_server(port, no_browser, hide_console).await;
             0
         }
-        other => run_sync_command(other, trace_args, ua, backtrace),
-    }
-}
-
-fn run_sync_command(
-    command: Commands,
-    trace_args: Vec<String>,
-    user_agent: Option<String>,
-    backtrace: bool,
-) -> i32 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
-        Commands::Init {
-            aozora_path,
-            line_height,
-        } => {
-            if let Err(e) = commands::init::cmd_init(aozora_path.as_deref(), line_height) {
-                eprintln!("Error initializing: {}", e);
+        Commands::Author { action } => match commands::author::cmd_author(action).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
                 1
-            } else {
-                0
             }
-        }
+        },
+        Commands::Hidden { action } => match commands::hidden::cmd_hidden(action) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
+        Commands::Virtual { action } => match commands::virtual_novel::cmd_virtual(action) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
         Commands::Download {
             targets,
             force,
@@ -312,40 +399,20 @@ fn run_sync_command(
                 eprintln!("Usage: narou download <url|ncode|id>...");
                 return 127;
             }
-            commands::download::cmd_download(commands::download::DownloadOptions {
-                targets,
-                force,
-                no_convert,
-                freeze,
-                remove,
-                mail,
-                user_agent,
-            })
+            commands::download::cmd_download(
+                commands::download::DownloadOptions {
+                    targets,
+                    force,
+                    no_convert,
+                    freeze,
+                    remove,
+                    mail,
+                    user_agent: ua,
+                },
+                &narou_rs::progress::console_sink(),
+            )
+            .await
         }
-        Commands::Mail { targets, force } => {
-            commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
-            0
-        }
-        Commands::Send {
-            args,
-            without_freeze,
-            force,
-            backup_bookmark,
-            restore_bookmark,
-        } => commands::send::cmd_send(commands::send::SendOptions {
-            args,
-            without_freeze,
-            force,
-            backup_bookmark,
-            restore_bookmark,
-        }),
-        Commands::Backup { targets } => match commands::backup::cmd_backup(&targets) {
-            Ok(_) => 0,
-            Err(e) => {
-                eprintln!("{}", e);
-                127
-            }
-        },
         Commands::Update {
             ids,
             force,
@@ -355,20 +422,128 @@ fn run_sync_command(
             sort_by,
             ignore_all,
         } => {
-            commands::update::cmd_update(commands::update::UpdateOptions {
-                ids,
-                force,
-                no_convert,
-                convert_only_new_arrival,
-                gl,
-                sort_by,
-                ignore_all,
-                user_agent,
-            });
+            commands::update::cmd_update(
+                commands::update::UpdateOptions {
+                    ids,
+                    force,
+                    no_convert,
+                    convert_only_new_arrival,
+                    gl,
+                    sort_by,
+                    ignore_all,
+                    user_agent: ua,
+                },
+                &narou_rs::progress::console_sink(),
+            )
+            .await;
             0
         }
-        Commands::Convert {
-            mut targets,
+        Commands::Csv { output, import } => {
+            // CSV 取り込みは download コマンド経由で取得するため非同期側で処理する。
+            commands::csv::cmd_csv(output.as_deref(), import.as_deref()).await
+        }
+        Commands::Illust {
+            force,
+            all,
+            sub,
+            targets,
+        } => match sub {
+            Some(resolved) => {
+                let sub = match resolved {
+                    cli::IllustSubcommand::Orphan => IllustSubcommand::Orphan,
+                    cli::IllustSubcommand::Migrate => IllustSubcommand::Migrate,
+                    cli::IllustSubcommand::FixExt => IllustSubcommand::FixExt,
+                    cli::IllustSubcommand::Rebuild => IllustSubcommand::Rebuild,
+                    cli::IllustSubcommand::S3Push => IllustSubcommand::S3Push,
+                    cli::IllustSubcommand::S3Verify => IllustSubcommand::S3Verify,
+                    cli::IllustSubcommand::S3Dedup => IllustSubcommand::S3Dedup,
+                };
+                commands::illust::cmd_illust(sub, &targets, force, all).await
+            }
+            None => {
+                commands::help::display_command_help("illust");
+                0
+            }
+        },
+        other => run_sync_command(other, trace_args, backtrace),
+    }
+}
+
+fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
+        Commands::Init {
+            aozora_path,
+            line_height,
+        } => {
+            if let Err(e) = commands::init::cmd_init(aozora_path.as_deref(), line_height) {
+                eprintln!("Error initializing: {}", e);
+                1
+            } else {
+                0
+            }
+        }
+        Commands::Download { .. } | Commands::Update { .. } | Commands::Csv { .. } | Commands::Author { .. } | Commands::Hidden { .. } | Commands::Virtual { .. } | Commands::Illust { .. } => {
+            unreachable!()
+        }
+        Commands::Mail { targets, force } => {
+            commands::mail::cmd_mail(
+                commands::mail::MailOptions { targets, force },
+                &narou_rs::progress::console_sink(),
+            );
+            0
+        }
+        Commands::Send {
+            args,
+            without_freeze,
+            force,
+            backup_bookmark,
+            restore_bookmark,
+        } => commands::send::cmd_send(
+            commands::send::SendOptions {
+                args,
+                without_freeze,
+                force,
+                backup_bookmark,
+                restore_bookmark,
+            },
+            &narou_rs::progress::console_sink(),
+        ),
+        Commands::Db { action } => match commands::db::cmd_db(action) {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                127
+            }
+        },
+        Commands::Backup { targets } => match commands::backup::cmd_backup(&targets) {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                127
+            }
+        },
+        Commands::Export { targets, output } => match commands::transfer_archive::cmd_export(
+            &targets,
+            output.as_deref(),
+        ) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
+        Commands::Import {
+            archive,
+            overwrite,
+            skip: _,
+        } => match commands::transfer_archive::cmd_import(&archive, overwrite) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },        Commands::Convert {
+            targets,
             output,
             encoding,
             no_epub,
@@ -382,15 +557,14 @@ fn run_sync_command(
             verbose,
             no_open,
         } => {
-            targets.extend(read_targets_from_stdin());
             if targets.is_empty() {
                 eprintln!("Usage: narou convert <url|ncode|id>...");
                 1
             } else {
-                commands::convert::cmd_convert(
-                    &targets,
-                    output.as_deref(),
-                    encoding.as_deref(),
+                commands::convert::cmd_convert(commands::convert::ConvertOptions {
+                    targets: &targets,
+                    output: output.as_deref(),
+                    encoding: encoding.as_deref(),
                     no_epub,
                     no_mobi,
                     no_strip,
@@ -401,7 +575,8 @@ fn run_sync_command(
                     verbose,
                     ignore_default,
                     ignore_force,
-                );
+                    sink: narou_rs::progress::console_sink().as_ref(),
+                });
                 0
             }
         }
@@ -413,6 +588,11 @@ fn run_sync_command(
             clean,
             all_clean,
             no_tool,
+            history,
+            show,
+            restore,
+            merge_from,
+            merge_sections,
         } => commands::diff::cmd_diff(commands::diff::DiffOptions {
             target,
             view_diff_version,
@@ -421,6 +601,11 @@ fn run_sync_command(
             clean,
             all_clean,
             no_tool,
+            history,
+            show,
+            restore,
+            merge_from,
+            merge_sections,
         }),
         Commands::List {
             limit,
@@ -437,6 +622,7 @@ fn run_sync_command(
             echo,
             sort_by,
             frozen,
+            show_hidden,
         } => commands::manage::cmd_list(commands::manage::ListOptions {
             limit,
             latest,
@@ -452,6 +638,7 @@ fn run_sync_command(
             echo,
             sort_by,
             frozen,
+            show_hidden,
         }),
         Commands::Tag {
             add,
@@ -502,9 +689,6 @@ fn run_sync_command(
             all,
         } => commands::clean::cmd_clean(&targets, force, dry_run, all),
         Commands::Inspect { targets } => commands::inspect::cmd_inspect(&targets),
-        Commands::Csv { output, import } => {
-            commands::csv::cmd_csv(output.as_deref(), import.as_deref())
-        }
         Commands::Trace => match commands::trace::cmd_trace() {
             Ok(_) => 0,
             Err(e) => {
@@ -528,24 +712,18 @@ fn run_sync_command(
             commands::version::cmd_version(more);
             0
         }
-        Commands::Illust {
-            force,
-            all,
-            sub,
-            targets,
-        } => match sub {
-            Some(resolved) => {
-                let sub = match resolved {
-                    cli::IllustSubcommand::Orphan => IllustSubcommand::Orphan,
-                    cli::IllustSubcommand::Migrate => IllustSubcommand::Migrate,
-                    cli::IllustSubcommand::FixExt => IllustSubcommand::FixExt,
-                    cli::IllustSubcommand::Rebuild => IllustSubcommand::Rebuild,
-                };
-                commands::illust::cmd_illust(sub, &targets, force, all)
+        Commands::Login { action } => match commands::login::cmd_login(action) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
             }
-            None => {
-                commands::help::display_command_help("illust");
-                0
+        },
+        Commands::Api { action } => match commands::api::cmd_api(action) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
             }
         },
         Commands::Web { .. } => unreachable!(),
@@ -563,5 +741,18 @@ fn run_sync_command(
             }
             127
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stdin_targets;
+
+    #[test]
+    fn parse_stdin_targets_splits_piped_ids_like_ruby_argv() {
+        assert_eq!(
+            parse_stdin_targets("3 2\r\n1\t4\n"),
+            vec!["3", "2", "1", "4"]
+        );
     }
 }

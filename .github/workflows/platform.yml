@@ -1,0 +1,477 @@
+name: Platform portability
+
+on:
+  push:
+    # develop 更新は develop、main 更新は production にデプロイする。
+    branches: [develop, 'feature-*', refactor-platform-abstraction, main]
+    # リリースタグでは互換性を検証するだけで、Worker はデプロイしない。
+    tags: ["v*", "[0-9]*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deployment target
+        type: choice
+        options: [develop, production]
+        default: develop
+
+permissions:
+  contents: read
+
+
+env:
+  # crates.io などへのダウンロードの一時的なネットワーク障害で CI が落ちるのを防ぐ。
+  # デフォルトの再試行回数 (3) だと macos-15-intel のような不安定なランナーの
+  # 数分の DNS 停止を吸収できない (v0.6.12 のリリース失敗)。
+  CARGO_NET_RETRY: "10"
+  # curl 8.x の HTTP/2 多重化で "transfer too slow" の偽発生が多発するため無効化。
+  CARGO_HTTP_MULTIPLEXING: "false"
+  # worker-build のピン。キャッシュのキーにも使う。
+  WORKER_BUILD_VERSION: 0.8.5
+
+jobs:
+  native:
+    name: Native check and tests
+    runs-on: ubuntu-latest
+    # 通常は 6 分ほど。ランナーが異常なとき test ステップが数時間止まる
+    # ことがあるので、待ち時間の上限で打ち切る。
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Build the browser transfer codec for native Web UI tests
+        run: node scripts/build-transfer-wasm.mjs --install-bindgen --assert-lean
+      - name: Worker S3 deployment regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_*s3*.py'
+      - name: Deploy secret handling regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_deploy_secret_masking.py'
+      - name: Deploy toolchain pin regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_deploy_wrangler_pin.py'
+      - name: Worker content publication and migration regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_content_storage_sql.py'
+      - name: Worker bounded runtime regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_bounded_runtime_sql.py'
+      - name: Web UI streamed transfer regressions
+        run: node --test tests/transfer_streaming.test.mjs
+      - name: Transfer WASM artifact pipeline regressions
+        run: node --test tests/transfer_artifacts.test.mjs
+      - name: Web UI source-link escaping regressions
+        run: node --test tests/render_links.test.mjs
+      - name: Web UI progress bar regressions
+        run: node --test tests/progress_bars.test.mjs
+      - run: cargo check --workspace --all-targets
+      - name: Web UI queue and refresh regressions
+        run: node --test tests/queue_refresh.test.mjs
+      - name: Web UI favorite tag regressions
+        run: node --test tests/favorite_tags.test.mjs
+      - name: Web UI dialog and virtual novel regressions
+        run: node --test tests/web_dialogs.test.mjs tests/virtual_novel_ui.test.mjs
+      - name: Web UI console rendering regressions
+        run: node --test tests/console_history.test.mjs tests/console_history_poll.test.mjs tests/websocket_fallback.test.mjs
+      - name: Regression - SQLite converter settings (issue 22)
+        run: cargo test -p narou_rs --lib converter_reads_sqlite_backed_default_and_force_settings
+      - name: Regression - latest list ordering (issue 21)
+        run: cargo test -p narou_rs --bin narou_rs list_latest_sorts_newest_first
+      # 1 つのテストバイナリが失敗しても残りを走らせる。どのバイナリで
+      # 止まったかをログから追えるようにするため。
+      - run: cargo test --workspace --all-targets --no-fail-fast
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Documentation warnings
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      # Verify the non-GPL binaries actually link (check/test do not).
+      - run: cargo build -p narou_rs --bins
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: browser-actions/setup-firefox@v1
+        id: transfer-firefox
+      - run: python -m pip install selenium==4.52.0
+      - name: Exercise tag ordering with Native YAML and SQLite in real Firefox
+        run: python scripts/test-tag-order-browser.py
+        env:
+          FIREFOX_BINARY: ${{ steps.transfer-firefox.outputs.firefox-path }}
+      - name: Exercise shipped transfer UI and WASM in real Firefox
+        run: python scripts/test-transfer-browser.py
+        env:
+          FIREFOX_BINARY: ${{ steps.transfer-firefox.outputs.firefox-path }}
+      - name: Retain browser surface failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: transfer-browser-surfaces
+          path: target/transfer-browser-artifacts/*.png
+          if-no-files-found: ignore
+
+  native-gpl:
+    name: Native check (lite/GPL)
+    runs-on: ubuntu-latest
+    # 通常は 4 分ほど。native ジョブと同じく待ち時間の上限を設ける。
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpl
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Build the browser transfer codec for GPL Web UI tests
+        run: node scripts/build-transfer-wasm.mjs --install-bindgen --assert-lean
+      - run: cargo check -p narou_rs --all-targets --features lite
+      - run: cargo test -p narou_rs --lib --test virtual_novel --features lite
+      # Verify the GPL (embedded AozoraEpub3_Lite) binary links.
+      - run: cargo build -p narou_rs --bin narou_rs --features lite
+
+  wasm:
+    name: Portable wasm check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p narou_rs --target wasm32-unknown-unknown --no-default-features --features worker-runtime
+      - run: cargo check -p narou_worker --target wasm32-unknown-unknown
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Build the browser transfer artifact set
+        # Generates content-hashed glue/wasm/worker plus manifest.json in
+        # target/transfer-artifacts/ and proves the codec dependency graph is
+        # free of the GPL Lite engine. Fails closed when any piece is missing.
+        run: |
+          node scripts/build-transfer-wasm.mjs --install-bindgen --assert-lean
+          node scripts/build-transfer-wasm.mjs --verify
+      - name: Exercise the standalone streaming WASM API
+        run: |
+          wasm-bindgen target/wasm32-unknown-unknown/release/narou_transfer_wasm.wasm --target nodejs --out-dir target/transfer-wasm-smoke
+          node transfer_wasm/tests/streaming.mjs target/transfer-wasm-smoke/narou_transfer_wasm.js
+
+  worker:
+    name: Worker release artifact
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker_entry
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      # build_assets.mjs also produces the transfer WASM artifact set under
+      # public/assets/transfer; the deployable artifact is incomplete without it.
+      - run: node build_assets.mjs
+      - run: worker-build --release
+
+  worker-contract:
+    name: Worker contract tests (local workerd)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker_entry
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      # CI のレンダリング契約 (Secrets Store の組み合わせ検証) もここで確認する。
+      # 認証情報・ネットワーク不要の unittest だけを走らせる。
+      - run: python3 -m unittest discover -s tests -p 'test_ci_*.py'
+      # tests/run.mjs builds, applies the local D1 migrations, starts
+      # `wrangler dev` and runs the contract checks (health, fail-closed auth,
+      # library/jobs APIs, and a queue-backed Convert job reaching a terminal
+      # state).
+      - run: node tests/run.mjs --release
+        env:
+          NAROU_ADMIN_TOKEN: contract-token
+          # トークンを外した構成で fail-closed も確かめる。
+          NAROU_CHECK_UNCONFIGURED: "1"
+      - name: Worker compressed content lifecycle
+        run: node tests/content_storage.mjs
+      - name: Worker delivery and update isolation
+        run: node tests/read_worker.mjs
+      - name: Worker abrupt termination and checkpoint recovery
+        run: node tests/runtime_recovery.mjs
+      - name: Worker acquisition lane concurrency
+        run: node tests/acquisition_concurrency.mjs
+
+  # デプロイ。GitHub Environments は用途で 2 つに分ける:
+  #   `Cloudflare` … この 2 ジョブ (develop / production) が使う Workers 用の値
+  #     secrets: CLOUDFLARE_ACCOUNT_ID (または CLOUDFLARE_ACCOUT_ID) / CLOUDFLARE_API_TOKEN /
+  #              SERVICE_DOMAIN (production 必須) / DEVELOP_DOMAIN (develop・任意。ドメインは
+  #              公開ログに残さないため secrets 推奨) /
+  #              NAROU_ADMIN_TOKEN (Zero Trust が境界なら不要) / NAROU_RS_LOGIN_KEY (任意) /
+  #              NAROU_S3_ACCESS_KEY_ID・NAROU_S3_SECRET_ACCESS_KEY (任意。S3 資格情報) /
+  #              CF_ACCESS_CLIENT_ID・CF_ACCESS_CLIENT_SECRET (smoke 用・任意)
+  #     vars:    NAROU_AUTH_REQUIRED (任意) / NAROU_WORKERS_DEV (任意) /
+  #              NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET /
+  #              NAROU_S3_PREFIX (任意。未設定なら narou/<target>) /
+  #              NAROU_SECRETS_STORE_ID と *_SECRET_NAME (Secrets Store を使う場合)
+  #   `CodeSining` … release.yml の Windows 署名 (CERTUM_USERNAME / CERTUM_OTP_URI /
+  #                  CERTUM_KEY_ID)
+  # 対象は `NAROU_DEPLOY_TARGET` (develop / production) で切り替えるので、
+  # target ごとに環境を分けずに同じ環境を共有している (SERVICE_DOMAIN と
+  # DEVELOP_DOMAIN は名前が違うため衝突しない)。
+  # D1・取得用 Queue・変換用 Queue と各 DLQ は `ci/provision_resources.py` が
+  # target 名から導出して冪等に作る。変換用の binding と物理名も CI が生成する。
+  worker-deploy-develop:
+    name: Deploy Worker (develop)
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+      || (github.event_name == 'workflow_dispatch' && inputs.target == 'develop')
+    # 外部リレーの配置・更新は本体の検証と配備から独立して管理する。
+    needs: [native, native-gpl, wasm, worker, worker-contract, license]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: narou-worker-develop
+      cancel-in-progress: false
+    environment:
+      # Workers 用の資格情報は用途別の 1 環境にまとめる (署名は CodeSining)。
+      name: Cloudflare
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: worker_entry
+    env:
+      # Dantalian と同じ綴り (`ACCOUT_ID`) でも動くようにしておく。
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      NAROU_DEPLOY_TARGET: develop
+      # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
+      DEVELOP_DOMAIN: ${{ secrets.DEVELOP_DOMAIN || vars.DEVELOP_DOMAIN }}
+      # リレードメイン。設定時は NAROU_RELAY_ENDPOINT より優先して https://<domain> を使う。
+      RELAY_DOMAIN: ${{ secrets.RELAY_DOMAIN || vars.RELAY_DOMAIN }}
+      NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
+      NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
+      NAROU_RELAY_ENDPOINT: ${{ secrets.NAROU_RELAY_ENDPOINT }}
+      NAROU_RELAY_KEY: ${{ secrets.NAROU_RELAY_KEY }}
+      NAROU_S3_ACCESS_KEY_ID: ${{ secrets.NAROU_S3_ACCESS_KEY_ID }}
+      NAROU_S3_SECRET_ACCESS_KEY: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY }}
+      NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
+      NAROU_S3_REGION: ${{ vars.NAROU_S3_REGION }}
+      NAROU_S3_BUCKET: ${{ vars.NAROU_S3_BUCKET }}
+      NAROU_S3_PREFIX: ${{ vars.NAROU_S3_PREFIX }}
+      # Secrets Store を使う場合だけ設定する (名前だけを渡し、値はストアに置く)。
+      NAROU_SECRETS_STORE_ID: ${{ secrets.NAROU_SECRETS_STORE_ID || vars.NAROU_SECRETS_STORE_ID }}
+      NAROU_S3_ACCESS_KEY_ID_SECRET_NAME: ${{ secrets.NAROU_S3_ACCESS_KEY_ID_SECRET_NAME || vars.NAROU_S3_ACCESS_KEY_ID_SECRET_NAME }}
+      NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME || vars.NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME }}
+      NAROU_S3_ENDPOINT_SECRET_NAME: ${{ secrets.NAROU_S3_ENDPOINT_SECRET_NAME || vars.NAROU_S3_ENDPOINT_SECRET_NAME }}
+      NAROU_S3_REGION_SECRET_NAME: ${{ secrets.NAROU_S3_REGION_SECRET_NAME || vars.NAROU_S3_REGION_SECRET_NAME }}
+      NAROU_S3_BUCKET_SECRET_NAME: ${{ secrets.NAROU_S3_BUCKET_SECRET_NAME || vars.NAROU_S3_BUCKET_SECRET_NAME }}
+      # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
+      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ secrets.NAROU_ADMIN_TOKEN_SECRET_NAME || vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
+      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ secrets.NAROU_RS_LOGIN_KEY_SECRET_NAME || vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
+      # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
+      NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
+      # 配備後の smoke (contract.mjs) でも S3 必須を確認する。contract.mjs は
+      # `NAROU_REQUIRE_S3=true` のときだけ `/api/storage/mode?probe=s3` を検査する。
+      # Python プローブが前段の 403 で警告つきスキップになった場合でも、Node 側の
+      # この検査が必須確認を維持する (secret ではなく固定値。render_config.py は
+      # 環境変数では NAROU_REQUIRE_S3 を変えられない)。
+      NAROU_REQUIRE_S3: "true"
+      # Access の service token (custom domain 越しに smoke を流す場合だけ)。
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+      # Access の service token を Secrets Store に置く場合は「名前」だけ渡す。
+      NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME: ${{ secrets.NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME || vars.NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME }}
+      NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME: ${{ secrets.NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME || vars.NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # CI と同じ worker-build を固定する (ローカル・他のジョブと揃える)。
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
+      - name: Check Cloudflare credentials
+        id: credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Cloudflare の secret が未設定のため develop へのデプロイを省略します"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+      - run: python3 ci/deploy_worker.py
+        if: steps.credentials.outputs.configured == 'true'
+
+
+  worker-deploy-production:
+    name: Deploy Worker (production)
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && inputs.target == 'production'))
+    needs: [native, native-gpl, wasm, worker, worker-contract, license]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: narou-worker-production
+      cancel-in-progress: false
+    environment:
+      # Workers 用の資格情報は用途別の 1 環境にまとめる (署名は CodeSining)。
+      name: Cloudflare
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: worker_entry
+    env:
+      # Dantalian と同じ綴り (`ACCOUT_ID`) でも動くようにしておく。
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      NAROU_DEPLOY_TARGET: production
+      # 既存の Route 運用なら route を選び、DNS / custom domain を付け替えない。
+      NAROU_DOMAIN_MODE: ${{ vars.NAROU_DOMAIN_MODE || 'custom_domain' }}
+      # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
+      SERVICE_DOMAIN: ${{ secrets.SERVICE_DOMAIN || vars.SERVICE_DOMAIN }}
+      # リレードメイン。設定時は NAROU_RELAY_ENDPOINT より優先して https://<domain> を使う。
+      RELAY_DOMAIN: ${{ secrets.RELAY_DOMAIN || vars.RELAY_DOMAIN }}
+      NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
+      NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
+      NAROU_RELAY_ENDPOINT: ${{ secrets.NAROU_RELAY_ENDPOINT }}
+      NAROU_RELAY_KEY: ${{ secrets.NAROU_RELAY_KEY }}
+      NAROU_S3_ACCESS_KEY_ID: ${{ secrets.NAROU_S3_ACCESS_KEY_ID }}
+      NAROU_S3_SECRET_ACCESS_KEY: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY }}
+      NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
+      NAROU_S3_REGION: ${{ vars.NAROU_S3_REGION }}
+      NAROU_S3_BUCKET: ${{ vars.NAROU_S3_BUCKET }}
+      NAROU_S3_PREFIX: ${{ vars.NAROU_S3_PREFIX }}
+      # Secrets Store を使う場合だけ設定する (名前だけを渡し、値はストアに置く)。
+      NAROU_SECRETS_STORE_ID: ${{ secrets.NAROU_SECRETS_STORE_ID || vars.NAROU_SECRETS_STORE_ID }}
+      NAROU_S3_ACCESS_KEY_ID_SECRET_NAME: ${{ secrets.NAROU_S3_ACCESS_KEY_ID_SECRET_NAME || vars.NAROU_S3_ACCESS_KEY_ID_SECRET_NAME }}
+      NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME || vars.NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME }}
+      NAROU_S3_ENDPOINT_SECRET_NAME: ${{ secrets.NAROU_S3_ENDPOINT_SECRET_NAME || vars.NAROU_S3_ENDPOINT_SECRET_NAME }}
+      NAROU_S3_REGION_SECRET_NAME: ${{ secrets.NAROU_S3_REGION_SECRET_NAME || vars.NAROU_S3_REGION_SECRET_NAME }}
+      NAROU_S3_BUCKET_SECRET_NAME: ${{ secrets.NAROU_S3_BUCKET_SECRET_NAME || vars.NAROU_S3_BUCKET_SECRET_NAME }}
+      # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
+      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ secrets.NAROU_ADMIN_TOKEN_SECRET_NAME || vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
+      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ secrets.NAROU_RS_LOGIN_KEY_SECRET_NAME || vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
+      # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
+      NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
+      # 配備後の smoke でも S3 必須を確認する (develop と同じ理由)。
+      NAROU_REQUIRE_S3: "true"
+      # Access の service token (custom domain 越しに smoke を流す場合だけ)。
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+      # Access の service token を Secrets Store に置く場合は「名前」だけ渡す。
+      NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME: ${{ secrets.NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME || vars.NAROU_CF_ACCESS_CLIENT_ID_SECRET_NAME }}
+      NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME: ${{ secrets.NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME || vars.NAROU_CF_ACCESS_CLIENT_SECRET_SECRET_NAME }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # CI と同じ worker-build を固定する (ローカル・他のジョブと揃える)。
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
+      - name: Check Cloudflare credentials
+        id: credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Cloudflare の secret が未設定のため production へのデプロイを省略します"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+      - run: python3 ci/deploy_worker.py
+        if: steps.credentials.outputs.configured == 'true'
+
+
+  license:
+    name: Third-party license notices
+    runs-on: ubuntu-latest
+    env:
+      # Pinned: the committed notices were generated with this version and the
+      # job fails on any output difference, so the generator must match.
+      CARGO_ABOUT_VERSION: "0.9.2"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-about
+      - run: cargo install cargo-about --locked --features cli --version "$CARGO_ABOUT_VERSION"
+        env:
+          # Keep the install inside ./target so rust-cache can reuse it.
+          CARGO_TARGET_DIR: target/cargo-about
+      # cargo-about reads license files from extracted crate sources; without
+      # this only the .crate archives are present and the notices would differ.
+      - run: cargo fetch --locked
+      # The second command is also the copyleft gate: it fails when a GPL
+      # dependency reaches the non-GPL dependency graph (about-probe).
+      - name: Regenerate notices
+        run: |
+          cargo-about generate --workspace --features narou_rs/lite --locked -c about.toml -o Third-Party-License.md about.hbs
+          cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked -o Third-Party-License-non-GPL.md about.hbs
+      - name: Committed notices are current
+        run: git diff --exit-code -- Third-Party-License.md Third-Party-License-non-GPL.md
+      # Section 3 is written by hand; regenerating the notices would not notice
+      # a stale table, so compare it against the manifest.
+      - name: Direct dependency table is current
+        run: python3 scripts/check-license-table.py

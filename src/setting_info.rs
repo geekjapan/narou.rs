@@ -45,6 +45,9 @@ pub fn default_local_setting_value(name: &str) -> Option<serde_yaml::Value> {
         }
         "time-zone" => Some(serde_yaml::Value::String("Asia/Tokyo".to_string())),
         "user-agent" => Some(serde_yaml::Value::String("auto".to_string())),
+        "tag.show-novel" => Some(serde_yaml::Value::Bool(false)),
+        "tag.show-manga" => Some(serde_yaml::Value::Bool(true)),
+        "tag.attributes-enabled" => Some(serde_yaml::Value::Bool(false)),
         "queue.max-retries" => Some(serde_yaml::Value::Number(serde_yaml::Number::from(3))),
         "queue.retry-backoff" => {
             Some(serde_yaml::Value::String("1m,5m,15m".to_string()))
@@ -92,10 +95,12 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "logging"
         | "update.interval"
         | "update.strong"
+        | "update.disabled-author-tracking"
         | "update.convert-only-new-arrival"
         | "update.sort-by"
         | "update.auto-schedule.enable"
         | "update.auto-schedule"
+        | "update.auto-schedule.timezone"
         | "update.max-parallel-domains"
         | "convert.copy-to"
         | "convert.copy-zip-to"
@@ -106,8 +111,22 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "convert.filename-to-ncode"
         | "convert.add-dc-subject-to-epub"
         | "convert.dc-subject-exclude-tags"
+        | "convert.rotate-image"
         | "send.without-freeze"
-        | "auto-add-tags" => Some("general"),
+        | "convert.section-cache"
+        | "convert.keep-txt"
+        | "sqlite.mirror-files"
+        | "auto-add-tags"
+        | "tag.show-novel"
+        | "tag.show-manga"
+        | "tag.attributes-enabled"
+        | "s3.asset-backend"
+        | "s3.endpoint"
+        | "s3.bucket"
+        | "s3.region"
+        | "s3.prefix"
+        | "s3.access-key-id"
+        | "s3.secret-access-key" => Some("general"),
 
         // local → detail
         "hotentry.auto-mail"
@@ -120,6 +139,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "download.narou-api.interval"
         | "download.narou-api.user-agent"
         | "download.use-subdirectory"
+        | "download.relay-sites"
         | "download.choices-of-digest-options"
         | "send.backup-bookmark"
         | "multiple-delimiter"
@@ -133,13 +153,15 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "time-zone"
         | "user-agent"
         | "queue.max-retries"
-        | "queue.retry-backoff" => Some("detail"),
+        | "queue.retry-backoff"
+        | "narou-compat" => Some("detail"),
 
         // local → webui
         "webui.theme"
         | "webui.table.reload-timing"
         | "webui.performance-mode"
         | "webui.new-tag-color"
+        | "webui.tag-sort-order"
         | "webui.debug-mode" => Some("webui"),
 
         // global → global
@@ -148,12 +170,22 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "no-color"
         | "color-parser"
         | "server-port"
+        | "server-ws-port"
         | "server-bind"
+        | "server-digest-auth.enable"
+        | "server-digest-auth.user"
+        | "server-digest-auth.password"
+        | "server-digest-auth.hashed-password"
         | "server-basic-auth.enable"
         | "server-basic-auth.user"
         | "server-basic-auth.password"
         | "server-ws-add-accepted-domains"
         | "server-add-accepted-hosts"
+        | "external-api.require-token"
+        | "external-api.allowed-origins"
+        | "self-update.variant"
+        | "convert.epub-engine"
+        | "convert.epub-font"
         | "over18" => Some("global"),
 
         _ => None,
@@ -173,7 +205,7 @@ pub const WEBUI_THEME_NAMES: &[&str] = &[
 /// Command names that support `default_args.*`.
 pub const DEFAULT_ARG_COMMAND_NAMES: &[&str] = &[
     "alias", "backup", "browser", "clean", "console", "convert", "csv", "diff", "download",
-    "folder", "freeze", "help", "init", "inspect", "list", "log", "mail", "remove", "send",
+    "folder", "freeze", "help", "init", "inspect", "list", "log", "mail", "remove", "restore346", "send",
     "setting", "tag", "trace", "update", "version", "web",
 ];
 
@@ -486,156 +518,6 @@ pub fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
     ]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_arg_command_names_cover_web_and_alias() {
-        assert!(default_arg_command_names().contains(&"web"));
-        assert!(default_arg_command_names().contains(&"alias"));
-        assert!(is_known_default_arg_name("default_args.convert"));
-        assert!(!is_known_default_arg_name("default_args.not_exists"));
-    }
-
-    #[test]
-    fn external_bind_auth_override_has_no_webui_tab() {
-        assert_eq!(
-            tab_for_setting("server-basic-auth.require-for-external-bind"),
-            None
-        );
-        assert!(
-            setting_variables()
-                .get("server-basic-auth.require-for-external-bind")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn reverse_proxy_mode_has_no_webui_tab() {
-        assert_eq!(tab_for_setting("server-reverse-proxy.enable"), None);
-        assert!(
-            setting_variables()
-                .get("server-reverse-proxy.enable")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn webui_debug_mode_is_visible_on_webui_tab() {
-        assert_eq!(tab_for_setting("webui.debug-mode"), Some("webui"));
-        assert!(setting_variables().get("webui.debug-mode").is_some());
-    }
-
-    #[test]
-    fn webui_new_tag_color_is_visible_on_webui_tab() {
-        assert_eq!(tab_for_setting("webui.new-tag-color"), Some("webui"));
-        assert!(setting_variables().get("webui.new-tag-color").is_some());
-    }
-
-    #[test]
-    fn server_add_accepted_hosts_has_global_tab() {
-        assert_eq!(tab_for_setting("server-add-accepted-hosts"), Some("global"));
-        let vars = setting_variables();
-        let info = vars
-            .get("server-add-accepted-hosts")
-            .expect("server-add-accepted-hosts must be registered as a global var");
-        assert!(matches!(info.var_type, VarType::String));
-        assert!(info.invisible, "global-only setting should stay invisible on webui tab");
-    }
-
-    #[test]
-    fn queue_retry_settings_have_detail_tab_and_defaults() {
-        assert_eq!(tab_for_setting("queue.max-retries"), Some("detail"));
-        assert_eq!(tab_for_setting("queue.retry-backoff"), Some("detail"));
-
-        let vars = setting_variables();
-        let max = vars
-            .get("queue.max-retries")
-            .expect("queue.max-retries must be registered as a local var");
-        assert!(matches!(max.var_type, VarType::Integer));
-        assert!(max.invisible, "queue settings stay invisible on webui tab");
-
-        let backoff = vars
-            .get("queue.retry-backoff")
-            .expect("queue.retry-backoff must be registered as a local var");
-        assert!(matches!(backoff.var_type, VarType::String));
-        assert!(backoff.invisible);
-
-        // Default values must surface through `default_local_setting_value` so
-        // the user does not have to write them by hand.
-        let max_default = default_local_setting_value("queue.max-retries")
-            .expect("queue.max-retries default");
-        assert_eq!(max_default.as_i64(), Some(3));
-        let backoff_default = default_local_setting_value("queue.retry-backoff")
-            .expect("queue.retry-backoff default");
-        assert_eq!(
-            backoff_default.as_str(),
-            Some("1m,5m,15m"),
-        );
-    }
-
-    #[test]
-    fn update_max_parallel_domains_has_general_tab_and_default() {
-        assert_eq!(tab_for_setting("update.max-parallel-domains"), Some("general"));
-
-        let vars = setting_variables();
-        let info = vars
-            .get("update.max-parallel-domains")
-            .expect("update.max-parallel-domains must be registered as a local var");
-        assert!(matches!(info.var_type, VarType::Integer));
-        assert!(!info.invisible);
-
-        let default = default_local_setting_value("update.max-parallel-domains")
-            .expect("update.max-parallel-domains default");
-        assert_eq!(default.as_i64(), Some(4));
-    }
-
-    #[test]
-    fn mail_attachment_filename_settings_are_visible_on_detail_tab() {
-        assert_eq!(
-            tab_for_setting("mail.attachment-filename-pattern"),
-            Some("detail")
-        );
-        assert_eq!(
-            tab_for_setting("mail.attachment-filename-replacement"),
-            Some("detail")
-        );
-
-        let vars = setting_variables();
-        for name in [
-            "mail.attachment-filename-pattern",
-            "mail.attachment-filename-replacement",
-        ] {
-            let info = vars.get(name).expect("mail attachment filename setting");
-            assert!(matches!(info.var_type, VarType::String));
-            assert!(!info.invisible);
-        }
-    }
-
-    #[test]
-    fn mail_attachment_filename_webui_help_includes_usage_notes() {
-        let vars = setting_variables();
-        let pattern = vars
-            .get("mail.attachment-filename-pattern")
-            .expect("mail attachment filename pattern setting");
-        let replacement = vars
-            .get("mail.attachment-filename-replacement")
-            .expect("mail attachment filename replacement setting");
-
-        let pattern_help =
-            webui_help_override("mail.attachment-filename-pattern", pattern.help).unwrap();
-        let replacement_help =
-            webui_help_override("mail.attachment-filename-replacement", replacement.help).unwrap();
-
-        assert!(pattern_help.contains(r"^\[[^\]]+\](.*)$"));
-        assert!(pattern_help.contains("フォルダ名は含みません"));
-        assert!(replacement_help.contains("$1"));
-        assert!(replacement_help.contains("mail_setting.yaml"));
-        assert!(replacement_help.contains("優先"));
-    }
-}
-
 /// Local setting variable metadata
 pub fn setting_variables() -> SettingVariables {
     let vis = |vt: VarType, help: &'static str| VarInfo {
@@ -759,6 +641,10 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "update.disabled-author-tracking",
+            vis(VarType::Boolean, "更新後の追跡作者からの新作品ダウンロードを停止する"),
+        ),
+        (
             "update.convert-only-new-arrival",
             vis(VarType::Boolean, "更新時に新着がある場合のみ変換を実行する"),
         ),
@@ -793,6 +679,13 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::String,
                 "自動アップデートする時間を指定する。カンマ区切りで複数指定可能。\n      書式：HHMM (例: 0800,1200,1800 = 8時、12時、18時)",
+            ),
+        ),
+        (
+            "update.auto-schedule.timezone",
+            vis(
+                VarType::String,
+                "自動アップデートのHHMMを評価するIANAタイムゾーン。未設定ならローカル時間(Worker の既定値は Asia/Tokyo)",
             ),
         ),
         (
@@ -887,6 +780,90 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "convert.rotate-image",
+            sel(
+                "EPUB 変換時の挿絵自動回転 (AozoraEpub3 の RotateImage 相当)。auto: AozoraEpub3.ini の設定に従う / 0: 回転しない / 1: 横長を右へ90° / 2: 横長を左へ90°。組み込みエンジン・外部 AozoraEpub3_Lite.exe・Worker に効く (Java 版 AozoraEpub3.jar は INI 差し替えが出来ないため対象外)",
+                vec!["auto", "0", "1", "2"],
+            ),
+        ),
+        (
+            "sqlite.mirror-files",
+            vis(
+                VarType::Boolean,
+                "SQLite 管理時に 小説データ/ へ実ファイルのミラーを書く (既定 true)。false では DB だけを保存先にし、変換の間だけ一時的に取り出す (容量の厳しい環境向け。環境変数 NAROU_RS_MIRROR_FILES=0 でも切れる)",
+            ),
+        ),
+        (
+            "convert.keep-txt",
+            vis(
+                VarType::Boolean,
+                "変換した txt を残す (既定 true)。false では変換済みテキストをファイルにも SQLite にも残さず、Web UI の EPUB は保存済み本文からその都度変換して生成する (環境変数 NAROU_RS_KEEP_TXT=0 でも切れる)",
+            ),
+        ),
+        (
+            "convert.section-cache",
+            vis(
+                VarType::Boolean,
+                "話ごとの変換結果をキャッシュする (既定 true)。容量の厳しい環境では false。環境変数 NAROU_RS_SECTION_CACHE=0 でも切れる",
+            ),
+        ),
+        (
+            "s3.asset-backend",
+            invis_sel(
+                "挿絵の保存先。local: ライブラリ内に保存 / s3: S3 互換ストレージ (Wasabi など) へ保存",
+                vec!["local", "s3"],
+            ),
+        ),
+        (
+            "s3.endpoint",
+            invis(
+                VarType::String,
+                "S3 互換ストレージの endpoint (例: https://s3.ap-northeast-1.wasabisys.com)。環境変数 S3_ENDPOINT でも指定可",
+            ),
+        ),
+        (
+            "s3.bucket",
+            invis(
+                VarType::String,
+                "S3 のバケット名。環境変数 S3_BUCKET でも指定可",
+            ),
+        ),
+        (
+            "s3.region",
+            invis(
+                VarType::String,
+                "S3 のリージョン (署名に必須)。環境変数 S3_REGION でも指定可",
+            ),
+        ),
+        (
+            "s3.prefix",
+            invis(
+                VarType::String,
+                "バケット内の接頭辞 (例: narou/library)。環境変数 S3_PREFIX でも指定可",
+            ),
+        ),
+        (
+            "s3.access-key-id",
+            invis(
+                VarType::String,
+                "S3 のアクセスキー ID。環境変数 S3_ACCESS_KEY_ID でも指定可",
+            ),
+        ),
+        (
+            "s3.secret-access-key",
+            invis(
+                VarType::String,
+                "S3 のシークレットアクセスキー。環境変数 S3_SECRET_ACCESS_KEY でも指定可",
+            ),
+        ),
+        (
+            "convert.epub-engine",
+            sel(
+                "EPUB 生成エンジンの選択。auto: epub / reader / ibooks はネイティブ、kobo / mobi は外部優先 / lite: AozoraEpub3_Lite を使用 (要 lite ビルド) / external: 外部 AozoraEpub3 を使用 / native: epub / reader / ibooks のネイティブを強制",
+                vec!["auto", "lite", "external", "native"],
+            ),
+        ),
+        (
             "download.interval",
             vis(VarType::Float, "各話DL時に指定秒数待機する"),
         ),
@@ -919,10 +896,36 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "download.relay-sites",
+            vis(
+                VarType::String,
+                concat!(
+                    "外部取得リレーを使うサイト (Workers のみ)。\n",
+                    "auto/空: 全サイトで取得失敗時にリレーを試す (既定)\n",
+                    "none: リレーを使わない\n",
+                    "ホスト名をカンマ区切り: そのサイト (サブドメイン含む) だけ失敗時にリレーを試す\n",
+                    "force:<ホスト名>: 直接取得せず最初からリレー経由にする (検証用の一時切替)"
+                ),
+            ),
+        ),
+        (
             "download.choices-of-digest-options",
             vis(
                 VarType::String,
-                "ダイジェスト化選択肢が出た場合に自動で項目を選択する",
+                concat!(
+                    "話数の減少を検出したときの操作をカンマ区切りで順に指定します。\n",
+                    "1: このまま更新する（話数減少を受け入れます。既存のEPUBが短くなる可能性があります）\n",
+                    "2: 更新をキャンセル\n",
+                    "3: 更新をキャンセルして小説を凍結する\n",
+                    "4: バックアップを作成する\n",
+                    "5: 最新のあらすじを表示する\n",
+                    "6: 小説ページをブラウザで開く\n",
+                    "7: 保存フォルダを開く\n",
+                    "8: 変換する（保存済みの本文を使用）\n",
+                    "空欄、または選択肢を使い切った場合は 2（キャンセル）になります。",
+                    "未設定の場合はCLIの対話環境では選択を求め、Web UI・非対話環境ではキャンセルします。\n",
+                    "4-8 の操作だけでは更新を続行しません。例: 7 はフォルダ表示後にキャンセル、7,1 は表示後に更新します。"
+                ),
             ),
         ),
         (
@@ -1019,11 +1022,38 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "tag.show-novel",
+            vis(VarType::Boolean, "属性タグ「小説」を CLI と WEB UI に表示する (既定 false)"),
+        ),
+        (
+            "tag.show-manga",
+            vis(VarType::Boolean, "属性タグ「漫画」を CLI と WEB UI に表示する (既定 true)"),
+        ),
+        (
+            "tag.attributes-enabled",
+            vis(
+                VarType::Boolean,
+                "属性タグ機能を有効にする。OFF の間は分類を保存するだけで、表示・検索には属性タグを使わない (既定 false)",
+            ),
+        ),
+        (
             "webui.new-tag-color",
             sel(
                 "新規タグに自動割り当てする色。defaultの場合は従来どおりタグ追加順に巡回します",
                 vec![
                     "default", "green", "yellow", "blue", "magenta", "cyan", "red", "white",
+                ],
+            ),
+        ),
+        (
+            "webui.tag-sort-order",
+            sel(
+                "WEB UI のタグ一覧の並び順。favorites_first: お気に入りタグを先頭に、alphabetical: アルファベット順、count: 使用件数順、registered: 登録順",
+                vec![
+                    "favorites_first",
+                    "alphabetical",
+                    "count",
+                    "registered",
                 ],
             ),
         ),
@@ -1038,7 +1068,7 @@ pub fn setting_variables() -> SettingVariables {
             "queue.max-retries",
             invis(
                 VarType::Integer,
-                "ジョブが失敗したときに自動リトライする最大回数。0 でリトライ無効。既定は 3",
+                "ジョブが失敗したときに自動リトライする最大回数。0 でリトライ無効。既定は 3。※Cloudflare Workers 版はキューの consumer max_retries (デプロイ時の値) を超えても効かず、その値に丸められる",
             ),
         ),
         (
@@ -1046,6 +1076,13 @@ pub fn setting_variables() -> SettingVariables {
             invis(
                 VarType::String,
                 "リトライ時の待機秒数をカンマ区切りで指定（s/m/h 単位可、例: 1m,5m,15m）。要素数より多く失敗したときは最後の値を再利用",
+            ),
+        ),
+        (
+            "narou-compat",
+            invis(
+                VarType::Boolean,
+                "SQLite 管理時も .narou/*.yaml を維持し narou.rb との前方互換を保つ。OFF(既定) で完全 SQLite 移行",
             ),
         ),
     ];
@@ -1079,17 +1116,53 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "convert.epub-font",
+            sel(
+                "EPUB の本文フォント。auto: 濁点注記のある小説だけ濁点フォント (DMincho) を使う / always: 常に DMincho を埋め込んで本文を組む (Reader が全角スペース等を描けない場合の回避策)",
+                vec!["auto", "always"],
+            ),
+        ),
+        (
             "server-port",
             vis(
                 VarType::Integer,
-                "WEBサーバ起動時のポート。server-port + 1 のポートも WebSocket で使用",
+                "WEBサーバ起動時のポート。server-port + 1 のポートも WebSocket で使用\n※要サーバ再起動",
+            ),
+        ),
+        (
+            "server-ws-port",
+            vis(
+                VarType::Integer,
+                "WebSocket の待受ポート。0 で併設リスナーを作らず、本体ポートの /ws だけで受ける\n※要サーバ再起動",
             ),
         ),
         (
             "server-bind",
             invis(
                 VarType::String,
-                "WEBサーバのホスト制限(未設定時:起動PCのIP)。頻繁にローカルIPが変わってしまう場合は127.0.0.1の指定を推奨",
+                "WEBサーバのホスト制限(未設定時:起動PCのIP)。頻繁にローカルIPが変わってしまう場合は127.0.0.1の指定を推奨\n※要サーバ再起動",
+            ),
+        ),
+        (
+            "server-digest-auth.enable",
+            invis(VarType::Boolean, "WEBサーバでDigest認証を使用するかどうか"),
+        ),
+        (
+            "server-digest-auth.user",
+            invis(VarType::String, "WEBサーバでDigest認証をするユーザ名"),
+        ),
+        (
+            "server-digest-auth.password",
+            invis(
+                VarType::String,
+                "WEBサーバのDigest認証のパスワード。hashed-passwordも設定した場合はそちらが優先される",
+            ),
+        ),
+        (
+            "server-digest-auth.hashed-password",
+            invis(
+                VarType::String,
+                "WEBサーバのDigest認証のパスワードを、Realmを\"narou.rb\"としてハッシュにしたもの。下記のようなコマンドで生成できる\n$ ruby -r 'digest/md5' -e 'puts Digest::MD5.hexdigest \"#{$*[0]}:narou.rb:#{$*[1]}\"' user password",
             ),
         ),
         (
@@ -1108,7 +1181,7 @@ pub fn setting_variables() -> SettingVariables {
             "server-basic-auth.require-for-external-bind",
             invis(
                 VarType::Boolean,
-                "外部公開bind時にBasic認証未設定での起動を拒否するかどうか",
+                "外部公開bind時にBasic認証未設定での起動を拒否するかどうか\n※サーバ起動時のみ評価",
             ),
         ),
         (
@@ -1139,7 +1212,28 @@ pub fn setting_variables() -> SettingVariables {
                 "HTTP の Host ヘッダに追加で許可するホストのリスト（カンマ区切り、*.example.com 形式のワイルドカード対応）",
             ),
         ),
+        (
+            "external-api.require-token",
+            vis(
+                VarType::Boolean,
+                "外部公開API (/api/v1) の Bearer トークン認証を必須にするかどうか（既定 true）。Cloudflare Zero Trust の内側で使う場合は false にする",
+            ),
+        ),
+        (
+            "external-api.allowed-origins",
+            vis(
+                VarType::String,
+                "既存 UI 認証を使う読み取り API (/api/read/v1) のブラウザ連携元 Origin（カンマ区切り、完全一致、ワイルドカード不可）。空ならクロスオリジン通信を許可しない",
+            ),
+        ),
         ("over18", invis(VarType::Boolean, "18歳以上かどうか")),
+        (
+            "self-update.variant",
+            sel(
+                "セルフアップデートで取得するリリース variant。gpl: AozoraEpub3_Lite 組込み(GPL-3.0) / standard: 外部 AozoraEpub3 を利用(BSD)。未設定なら実行中のビルドと同じ variant を使う",
+                vec!["gpl", "standard"],
+            ),
+        ),
     ];
 
     SettingVariables {
@@ -1169,13 +1263,9 @@ pub fn webui_help_override(name: &str, base_help: &str) -> Option<String> {
         "send.without-freeze" => {
             "一括送信時に凍結された小説は対象外にする。（個別送信時は凍結済みでも送信可能）"
         }
-        "server-basic-auth.enable" => {
-            "%%ORIG%%\n※basic-auth関連の設定を変更した場合サーバの再起動が必要"
+        "concurrency" => {
+            "%%ORIG%% ※キューワーカーのレーン構成のみサーバ再起動が必要（ログ分割は即時反映）"
         }
-        "concurrency" => "%%ORIG%% ※要サーバ再起動",
-        "logging" => "%%ORIG%%\n※要サーバ再起動",
-        "logging.format-filename" => "%%ORIG%%\n※要サーバ再起動",
-        "logging.format-timestamp" => "%%ORIG%%\n※要サーバ再起動",
         "auto-add-tags" => "小説サイトから取得したタグを自動的に小説データに追加する",
         "convert.add-dc-subject-to-epub" => {
             "EPUB変換時にstandard.opfファイルにdc:subject要素を追加する。\n小説のタグ情報がdc:subjectとして埋め込まれ、\n電子書籍リーダーでの検索やカテゴリ分類に活用できます。\n除外するタグは下の設定で指定できます"
@@ -1194,4 +1284,189 @@ pub fn webui_help_override(name: &str, base_help: &str) -> Option<String> {
         _ => return None,
     };
     Some(raw.replace("%%ORIG%%", base_help))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_arg_command_names_cover_web_and_alias() {
+        assert!(default_arg_command_names().contains(&"web"));
+        assert!(default_arg_command_names().contains(&"alias"));
+        assert!(is_known_default_arg_name("default_args.convert"));
+        assert!(!is_known_default_arg_name("default_args.not_exists"));
+    }
+
+    #[test]
+    fn external_bind_auth_override_has_no_webui_tab() {
+        assert_eq!(
+            tab_for_setting("server-basic-auth.require-for-external-bind"),
+            None
+        );
+        assert!(
+            setting_variables()
+                .get("server-basic-auth.require-for-external-bind")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_mode_has_no_webui_tab() {
+        assert_eq!(tab_for_setting("server-reverse-proxy.enable"), None);
+        assert!(
+            setting_variables()
+                .get("server-reverse-proxy.enable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn webui_debug_mode_is_visible_on_webui_tab() {
+        assert_eq!(tab_for_setting("webui.debug-mode"), Some("webui"));
+        assert!(setting_variables().get("webui.debug-mode").is_some());
+    }
+
+    #[test]
+    fn webui_new_tag_color_is_visible_on_webui_tab() {
+        assert_eq!(tab_for_setting("webui.new-tag-color"), Some("webui"));
+        assert!(setting_variables().get("webui.new-tag-color").is_some());
+    }
+
+    #[test]
+    fn server_add_accepted_hosts_has_global_tab() {
+        assert_eq!(tab_for_setting("server-add-accepted-hosts"), Some("global"));
+        let vars = setting_variables();
+        let info = vars
+            .get("server-add-accepted-hosts")
+            .expect("server-add-accepted-hosts must be registered as a global var");
+        assert!(matches!(info.var_type, VarType::String));
+        assert!(info.invisible, "global-only setting should stay invisible on webui tab");
+    }
+
+    #[test]
+    fn self_update_variant_is_selectable_from_settings() {
+        assert_eq!(tab_for_setting("self-update.variant"), Some("global"));
+
+        let vars = setting_variables();
+        let info = vars
+            .get("self-update.variant")
+            .expect("self-update.variant must be registered as a global var");
+        assert!(matches!(info.var_type, VarType::Select));
+        assert!(
+            !info.invisible,
+            "the variant must be listed by `narou setting` and shown on the Web UI settings page"
+        );
+        assert_eq!(
+            info.select_keys,
+            Some(vec!["gpl".to_string(), "standard".to_string()])
+        );
+    }
+
+    #[test]
+    fn queue_retry_settings_have_detail_tab_and_defaults() {
+        assert_eq!(tab_for_setting("queue.max-retries"), Some("detail"));
+        assert_eq!(tab_for_setting("queue.retry-backoff"), Some("detail"));
+
+        let vars = setting_variables();
+        let max = vars
+            .get("queue.max-retries")
+            .expect("queue.max-retries must be registered as a local var");
+        assert!(matches!(max.var_type, VarType::Integer));
+        assert!(max.invisible, "queue settings stay invisible on webui tab");
+
+        let backoff = vars
+            .get("queue.retry-backoff")
+            .expect("queue.retry-backoff must be registered as a local var");
+        assert!(matches!(backoff.var_type, VarType::String));
+        assert!(backoff.invisible);
+
+        // Default values must surface through `default_local_setting_value` so
+        // the user does not have to write them by hand.
+        let max_default = default_local_setting_value("queue.max-retries")
+            .expect("queue.max-retries default");
+        assert_eq!(max_default.as_i64(), Some(3));
+        let backoff_default = default_local_setting_value("queue.retry-backoff")
+            .expect("queue.retry-backoff default");
+        assert_eq!(
+            backoff_default.as_str(),
+            Some("1m,5m,15m"),
+        );
+    }
+
+    #[test]
+    fn digest_choices_help_lists_actions_and_safe_default() {
+        let vars = setting_variables();
+        let info = vars.get("download.choices-of-digest-options").unwrap();
+        for label in [
+            "1: このまま更新する", "2: 更新をキャンセル",
+            "3: 更新をキャンセルして小説を凍結する", "4: バックアップを作成する",
+            "5: 最新のあらすじを表示する", "6: 小説ページをブラウザで開く",
+            "7: 保存フォルダを開く", "8: 変換する",
+            "空欄", "選択肢を使い切った", "7,1", "保存済みの本文",
+        ] {
+            assert!(info.help.contains(label), "missing digest help: {label}");
+        }
+        assert!(!info.help.contains("非終端アクションの後は更新を継続"));
+    }
+
+    #[test]
+    fn update_max_parallel_domains_has_general_tab_and_default() {
+        assert_eq!(tab_for_setting("update.max-parallel-domains"), Some("general"));
+
+        let vars = setting_variables();
+        let info = vars
+            .get("update.max-parallel-domains")
+            .expect("update.max-parallel-domains must be registered as a local var");
+        assert!(matches!(info.var_type, VarType::Integer));
+        assert!(!info.invisible);
+
+        let default = default_local_setting_value("update.max-parallel-domains")
+            .expect("update.max-parallel-domains default");
+        assert_eq!(default.as_i64(), Some(4));
+    }
+
+    #[test]
+    fn mail_attachment_filename_settings_are_visible_on_detail_tab() {
+        assert_eq!(
+            tab_for_setting("mail.attachment-filename-pattern"),
+            Some("detail")
+        );
+        assert_eq!(
+            tab_for_setting("mail.attachment-filename-replacement"),
+            Some("detail")
+        );
+
+        let vars = setting_variables();
+        for name in [
+            "mail.attachment-filename-pattern",
+            "mail.attachment-filename-replacement",
+        ] {
+            let info = vars.get(name).expect("mail attachment filename setting");
+            assert!(matches!(info.var_type, VarType::String));
+            assert!(!info.invisible);
+        }
+    }
+
+    #[test]
+    fn mail_attachment_filename_webui_help_includes_usage_notes() {
+        let vars = setting_variables();
+        let pattern = vars
+            .get("mail.attachment-filename-pattern")
+            .expect("mail attachment filename pattern setting");
+        let replacement = vars
+            .get("mail.attachment-filename-replacement")
+            .expect("mail attachment filename replacement setting");
+
+        let pattern_help =
+            webui_help_override("mail.attachment-filename-pattern", pattern.help).unwrap();
+        let replacement_help =
+            webui_help_override("mail.attachment-filename-replacement", replacement.help).unwrap();
+
+        assert!(pattern_help.contains(r"^\[[^\]]+\](.*)$"));
+        assert!(pattern_help.contains("フォルダ名は含みません"));
+        assert!(replacement_help.contains("$1"));
+        assert!(replacement_help.contains("mail_setting.yaml"));
+        assert!(replacement_help.contains("優先"));
+    }
 }

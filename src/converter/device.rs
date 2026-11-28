@@ -1,23 +1,44 @@
-use std::ffi::OsString;
+#[cfg(feature = "native-runtime")]
 use std::fmt;
+use std::path::Path;
+
+#[cfg(feature = "native-runtime")]
+use std::ffi::OsString;
+#[cfg(feature = "native-runtime")]
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "native-runtime")]
+use std::path::PathBuf;
+#[cfg(feature = "native-runtime")]
 use std::process::{Command, Stdio};
+#[cfg(feature = "native-runtime")]
 use std::sync::mpsc;
+#[cfg(feature = "native-runtime")]
 use std::thread;
+#[cfg(feature = "native-runtime")]
 use std::time::SystemTime;
 
+#[cfg(feature = "native-runtime")]
 use encoding_rs::SHIFT_JIS;
+#[cfg(feature = "native-runtime")]
 use regex::Regex;
+#[cfg(feature = "native-runtime")]
 use zip::write::SimpleFileOptions;
+#[cfg(feature = "native-runtime")]
 use zip::{CompressionMethod, ZipWriter};
 
+#[cfg(feature = "native-runtime")]
 use crate::compat::{
-    canonicalize_aozoraepub3_jar_dir, canonicalize_existing_path, configure_hidden_console_command,
-    load_global_setting_string, resolve_java_command_path, sanitize_java_command,
+    canonicalize_aozoraepub3_tool_path, canonicalize_existing_path,
+    configure_hidden_console_command, load_global_setting_string, resolve_java_command_path,
+    sanitize_java_command,
 };
+#[cfg(feature = "native-runtime")]
 use crate::downloader::util::decode_numeric_entities;
+#[cfg(feature = "native-runtime")]
 use crate::error::{NarouError, Result};
+
+#[cfg(feature = "native-runtime")]
+use super::render::cover_image_path;
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -47,9 +68,11 @@ pub enum Device {
     Ibooks,
 }
 
-impl Device {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for Device {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "epub" => Device::Epub,
             "mobi" | "kindle" => Device::Mobi,
             "kobo" => Device::Kobo,
@@ -57,9 +80,11 @@ impl Device {
             "reader" => Device::Reader,
             "ibooks" => Device::Ibooks,
             _ => Device::Text,
-        }
+        })
     }
+}
 
+impl Device {
     pub fn extension(&self) -> &str {
         match self {
             Device::Text => ".txt",
@@ -129,6 +154,7 @@ impl Device {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 pub struct OutputManager {
     device: Device,
     aozora_epub3_path: Option<PathBuf>,
@@ -137,8 +163,21 @@ pub struct OutputManager {
     no_strip: bool,
     use_dakuten_font: bool,
     yokogaki: bool,
+    #[cfg(feature = "lite")]
+    lite_epub: Option<LiteEpubContext>,
 }
 
+/// `lite` feature での組み込み EPUB 生成に必要なメタ情報。
+/// `None` 項目は変換済みテキストから検出する。
+#[cfg(feature = "lite")]
+#[derive(Debug, Clone, Default)]
+#[cfg(feature = "native-runtime")]
+pub struct LiteEpubContext {
+    pub title: String,
+    pub author: String,
+}
+
+#[cfg(feature = "native-runtime")]
 fn file_contains_dakuten_chuki(path: &Path) -> bool {
     match std::fs::read_to_string(path) {
         Ok(s) => s.contains("［＃濁点］"),
@@ -146,6 +185,7 @@ fn file_contains_dakuten_chuki(path: &Path) -> bool {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 impl OutputManager {
     pub fn new(device: Device) -> Self {
         Self {
@@ -156,11 +196,20 @@ impl OutputManager {
             no_strip: false,
             use_dakuten_font: false,
             yokogaki: false,
+            #[cfg(feature = "lite")]
+            lite_epub: None,
         }
     }
-
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    /// `lite` feature の組み込み EPUB 生成に使うメタ情報を設定する。
+    /// 外部 AozoraEpub3 が見つからない場合のフォールバックとして使われる。
+    #[cfg(feature = "lite")]
+    pub fn with_lite_epub(mut self, context: LiteEpubContext) -> Self {
+        self.lite_epub = Some(context);
         self
     }
 
@@ -188,10 +237,10 @@ impl OutputManager {
             return resolve_java_command_path();
         }
 
-        if name.eq_ignore_ascii_case("AozoraEpub3") {
-            if let Some(path) = Self::find_aozora_epub3_from_settings() {
-                return Some(path);
-            }
+        if name.eq_ignore_ascii_case("AozoraEpub3")
+            && let Some(path) = Self::find_aozora_epub3_from_settings()
+        {
+            return Some(path);
         }
 
         if name.eq_ignore_ascii_case("kindlegen") {
@@ -207,18 +256,16 @@ impl OutputManager {
         let mut lookup = Command::new(locator);
         lookup.arg(name);
         configure_hidden_console_command(&mut lookup);
-        if let Ok(output) = lookup.output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = path.lines().next() {
-                    if !first_line.trim().is_empty() {
-                        if let Some(canonical) =
-                            canonicalize_existing_path(PathBuf::from(first_line.trim()))
-                        {
-                            return Some(canonical);
-                        }
-                    }
-                }
+        if let Ok(output) = lookup.output()
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout);
+            if let Some(first_line) = path.lines().next()
+                && !first_line.trim().is_empty()
+                && let Some(canonical) =
+                    canonicalize_existing_path(PathBuf::from(first_line.trim()))
+            {
+                return Some(canonical);
             }
         }
 
@@ -229,10 +276,10 @@ impl OutputManager {
             ];
             for candidate in &candidates {
                 let p = PathBuf::from(candidate);
-                if p.exists() {
-                    if let Some(canonical) = canonicalize_existing_path(&p) {
-                        return Some(canonical);
-                    }
+                if p.exists()
+                    && let Some(canonical) = canonicalize_existing_path(&p)
+                {
+                    return Some(canonical);
                 }
             }
         }
@@ -283,7 +330,7 @@ impl OutputManager {
 
     fn find_aozora_epub3_from_settings() -> Option<PathBuf> {
         let dir = load_global_setting_string("aozoraepub3dir")?;
-        canonicalize_aozoraepub3_jar_dir(&dir)
+        canonicalize_aozoraepub3_tool_path(&dir)
     }
 
     fn aozora_device_name(&self) -> Option<&'static str> {
@@ -305,6 +352,7 @@ impl OutputManager {
         input_txt: &Path,
         output_dir: &Path,
         output_ext: &str,
+        rotate_ini: Option<&Path>,
     ) -> Vec<OsString> {
         let mut args = vec![
             OsString::from("-enc"),
@@ -312,18 +360,28 @@ impl OutputManager {
             OsString::from("-of"),
         ];
 
+        // `convert.rotate-image` が指定されたときだけ、差し替えた INI を
+        // `-i` で渡す (Lite CLI の INI パスオプション。呼び出し側が
+        // `prepare_rotate_image_ini` で Lite exe のときだけ Some を返す)。
+        if let Some(rotate_ini) = rotate_ini {
+            args.push(OsString::from("-i"));
+            args.push(resolved_path_for_aozora(rotate_ini).into_os_string());
+        }
+
         if let Some(device_name) = self.aozora_device_name() {
             args.push(OsString::from("-device"));
             args.push(OsString::from(device_name));
         }
 
-        if input_txt.parent().is_some_and(has_cover_image) {
+        // Java CLI と同じく、表紙ファイルの実在だけで `-c 0` を渡す
+        // (`enable_illust` は見ない)。
+        if input_txt.parent().and_then(cover_image_path).is_some() {
             args.push(OsString::from("-c"));
             args.push(OsString::from("0"));
         }
 
         args.push(OsString::from("-dst"));
-        args.push(absolutize_path(output_dir).into_os_string());
+        args.push(resolved_path_for_aozora(output_dir).into_os_string());
 
         if let Some(ext_option) = self.aozora_ext_option(output_ext) {
             args.push(OsString::from("-ext"));
@@ -334,7 +392,7 @@ impl OutputManager {
             args.push(OsString::from("-hor"));
         }
 
-        args.push(absolutize_path(input_txt).into_os_string());
+        args.push(resolved_path_for_aozora(input_txt).into_os_string());
         args
     }
 
@@ -372,6 +430,7 @@ impl OutputManager {
 
         let mut cmd = if tool_path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
             let java_path = resolve_java_command_path()
+                .or_else(|| crate::compat::resolve_bundled_java_for_jar(&tool_path))
                 .ok_or_else(|| NarouError::Conversion("java not found".into()))?;
             let jar_name = tool_path
                 .file_name()
@@ -408,10 +467,35 @@ impl OutputManager {
         let (mut cmd, working_dir) = self.build_aozora_command()?;
         let needs_dakuten = self.use_dakuten_font || file_contains_dakuten_chuki(input_txt);
         let _dakuten_guard = if needs_dakuten {
-            Some(super::dakuten_font::DakutenFontGuard::activate(&working_dir)?)
+            Some(super::dakuten_font::DakutenFontGuard::activate(
+                &working_dir,
+            )?)
         } else {
+            // 古い narou_rs で初期化されたライブラリでも、カスタム CSS が
+            // 正しい配置先 (電書協レイアウトは style_custom/font.css) に
+            // 無いと二分アキ・行高が EPUB に反映されない。無い場合だけ
+            // 現在の設定で補完する。書けない環境では従来どおり変換を続ける。
+            if let Err(error) = super::dakuten_font::ensure_normal_css(&working_dir) {
+                tracing::warn!(
+                    dir = %working_dir.display(),
+                    error = %error,
+                    "failed to install narou custom CSS for AozoraEpub3"
+                );
+            }
             None
         };
+        // `convert.rotate-image` が指定されていれば、RotateImage を差し替えた
+        // 一時 INI を `-i` で渡す。対象は外部ツールが Lite の exe のときだけ
+        // (Java jar は INI 差し替えオプションを持たない)。子プロセスの起動
+        // より前に作り、関数が返るまで生存させる。
+        let _rotate_ini_guard = match rotate_image_override() {
+            Some(rotation) => self.prepare_rotate_image_ini(rotation)?,
+            None => None,
+        };
+        let rotate_ini_path = _rotate_ini_guard
+            .as_ref()
+            .map(|guard| guard.path().to_path_buf());
+
         let base_name = input_txt
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -429,12 +513,16 @@ impl OutputManager {
             })?;
         }
 
-        let invocation = prepare_aozora_invocation(input_txt, output_dir, output_ext, &output_path)?;
+        let invocation =
+            prepare_aozora_invocation(input_txt, output_dir, output_ext, &output_path)?;
         let actual_aozora_output_path = absolutize_path(&invocation.expected_output_path);
 
-        for arg in
-            self.build_aozora_epub3_args(&invocation.input_txt, &invocation.output_dir, output_ext)
-        {
+        for arg in self.build_aozora_epub3_args(
+            &invocation.input_txt,
+            &invocation.output_dir,
+            output_ext,
+            rotate_ini_path.as_deref(),
+        ) {
             cmd.arg(arg);
         }
         if !self.verbose {
@@ -526,36 +614,6 @@ impl OutputManager {
 
         eprintln!("変換しました");
         Ok(output_path)
-    }
-
-    /// EPUB を生成する。既定はネイティブ経路（grill Q1）。`convert.use-aozoraepub3` 有効かつ
-    /// AozoraEpub3/Java が解決可能なときのみ従来経路を使い、解決不可ならネイティブへフォールバックする。
-    /// 検証用に環境変数 `NAROU_RS_EPUB_ENGINE`(`native`/`aozora`) で強制切替できる。
-    fn build_epub_output(
-        &self,
-        input_txt: &Path,
-        output_dir: &Path,
-        output_ext: &str,
-        include_illust: bool,
-    ) -> Result<PathBuf> {
-        if self.use_aozora_engine() {
-            return self.run_aozora_epub3(input_txt, output_dir, output_ext);
-        }
-        self.run_native_epub(input_txt, output_dir, output_ext, include_illust)
-    }
-
-    /// AozoraEpub3 経路を使うべきか判定する。
-    fn use_aozora_engine(&self) -> bool {
-        match std::env::var("NAROU_RS_EPUB_ENGINE").ok().as_deref() {
-            Some("native") => return false,
-            Some("aozora") => return true,
-            _ => {}
-        }
-        if !crate::compat::load_local_setting_bool("convert.use-aozoraepub3") {
-            return false;
-        }
-        // 退避指定でも AozoraEpub3/Java が解決できなければネイティブへフォールバック。
-        self.aozora_epub3_path.is_some() && resolve_java_command_path().is_some()
     }
 
     fn run_native_epub(
@@ -662,18 +720,13 @@ impl OutputManager {
                 }
             }
 
-            for ext in [".jpg", ".png", ".jpeg"] {
-                let cover_name = format!("cover{ext}");
-                let cover_path = input_txt
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(&cover_name);
-                if cover_path.exists() {
-                    zip.start_file(cover_name, options)
-                        .map_err(|e| NarouError::Conversion(e.to_string()))?;
-                    zip.write_all(&std::fs::read(cover_path)?)?;
-                    break;
-                }
+            if let Some(cover_path) =
+                cover_image_path(input_txt.parent().unwrap_or_else(|| Path::new(".")))
+                && let Some(cover_name) = cover_path.file_name().and_then(|name| name.to_str())
+            {
+                zip.start_file(cover_name, options)
+                    .map_err(|e| NarouError::Conversion(e.to_string()))?;
+                zip.write_all(&std::fs::read(&cover_path)?)?;
             }
 
             zip.finish()
@@ -692,17 +745,25 @@ impl OutputManager {
         base_name: &str,
         include_illust: bool,
     ) -> Result<PathBuf> {
+        #[cfg(feature = "native-runtime")]
+        {
+            crate::application::novel_access::require_private_path(input_txt)?;
+            crate::application::novel_access::require_private_path(output_dir)?;
+        }
+        if matches!(self.device, Device::Text) {
+            return Ok(input_txt.to_path_buf());
+        }
         match self.device {
             Device::Text => Ok(input_txt.to_path_buf()),
-            Device::Epub => self.build_epub_output(input_txt, output_dir, ".epub", include_illust),
-            Device::Kobo => self.run_aozora_epub3(input_txt, output_dir, ".kepub.epub"),
+            Device::Epub => self.epub_output(input_txt, output_dir, ".epub", include_illust),
+            Device::Kobo => self.epub_output(input_txt, output_dir, ".kepub.epub", include_illust),
             Device::Ibunko => self.create_ibunko_zip(input_txt, include_illust),
-            Device::Reader => self.build_epub_output(input_txt, output_dir, ".epub", include_illust),
-            Device::Ibooks => self.build_epub_output(input_txt, output_dir, ".epub", include_illust),
+            Device::Reader => self.epub_output(input_txt, output_dir, ".epub", include_illust),
+            Device::Ibooks => self.epub_output(input_txt, output_dir, ".epub", include_illust),
             Device::Mobi => {
                 let temp_input = output_dir.join(format!("{}_mobi_source.txt", base_name));
                 std::fs::copy(input_txt, &temp_input)?;
-                let epub_temp = match self.run_aozora_epub3(&temp_input, output_dir, ".epub") {
+                let epub_temp = match self.epub_output(&temp_input, output_dir, ".epub", include_illust) {
                     Ok(path) => path,
                     Err(err) => {
                         let _ = std::fs::remove_file(&temp_input);
@@ -760,10 +821,10 @@ impl OutputManager {
                     )));
                 }
 
-                if !self.no_strip {
-                    if let Err(err) = strip_mobi_file(&mobi_output) {
-                        eprintln!("{}", err);
-                    }
+                if !self.no_strip
+                    && let Err(err) = strip_mobi_file(&mobi_output)
+                {
+                    eprintln!("{}", err);
                 }
 
                 Ok(mobi_output)
@@ -771,26 +832,116 @@ impl OutputManager {
         }
     }
 
+    fn epub_output(
+        &self,
+        input_txt: &Path,
+        output_dir: &Path,
+        output_ext: &str,
+        include_illust: bool,
+    ) -> Result<PathBuf> {
+        let preference = epub_engine_preference();
+        if matches!(self.device, Device::Epub | Device::Reader | Device::Ibooks)
+            && (preference == EpubEngine::Native
+                || (preference == EpubEngine::Auto
+                    && !(crate::compat::load_local_setting_bool("convert.use-aozoraepub3")
+                        && self.aozora_epub3_path.is_some()
+                        && resolve_java_command_path().is_some())))
+        {
+            return self.run_native_epub(input_txt, output_dir, output_ext, include_illust);
+        }
+        if preference == EpubEngine::External
+            || (preference != EpubEngine::Lite && self.aozora_epub3_path.is_some())
+        {
+            return self.run_aozora_epub3(input_txt, output_dir, output_ext);
+        }
+        #[cfg(feature = "lite")]
+        {
+            self.run_lite_epub(input_txt, output_dir, output_ext)
+        }
+        #[cfg(not(feature = "lite"))]
+        {
+            if preference == EpubEngine::Lite {
+                return Err(NarouError::Conversion(
+                    "NAROU_RS_EPUB_ENGINE=lite ですが、この実行ファイルは組み込み EPUB \
+                     エンジン入りでビルドされていません (cargo build --features lite)"
+                        .into(),
+                ));
+            }
+            self.run_aozora_epub3(input_txt, output_dir, output_ext)
+        }
+    }
+
+    /// `lite` feature の組み込み EPUB エンジンで生成する。挿絵は入力テキストの
+    /// 階層から解決する (Java 版と同じ規約)。
+    #[cfg(feature = "lite")]
+    fn run_lite_epub(
+        &self,
+        input_txt: &Path,
+        output_dir: &Path,
+        output_ext: &str,
+    ) -> Result<PathBuf> {
+        let context = self.lite_epub.clone().unwrap_or_default();
+        // 挿絵の取り出しは [`Self::convert_file`] が受け持つ (EPUB を要求する
+        // 経路すべてで必要なので、入口 1 箇所に寄せる)。
+        // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
+        //
+        // 表紙は Java CLI と同じ条件 (`-c 0` = 表紙ファイルの実在だけ) で決め、
+        // `enable_illust` を見ないため native Web / Worker の `from_settings` は
+        // 使わない。濁点フォントは preset の実体から組む。
+        let options = crate::epub_lite::EpubBuildOptions {
+            title: context.title.clone(),
+            author: context.author.clone(),
+            vertical: !self.yokogaki,
+            cover_from_first_image: input_txt.parent().and_then(cover_image_path).is_some(),
+            assets_dir: crate::compat::lite_preset_dir(),
+            kindle: matches!(self.device, Device::Mobi),
+            extra_assets: super::dakuten_font::lite_font_assets(self.use_dakuten_font)?,
+            rotate_image: rotate_image_override(),
+        };
+        let build = crate::epub_lite::build_book(input_txt, &options)?;
+
+        let base_name = input_txt
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| NarouError::Conversion("Invalid input filename".into()))?;
+        let output_path = output_dir.join(format!("{}{}", base_name, output_ext));
+        if output_path.exists() {
+            std::fs::remove_file(&output_path).map_err(|e| {
+                NarouError::Conversion(format!(
+                    "Failed to remove existing output file {}: {}",
+                    output_path.display(),
+                    e
+                ))
+            })?;
+        }
+        let file = std::fs::File::create(&output_path)?;
+        crate::epub_lite::stream_epub(&build.book, file, |epub_path| build.resolve(epub_path))?;
+        if self.verbose {
+            eprintln!("AozoraEpub3_Lite (組み込み) でEPUBに変換しました");
+        }
+        Ok(output_path)
+    }
+
     pub fn available_devices() -> Vec<(String, bool)> {
-        // epub/reader/ibooks はネイティブ EPUB3 経路が既定で、AozoraEpub3/Java 非依存。
-        // よって外部ツールの有無に関わらず常に利用可能。mobi(kindlegen)/kobo(AozoraEpub3)
-        // は従来どおり外部ツール依存。
-        let devices = vec![
+        let preference = epub_engine_preference();
+        let has_aozora = Self::find_external_tool("AozoraEpub3").is_some();
+        let has_epub_engine = match preference {
+            EpubEngine::Lite => cfg!(feature = "lite"),
+            EpubEngine::External => has_aozora,
+            EpubEngine::Auto | EpubEngine::Native => has_aozora || cfg!(feature = "lite"),
+        };
+        let has_standard_epub = matches!(preference, EpubEngine::Auto | EpubEngine::Native)
+            || has_epub_engine;
+        let has_kindlegen = has_epub_engine && Self::find_external_tool("kindlegen").is_some();
+        vec![
             ("text".to_string(), true),
-            ("epub".to_string(), true),
-            ("mobi".to_string(), {
-                Self::find_external_tool("kindlegen").is_some()
-                    && Self::find_external_tool("AozoraEpub3").is_some()
-            }),
-            (
-                "kobo".to_string(),
-                Self::find_external_tool("AozoraEpub3").is_some(),
-            ),
+            ("epub".to_string(), has_standard_epub),
+            ("mobi".to_string(), has_kindlegen),
+            ("kobo".to_string(), has_epub_engine),
             ("ibunko".to_string(), true),
-            ("reader".to_string(), true),
-            ("ibooks".to_string(), true),
-        ];
-        devices
+            ("reader".to_string(), has_standard_epub),
+            ("ibooks".to_string(), has_standard_epub),
+        ]
     }
 
     pub fn get_documents_path(&self) -> Option<PathBuf> {
@@ -861,8 +1012,55 @@ impl OutputManager {
         }
         Ok(Some(dst_path))
     }
+
+    /// `convert.rotate-image` 用の一時 INI を作る。
+    ///
+    /// 対象は外部ツールが AozoraEpub3_Lite の実行ファイル (`AozoraEpub3_Lite.exe`
+    /// 等、Java ではないもの) のときだけ。Lite CLI は `-i <file>` で指定した
+    /// INI を `AozoraConfig` に読み、`-i` 無しでは INI を読まない (Java CLI と
+    /// 同じ空プロファイルで動く)。空プロファイルは `from_ini` の既定値と同じ
+    /// ため、差し替えるのは `RotateImage` 1 項目だけで現行と同じ挙動になる。
+    ///
+    /// Java 版 `AozoraEpub3.jar` は INI パスを受け取るオプションを持たず、
+    /// 起動ディレクトリの `AozoraEpub3.ini` を必ず読む。インストール先の
+    /// INI は書き換えない方針のため jar には `None` を返し (本項目は効かない)、
+    /// 組み込みエンジン (`epub-engine=lite`) で同じ効果を得られる。
+    #[cfg(feature = "native-runtime")]
+    fn prepare_rotate_image_ini(
+        &self,
+        rotation: crate::converter::settings::ImageRotation,
+    ) -> Result<Option<tempfile::NamedTempFile>> {
+        let tool_path = self
+            .aozora_epub3_path
+            .as_ref()
+            .ok_or_else(|| NarouError::Conversion("AozoraEpub3 not found".into()))?;
+        if tool_path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+            return Ok(None);
+        }
+
+        // 一時ファイルは子プロセスが読み終わるまで生存させる (`Drop` で削除)。
+        let mut file = tempfile::Builder::new()
+            .prefix("narou-aozora-ini-")
+            .suffix(".ini")
+            .tempfile()?;
+        file.write_all(format!("RotateImage={}\n", rotation.ini_value()).as_bytes())?;
+        file.flush()?;
+        Ok(Some(file))
+    }
 }
 
+/// `convert.rotate-image` の設定値を解決する。未設定・`auto`・`ini`・空文字は
+/// `None` (= ツール側の `RotateImage` (ini) に従う = 本家準拠の既定)。
+///
+/// ローカル設定 (`narou setting convert.rotate-image …`) を読む。Worker の
+/// `download.epub` は D1 の同じキーを `lib.rs` で読む。
+#[cfg(feature = "native-runtime")]
+fn rotate_image_override() -> Option<crate::converter::settings::ImageRotation> {
+    crate::compat::load_local_setting_string("convert.rotate-image")
+        .and_then(|value| crate::converter::settings::ImageRotation::from_setting(&value))
+}
+
+#[cfg(feature = "native-runtime")]
 fn home_dir() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         return Some(PathBuf::from(home));
@@ -876,8 +1074,10 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "native-runtime")]
 struct StripError(String);
 
+#[cfg(feature = "native-runtime")]
 impl StripError {
     fn invalid_format() -> Self {
         Self("invalid file format".to_string())
@@ -892,12 +1092,53 @@ impl StripError {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 impl fmt::Display for StripError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
+/// Which EPUB engine the environment asks for.
+#[cfg(feature = "native-runtime")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpubEngine {
+    Auto,
+    Native,
+    /// Embedded engine (`lite` feature builds).
+    Lite,
+    /// External AozoraEpub3, even if the embedded engine is available.
+    External,
+}
+
+/// `convert.epub-engine` picks the engine; `NAROU_RS_EPUB_ENGINE` overrides it
+/// for one run (the Web UI starts conversions as child processes, so the
+/// setting is what the browser switches).
+#[cfg(feature = "native-runtime")]
+fn epub_engine_preference() -> EpubEngine {
+    if let Ok(value) = std::env::var("NAROU_RS_EPUB_ENGINE")
+        && let Some(engine) = parse_epub_engine(&value)
+    {
+        return engine;
+    }
+    crate::compat::load_local_setting_string("convert.epub-engine")
+        .or_else(|| crate::compat::load_global_setting_string("convert.epub-engine"))
+        .and_then(|value| parse_epub_engine(&value))
+        .unwrap_or(EpubEngine::Auto)
+}
+
+#[cfg(feature = "native-runtime")]
+fn parse_epub_engine(value: &str) -> Option<EpubEngine> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(EpubEngine::Auto),
+        "lite" | "builtin" => Some(EpubEngine::Lite),
+        "native" => Some(EpubEngine::Native),
+        "external" | "java" | "aozora" => Some(EpubEngine::External),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "native-runtime")]
 fn strip_mobi_file(path: &Path) -> std::result::Result<(), StripError> {
     let data = std::fs::read(path).map_err(|e| StripError(e.to_string()))?;
     let stripped = strip_mobi_sources(&data)?;
@@ -905,6 +1146,7 @@ fn strip_mobi_file(path: &Path) -> std::result::Result<(), StripError> {
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn strip_mobi_sources(datain: &[u8]) -> std::result::Result<Vec<u8>, StripError> {
     if slice_range(datain, 0x3c, 0x44)? != b"BOOKMOBI" {
         return Err(StripError::invalid_format());
@@ -985,6 +1227,7 @@ fn strip_mobi_sources(datain: &[u8]) -> std::result::Result<Vec<u8>, StripError>
     Ok(data_file)
 }
 
+#[cfg(feature = "native-runtime")]
 fn update_exth121(mobiheader: &mut [u8], srcs_secnum: u32, srcs_cnt: u32) {
     let Ok(mobi_length) = read_be_u32(mobiheader, 0x14) else {
         return;
@@ -1033,16 +1276,19 @@ fn update_exth121(mobiheader: &mut [u8], srcs_secnum: u32, srcs_cnt: u32) {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn read_be_u16(data: &[u8], offset: usize) -> std::result::Result<u16, StripError> {
     let bytes = slice_range(data, offset, offset + 2)?;
     Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
+#[cfg(feature = "native-runtime")]
 fn read_be_u32(data: &[u8], offset: usize) -> std::result::Result<u32, StripError> {
     let bytes = slice_range(data, offset, offset + 4)?;
     Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+#[cfg(feature = "native-runtime")]
 fn patch_range(
     data: &mut [u8],
     offset: usize,
@@ -1055,14 +1301,17 @@ fn patch_range(
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn slice_range(data: &[u8], start: usize, end: usize) -> std::result::Result<&[u8], StripError> {
     data.get(start..end).ok_or_else(StripError::invalid_format)
 }
 
+#[cfg(feature = "native-runtime")]
 fn slice_from(data: &[u8], start: usize) -> std::result::Result<&[u8], StripError> {
     data.get(start..).ok_or_else(StripError::invalid_format)
 }
 
+#[cfg(feature = "native-runtime")]
 struct AozoraInvocation {
     _temp_dir: Option<tempfile::TempDir>,
     input_txt: PathBuf,
@@ -1071,6 +1320,7 @@ struct AozoraInvocation {
     final_output_path: PathBuf,
 }
 
+#[cfg(feature = "native-runtime")]
 impl AozoraInvocation {
     fn direct(input_txt: &Path, output_dir: &Path, final_output_path: &Path) -> Self {
         Self {
@@ -1105,6 +1355,7 @@ impl AozoraInvocation {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn prepare_aozora_invocation(
     input_txt: &Path,
     output_dir: &Path,
@@ -1122,10 +1373,12 @@ fn prepare_aozora_invocation(
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn should_use_aozora_temp_workspace(input_txt: &Path, output_dir: &Path) -> bool {
     path_contains_aozora_risky_chars(input_txt) || path_contains_aozora_risky_chars(output_dir)
 }
 
+#[cfg(feature = "native-runtime")]
 fn path_contains_aozora_risky_chars(path: &Path) -> bool {
     let path_text = path.to_string_lossy();
     // AozoraEpub3(Java) 自身がファイル名正規化で取りこぼす Unicode 文字は OS 非依存で退避する
@@ -1138,11 +1391,13 @@ fn path_contains_aozora_risky_chars(path: &Path) -> bool {
     cfg!(windows) && windows_31j_encode_has_errors(&path_text)
 }
 
+#[cfg(feature = "native-runtime")]
 fn windows_31j_encode_has_errors(text: &str) -> bool {
     let (_, _, had_errors) = SHIFT_JIS.encode(text);
     had_errors
 }
 
+#[cfg(feature = "native-runtime")]
 fn is_aozora_mapping_risky_char(ch: char) -> bool {
     matches!(
         ch,
@@ -1165,11 +1420,14 @@ fn is_aozora_mapping_risky_char(ch: char) -> bool {
     )
 }
 
+#[cfg(feature = "native-runtime")]
 fn copy_aozora_companion_files(input_txt: &Path, temp_root: &Path) -> Result<()> {
     let Some(src_dir) = input_txt.parent() else {
         return Ok(());
     };
 
+    // 手書きテキストは任意の `cover.*` を参照し得るため、実在する分をすべて
+    // 運ぶ (表示・`-c 0` の選択は AozoraEpub3 側に任せる)。
     for ext in [".jpg", ".png", ".jpeg"] {
         let name = format!("cover{}", ext);
         let src = src_dir.join(&name);
@@ -1181,6 +1439,7 @@ fn copy_aozora_companion_files(input_txt: &Path, temp_root: &Path) -> Result<()>
     copy_dir_contents_if_exists(&src_dir.join("挿絵"), &temp_root.join("挿絵"))
 }
 
+#[cfg(feature = "native-runtime")]
 fn copy_dir_contents_if_exists(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Ok(());
@@ -1203,6 +1462,7 @@ fn copy_dir_contents_if_exists(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn move_aozora_output(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1218,6 +1478,7 @@ fn move_aozora_output(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn normalize_windows_verbatim_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if cfg!(windows) && raw.starts_with(r"\\?\") {
@@ -1227,6 +1488,7 @@ fn normalize_windows_verbatim_path(path: &Path) -> PathBuf {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn absolutize_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return normalize_windows_verbatim_path(path);
@@ -1238,12 +1500,21 @@ fn absolutize_path(path: &Path) -> PathBuf {
     }
 }
 
-fn has_cover_image(dir: &Path) -> bool {
-    [".jpg", ".png", ".jpeg"]
-        .iter()
-        .any(|ext| dir.join(format!("cover{}", ext)).is_file())
+/// ファイルシステムが報告する実パスへ解決してから AozoraEpub3 へ渡す。
+///
+/// AozoraEpub3 (JDK21 版) は出力パスが `-dst` の *実パス* 配下かを検査し、
+/// 外れていれば「出力パスが許可されたディレクトリ外です」で失敗する。検査は
+/// 出力ファイルが無い時点で字句的に正規化したパスと比較されるため、`-dst` が
+/// junction / シンボリックリンク / 8.3 短縮名 を含む形だと、実際には同じ場所でも
+/// 一致せず失敗する。解決できない場合は従来どおり絶対パス化して返す。
+#[cfg(feature = "native-runtime")]
+fn resolved_path_for_aozora(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .map(|resolved| normalize_windows_verbatim_path(&resolved))
+        .unwrap_or_else(|_| absolutize_path(path))
 }
 
+#[cfg(feature = "native-runtime")]
 fn aozora_output_looks_generated(output_path: &Path, started_at: SystemTime) -> Result<bool> {
     let metadata = std::fs::metadata(output_path)?;
     let modified_is_newer = metadata
@@ -1253,6 +1524,7 @@ fn aozora_output_looks_generated(output_path: &Path, started_at: SystemTime) -> 
     Ok(modified_is_newer || metadata.len() > 0)
 }
 
+#[cfg(feature = "native-runtime")]
 fn build_aozora_output_summary(stdout: Option<Vec<u8>>, stderr: Option<Vec<u8>>) -> String {
     let stdout_text = stdout
         .filter(|b| !b.is_empty())
@@ -1273,6 +1545,7 @@ fn build_aozora_output_summary(stdout: Option<Vec<u8>>, stderr: Option<Vec<u8>>)
     summary
 }
 
+#[cfg(feature = "native-runtime")]
 fn truncate_output_for_error(text: &str) -> String {
     const MAX_LINES: usize = 80;
     const MAX_BYTES: usize = 16 * 1024;
@@ -1295,6 +1568,7 @@ fn truncate_output_for_error(text: &str) -> String {
     result
 }
 
+#[cfg(feature = "native-runtime")]
 fn decode_ibunko_html_entities(text: &str) -> String {
     let mut data = text
         .replace("&quot;", "\"")
@@ -1306,7 +1580,7 @@ fn decode_ibunko_html_entities(text: &str) -> String {
     data
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "native-runtime"))]
 fn find_windows_volume_root(volume_name: &str) -> Option<PathBuf> {
     for letter in b'A'..=b'Z' {
         let drive = format!("{}:\\", letter as char);
@@ -1322,7 +1596,7 @@ fn find_windows_volume_root(volume_name: &str) -> Option<PathBuf> {
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "native-runtime"))]
 fn find_windows_volume_root(_volume_name: &str) -> Option<PathBuf> {
     None
 }
@@ -1361,13 +1635,14 @@ fn volume_matches(root: &str, expected: &str) -> bool {
     label.eq_ignore_ascii_case(expected) || serial_text.eq_ignore_ascii_case(expected)
 }
 
+#[cfg(feature = "native-runtime")]
 fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
     let mut roots = vec![PathBuf::from("/media"), PathBuf::from("/mnt")];
-    if let Some(home) = home_dir() {
-        if let Some(user) = home.file_name().and_then(|v| v.to_str()) {
-            roots.push(PathBuf::from("/run/media").join(user));
-            roots.push(PathBuf::from("/media").join(user));
-        }
+    if let Some(home) = home_dir()
+        && let Some(user) = home.file_name().and_then(|v| v.to_str())
+    {
+        roots.push(PathBuf::from("/run/media").join(user));
+        roots.push(PathBuf::from("/media").join(user));
     }
 
     for root in roots {
@@ -1380,16 +1655,18 @@ fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "native-runtime")]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(windows)]
+    use super::normalize_windows_verbatim_path;
     use super::{
-        Device, OutputManager, StripError, absolutize_path, build_aozora_output_summary,
+        Device, OutputManager, StripError, build_aozora_output_summary,
         decode_ibunko_html_entities, path_contains_aozora_risky_chars,
-        prepare_aozora_invocation, normalize_windows_verbatim_path, strip_mobi_sources,
-        truncate_output_for_error,
+        prepare_aozora_invocation, strip_mobi_sources, truncate_output_for_error,
     };
 
     fn test_output_manager(device: Device) -> OutputManager {
@@ -1401,6 +1678,8 @@ mod tests {
             no_strip: false,
             use_dakuten_font: false,
             yokogaki: false,
+            #[cfg(feature = "lite")]
+            lite_epub: None,
         }
     }
 
@@ -1433,15 +1712,13 @@ mod tests {
         assert!(!Device::Kobo.matches_ebook_file(Path::new("novel.epub")));
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalize_windows_verbatim_path_strips_prefix() {
-        let verbatim = Path::new(r"\\?\C:\Tools\AozoraEpub3\AozoraEpub3.jar");
-        let expected = if cfg!(windows) {
+        assert_eq!(
+            normalize_windows_verbatim_path(Path::new(r"\\?\C:\Tools\AozoraEpub3\AozoraEpub3.jar")),
             Path::new(r"C:\Tools\AozoraEpub3\AozoraEpub3.jar")
-        } else {
-            verbatim
-        };
-        assert_eq!(normalize_windows_verbatim_path(verbatim), expected);
+        );
     }
 
     #[test]
@@ -1534,7 +1811,12 @@ mod tests {
         if cfg!(windows) {
             assert_ne!(invocation.input_txt, input);
             assert_eq!(
-                invocation.expected_output_path.file_name().unwrap().to_str().unwrap(),
+                invocation
+                    .expected_output_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
                 "input.epub"
             );
             assert!(invocation.needs_final_copy());
@@ -1553,7 +1835,7 @@ mod tests {
         fs::write(dir.join("cover.jpg"), b"cover").unwrap();
 
         let manager = test_output_manager(Device::Mobi).with_yokogaki(true);
-        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".epub"));
+        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".epub", None));
 
         assert_eq!(args[0], "-enc");
         assert_eq!(args[1], "UTF-8");
@@ -1562,7 +1844,52 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-c", "0"]));
         assert!(args.contains(&"-hor".to_string()));
         assert!(!args.contains(&"-ext".to_string()));
-        assert_eq!(PathBuf::from(args.last().unwrap()), absolutize_path(&input));
+        // The paths handed over are resolved, so AozoraEpub3 still has to see
+        // the same file (its output check compares real paths).
+        let input_arg = PathBuf::from(args.last().unwrap());
+        assert_eq!(
+            fs::canonicalize(&input_arg).unwrap(),
+            fs::canonicalize(&input).unwrap()
+        );
+    }
+
+    /// AozoraEpub3 (JDK21) rejects an output whose `-dst` directory resolves
+    /// elsewhere, so the arguments must carry the resolved path.
+    #[cfg(windows)]
+    #[test]
+    fn aozora_args_resolve_the_output_directory() {
+        let dir = create_test_dir("junction-args");
+        let target = dir.join("target");
+        fs::create_dir_all(target.join("novel")).unwrap();
+        let link = dir.join("link");
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+            && link.is_dir();
+        if !created {
+            // Junction creation needs NTFS and a permitted parent directory.
+            return;
+        }
+        let novel_dir = link.join("novel");
+        let input = novel_dir.join("novel.txt");
+        fs::write(&input, "test").unwrap();
+
+        let manager = test_output_manager(Device::Epub);
+        let args = stringify_args(manager.build_aozora_epub3_args(&input, &novel_dir, ".epub", None));
+
+        let dst_index = args.iter().position(|arg| arg == "-dst").unwrap();
+        let dst = PathBuf::from(&args[dst_index + 1]);
+        let resolved = normalize_windows_verbatim_path(&fs::canonicalize(&dst).unwrap());
+        assert_eq!(dst, resolved, "-dst must already be the resolved directory");
+        let input_arg = PathBuf::from(args.last().unwrap());
+        assert_eq!(
+            fs::canonicalize(&input_arg).unwrap(),
+            fs::canonicalize(&input).unwrap()
+        );
     }
 
     #[test]
@@ -1572,7 +1899,7 @@ mod tests {
         fs::write(&input, "test").unwrap();
 
         let manager = test_output_manager(Device::Kobo);
-        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".kepub.epub"));
+        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".kepub.epub", None));
 
         assert!(args.windows(2).any(|pair| pair == ["-ext", ".kepub.epub"]));
         assert!(!args.contains(&"-device".to_string()));

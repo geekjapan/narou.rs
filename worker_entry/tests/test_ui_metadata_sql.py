@@ -1,0 +1,327 @@
+"""Execute the production UI SQL against SQLite, without network or credentials.
+
+This verifies query semantics and bounded result sizes, not D1 latency or Rust
+compilation. Run: python -m unittest discover -s worker_entry/tests -p 'test_ui_*.py'
+"""
+from collections import Counter
+import itertools
+from pathlib import Path
+import re
+import sqlite3
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+SOURCES = [
+    (ROOT / "worker_entry/src/webui/queue.rs").read_text(encoding="utf-8"),
+    (ROOT / "worker_entry/src/webui/queue/paging.rs").read_text(encoding="utf-8"),
+]
+SQL = {}
+for source in SOURCES:
+    SQL.update(re.findall(r'const (\w+_SQL): &str = r#"(.*?)"#;', source, re.S))
+shared = (ROOT / "src/db/novel_query.rs").read_text(encoding="utf-8")
+for name in ("TAG_NAMES_SQL", "ATTRIBUTE_NAMES_SQL"):
+    SQL[name] = re.search(rf'const {name}: &str = r#"(.*?)"#;', shared, re.S).group(1)
+ACTIVE = {"pending", "retryable", "running"}
+SECONDARY = {"convert", "send", "backup", "mail"}
+STATUSES = (*sorted(ACTIVE), "succeeded", "partial", "blocked", "permanent")
+KINDS = ("download", "update", "auto_update", "convert", "send", "backup", "mail", "future-kind")
+COUNT_MIGRATION = (ROOT / "worker_entry/migrations/0017_worker_job_counts.sql").read_text(encoding="utf-8")
+
+
+class UiMetadataSqlTests(unittest.TestCase):
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.addCleanup(self.db.close)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript("""
+            PRAGMA foreign_keys=ON;
+            CREATE TABLE novels (id INTEGER PRIMARY KEY, title TEXT, extra_fields_json TEXT, attribute_tag TEXT);
+            CREATE TABLE novel_tags (
+                novel_id INTEGER NOT NULL REFERENCES novels(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL, position INTEGER NOT NULL,
+                UNIQUE(novel_id, tag)
+            );
+            CREATE TABLE worker_jobs (
+                job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL,
+                options TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, last_error TEXT
+            );
+            CREATE INDEX jobs_status ON worker_jobs(status);
+            CREATE INDEX novel_tags_exact_tag_idx ON novel_tags(tag, novel_id);
+            CREATE TABLE app_state (
+                scope TEXT NOT NULL, key TEXT NOT NULL,
+                value_json TEXT NOT NULL, value_yaml TEXT NOT NULL,
+                PRIMARY KEY(scope, key)
+            );
+        """)
+        self.db.executescript(COUNT_MIGRATION)
+
+    def insert_job(self, job_id, kind, status, *, target="1", options="[]", at="2026-10-03T00:00:00Z"):
+        self.db.execute("INSERT INTO worker_jobs(job_id,kind,target,options,status,created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (job_id, kind, target, options, status, at))
+
+    def query(self, name, params=None):
+        self.assertIn(name, SQL, "test must use the production SQL, not a copied query")
+        if params is None:
+            if name == "TAG_SETTINGS_SQL":
+                params = ("webui.new-tag-color", "tag.attributes-enabled", "webui.tag-sort-order")
+            else:
+                params = ("", "", "", 1000) if "?" in SQL[name] else ()
+        return [dict(row) for row in self.db.execute(SQL[name], params)]
+
+    def test_empty_library_and_queue(self):
+        for name in SQL:
+            self.assertEqual(self.query(name), [])
+
+    def test_every_status_and_lane_matches_row_based_counts(self):
+        expected = Counter()
+        lane_sizes = Counter()
+        for index, (kind, status) in enumerate(itertools.product(KINDS, STATUSES)):
+            repetitions = 1 + index % 3
+            for repetition in range(repetitions):
+                self.insert_job(f"job-{index}-{repetition}", kind, status)
+            lane = int(kind in SECONDARY)
+            expected[(status, lane)] += repetitions
+            if status in ACTIVE:
+                lane_sizes[lane] += repetitions
+        actual = {(r["status"], r["lane"]): r["n"] for r in self.query("QUEUE_COUNTS_SQL")}
+        self.assertEqual(actual, dict(expected))
+        self.assertEqual({r["lane"]: r["n"] for r in self.query("LANE_COUNTS_SQL")}, dict(lane_sizes))
+
+    def test_terminal_jobs_do_not_change_lane_sizes(self):
+        self.insert_job("pending", "update", "retryable")
+        for index, (kind, status) in enumerate(itertools.product(KINDS, ("succeeded", "partial", "blocked", "permanent"))):
+            self.insert_job(f"terminal-{index}", kind, status)
+        self.assertEqual(self.query("LANE_COUNTS_SQL"), [{"lane": 0, "n": 1}])
+
+    def test_running_label_query_is_bounded_and_fifo(self):
+        self.insert_job("b", "update", "running", target="2")
+        self.insert_job("a", "convert", "running", target="3")
+        self.insert_job("pending", "download", "pending", at="2020-01-01T00:00:00Z")
+        rows = self.query("FIRST_RUNNING_SQL")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["job_id"], "a")
+        self.assertEqual(rows[0]["target"], "3")
+        counts = self.query("QUEUE_COUNTS_SQL")
+        self.assertEqual(sum(r["n"] for r in counts if r["status"] == "running"), 2)
+
+    def test_single_running_job_keeps_fields_for_existing_label_formatter(self):
+        self.insert_job("one", "update", "running", target="42", options='["--force"]')
+        row, = self.query("FIRST_RUNNING_SQL")
+        self.assertEqual((row["kind"], row["target"], row["options"]), ("update", "42", '["--force"]'))
+
+    def test_tag_frequency_unicode_case_empty_tag_and_cascade(self):
+        values = {1: ["冒険", "SF", "sf", "", '<script>'], 2: ["冒険", "SF"], 3: ["冒険"]}
+        counts = Counter()
+        for novel_id, tags in values.items():
+            self.db.execute("INSERT INTO novels(id,title,extra_fields_json) VALUES (?, ?, ?)", (novel_id, "not transferred", "x" * 20000))
+            for position, tag in enumerate(tags):
+                self.db.execute("INSERT INTO novel_tags VALUES (?, ?, ?)", (novel_id, tag, position))
+                counts[tag] += 1
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("INSERT INTO novel_tags VALUES (999, 'orphan', 0)")
+        rows = self.query("TAG_NAMES_SQL")
+        self.assertEqual([r["tag"] for r in rows], sorted(counts, key=lambda t: (-counts[t], t)))
+        self.assertEqual({r["tag"]: r["n"] for r in rows}, dict(counts))
+        self.assertEqual({r["tag"]: r["first_novel_id"] for r in rows}, {tag: 1 for tag in counts})
+        self.db.execute("DELETE FROM novels WHERE id=1")
+        rows = self.query("TAG_NAMES_SQL")
+        self.assertEqual({r["tag"]: r["n"] for r in rows}, {"冒険": 2, "SF": 1})
+        self.assertEqual({r["tag"]: r["first_novel_id"] for r in rows}, {"冒険": 2, "SF": 2})
+
+    def test_tag_settings_only_read_the_three_requested_local_keys(self):
+        selected = ("webui.new-tag-color", "tag.attributes-enabled", "webui.tag-sort-order")
+        self.db.executemany("INSERT INTO app_state VALUES ('local', ?, ?, ?)",
+                            ((key, '"blue"', "blue") for key in selected))
+        self.db.executemany("INSERT INTO app_state VALUES ('local', ?, ?, ?)",
+                            ((f"unrelated-{index}", "invalid JSON", "[" + "x" * 10000)
+                             for index in range(100)))
+        self.db.execute("INSERT INTO app_state VALUES ('global', ?, 'false', 'false')",
+                        (selected[1],))
+        rows = self.query("TAG_SETTINGS_SQL")
+        self.assertEqual({row["key"] for row in rows}, set(selected))
+        self.assertTrue(all(row["value_yaml"] == "blue" for row in rows))
+        plan = self.db.execute("EXPLAIN QUERY PLAN " + SQL["TAG_SETTINGS_SQL"], selected).fetchall()
+        self.assertTrue(any("SEARCH app_state" in row["detail"] and "key=?" in row["detail"] for row in plan),
+                        [dict(row) for row in plan])
+
+    def test_tag_aggregate_uses_the_covering_exact_tag_index(self):
+        plan = self.db.execute("EXPLAIN QUERY PLAN " + SQL["TAG_NAMES_SQL"]).fetchall()
+        self.assertTrue(any("COVERING INDEX novel_tags_exact_tag_idx" in row["detail"] for row in plan),
+                        [dict(row) for row in plan])
+        self.assertFalse(any("novels" in row["detail"] for row in plan))
+
+    def test_large_pending_queue_returns_counts_not_payloads(self):
+        count = 10000
+        self.db.executemany("INSERT INTO worker_jobs(job_id,kind,target,options,status,created_at) VALUES (?, 'update', '1', ?, 'pending', '2026-10-03T00:00:00Z')",
+                            ((f"job-{i}", '["' + "x" * 512 + '"]') for i in range(count)))
+        self.assertEqual(self.query("QUEUE_COUNTS_SQL"), [{"status": "pending", "lane": 0, "n": count}])
+        self.assertEqual(self.query("LANE_COUNTS_SQL"), [{"lane": 0, "n": count}])
+        self.assertEqual(self.query("FIRST_RUNNING_SQL"), [])
+
+    def test_status_result_bound_for_mixed_large_queue(self):
+        for i in range(1000):
+            self.insert_job(str(i), KINDS[i % len(KINDS)], STATUSES[i % len(STATUSES)])
+        self.assertLessEqual(len(self.query("QUEUE_COUNTS_SQL")), 14)
+        self.assertLessEqual(len(self.query("FIRST_RUNNING_SQL")), 1)
+        self.assertLessEqual(len(self.query("LANE_COUNTS_SQL")), 2)
+
+    def assert_counts_match_jobs(self):
+        expected = Counter()
+        lanes = Counter()
+        active = Counter()
+        for row in self.db.execute("SELECT status,kind,last_error FROM worker_jobs"):
+            status, kind, error = row
+            if status not in STATUSES:
+                continue
+            lane = int(kind in SECONDARY)
+            if status in ACTIVE:
+                lanes[lane] += 1
+                active[int(status == "running")] += 1
+            if status == "permanent":
+                if error in ("queue cleared by user via Web UI", "removed from queue by user via Web UI"):
+                    continue
+                if error == "cancelled by user via Web UI":
+                    status = "cancelled"
+            expected[(status, lane)] += 1
+        self.assertEqual({(r["status"], r["lane"]): r["n"] for r in self.query("QUEUE_COUNTS_SQL")}, dict(expected))
+        self.assertEqual({r["lane"]: r["n"] for r in self.query("LANE_COUNTS_SQL")}, dict(lanes))
+        self.assertEqual({r["lane"]: r["n"] for r in self.query("ACTIVE_TOTALS_SQL")}, dict(active))
+
+    def test_counts_follow_transitions_cancellations_and_lane_changes(self):
+        self.insert_job("a", "download", "pending")
+        self.insert_job("b", "convert", "running")
+        for status, kind, error in (
+            ("running", "download", None),
+            ("retryable", "download", "HTTP 503"),
+            ("permanent", "download", "cancelled by user via Web UI"),
+            ("permanent", "mail", "queue cleared by user via Web UI"),
+            ("permanent", "update", "removed from queue by user via Web UI"),
+            ("permanent", "update", None),
+            ("succeeded", "convert", "cancelled by user via Web UI"),
+            ("future-status", "update", None),
+            ("pending", "update", None),
+        ):
+            self.db.execute("UPDATE worker_jobs SET status=?,kind=?,last_error=? WHERE job_id='a'",
+                            (status, kind, error))
+            self.assert_counts_match_jobs()
+        self.db.execute("DELETE FROM worker_jobs")
+        self.assert_counts_match_jobs()
+        self.assertEqual(self.query("QUEUE_COUNTS_SQL"), [])
+
+    def test_counts_are_transactional_and_ignored_inserts_do_not_increment(self):
+        self.insert_job("a", "update", "pending")
+        self.db.execute("INSERT OR IGNORE INTO worker_jobs SELECT * FROM worker_jobs WHERE job_id='a'")
+        self.assertEqual(self.query("QUEUE_COUNTS_SQL"), [{"status": "pending", "lane": 0, "n": 1}])
+        self.db.execute("SAVEPOINT failed_batch")
+        self.db.execute("UPDATE worker_jobs SET status='running' WHERE job_id='a'")
+        self.insert_job("b", "convert", "pending")
+        self.assert_counts_match_jobs()
+        self.db.execute("ROLLBACK TO failed_batch")
+        self.db.execute("RELEASE failed_batch")
+        self.assertEqual(self.query("QUEUE_COUNTS_SQL"), [{"status": "pending", "lane": 0, "n": 1}])
+
+    def test_count_backfill_preserves_existing_terminal_history(self):
+        self.insert_job("active", "convert", "running")
+        self.insert_job("done", "download", "succeeded")
+        self.insert_job("cancelled", "download", "permanent")
+        self.db.execute("UPDATE worker_jobs SET last_error='cancelled by user via Web UI' WHERE job_id='cancelled'")
+        self.db.executescript("""
+            DROP TRIGGER worker_job_counts_insert;
+            DROP TRIGGER worker_job_counts_update;
+            DROP TRIGGER worker_job_counts_delete;
+            DROP VIEW worker_job_count_keys;
+            DROP TABLE worker_job_counts;
+        """)
+        self.db.executescript(COUNT_MIGRATION)
+        self.assert_counts_match_jobs()
+        self.db.execute("UPDATE worker_jobs SET status='succeeded' WHERE job_id='active'")
+        self.assert_counts_match_jobs()
+
+    def test_count_work_is_bounded_by_buckets_not_job_history(self):
+        self.db.executemany(
+            "INSERT INTO worker_jobs(job_id,kind,target,options,status,created_at,last_error) "
+            "VALUES (?, 'update','1','[]','permanent','now',?)",
+            ((f"history-{i}", f"distinct upstream error {i}") for i in range(30000)))
+        self.insert_job("active", "convert", "pending")
+        ticks = 0
+        def progress():
+            nonlocal ticks
+            ticks += 100
+            return int(ticks > 5000)
+        self.db.set_progress_handler(progress, 100)
+        try:
+            self.assertEqual({(r["status"], r["lane"]): r["n"] for r in self.query("QUEUE_COUNTS_SQL")},
+                             {("permanent", 0): 30000, ("pending", 1): 1})
+            self.assertEqual(self.query("LANE_COUNTS_SQL"), [{"lane": 1, "n": 1}])
+            self.assertEqual(self.query("ACTIVE_TOTALS_SQL"), [{"lane": 0, "n": 1}])
+        finally:
+            self.db.set_progress_handler(None, 0)
+        changes = self.db.total_changes
+        self.db.execute("UPDATE worker_jobs SET options='[\"--force\"]',status=status,kind='send' WHERE job_id='active'")
+        self.assertEqual(self.db.total_changes - changes, 1, "same count bucket must not write counters")
+
+    # ------------------------------------------------------------------
+    # Cursor paging for GET /api/get_pending_tasks
+    # ------------------------------------------------------------------
+
+    def page(self, cursor, limit):
+        created_at, job_id = cursor if cursor else ("", "")
+        return self.query("ACTIVE_PAGE_SQL", (created_at, created_at, job_id, limit))
+
+    def test_active_totals_count_waiting_and_running_server_side(self):
+        for status, times in (("pending", 3), ("retryable", 2), ("running", 4), ("succeeded", 9)):
+            for i in range(times):
+                self.insert_job(f"{status}-{i}", "update", status)
+        totals = {r["lane"]: r["n"] for r in self.query("ACTIVE_TOTALS_SQL")}
+        self.assertEqual(totals, {0: 5, 1: 4})
+
+    def test_pending_page_walks_every_row_exactly_once_across_pages(self):
+        # Rows written by one ledger batch share created_at; the job_id tie
+        # breaker must still order them so pages never skip or repeat a row.
+        tied = "2026-10-12T00:00:00.000000000Z"
+        for index in range(25):
+            self.insert_job(f"batch-{index:02d}", "update", "pending", at=tied)
+        self.insert_job("older", "update", "pending", at="2026-10-11T00:00:00Z")
+        self.insert_job("running", "update", "running", at=tied)
+        # Terminal rows must never appear in a page.
+        self.insert_job("done", "update", "succeeded", at="2026-10-10T00:00:00Z")
+        expected = (
+            ["older"]
+            + [f"batch-{index:02d}" for index in range(25)]
+            + ["running"]
+        )
+
+        seen = []
+        cursor = None
+        for _ in range(100):
+            rows = self.page(cursor, 7)
+            if not rows:
+                break
+            seen.extend(row["job_id"] for row in rows)
+            last = rows[-1]
+            cursor = (last["created_at"], last["job_id"])
+            if len(rows) < 7:
+                break
+        self.assertEqual(seen, expected)
+        self.assertEqual(len(seen), len(set(seen)), "a page boundary must not repeat a row")
+
+    def test_pending_page_cursor_is_strictly_after_the_last_row(self):
+        self.insert_job("a", "update", "pending", at="2026-10-12T00:00:00Z")
+        self.insert_job("b", "update", "retryable", at="2026-10-12T00:00:00Z")
+        self.insert_job("c", "update", "running", at="2026-10-12T00:00:01Z")
+        self.assertEqual([r["job_id"] for r in self.page(None, 2)], ["a", "b"])
+        self.assertEqual(
+            [r["job_id"] for r in self.page(("2026-10-12T00:00:00Z", "b"), 2)], ["c"]
+        )
+        # A cursor at the very end returns an empty page (the client stops).
+        self.assertEqual(self.page(("2026-10-12T00:00:01Z", "c"), 2), [])
+
+    def test_pending_page_limit_is_part_of_the_query_not_the_client(self):
+        for i in range(10):
+            self.insert_job(f"job-{i}", "update", "pending")
+        self.assertEqual(len(self.page(None, 3)), 3)
+        self.assertEqual(len(self.page(None, 1000)), 10)
+
+
+if __name__ == "__main__":
+    unittest.main()

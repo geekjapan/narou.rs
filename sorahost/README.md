@@ -1,0 +1,389 @@
+# SORAHOST で narou.rs を手動配置する
+
+> **非推奨 (2026-10-21): SORAHOST への配備は非推奨です。** SORAHOST 専用の CI 配備・
+> 切り替えは廃止済みで、新規配備・自動更新はサポートしません。この資料は既存配置の参照用です。
+> 通常は Native のローカル実行、または VPS / 自宅回線のリレー
+> (`relay.md` / `docs/home-relay.md`) を利用してください。
+
+この資料は既存の SORAHOST (PteWorker) へ native 版を手動配置する場合の参考です。
+**SORAHOST 専用の CI 配備・切り替えは廃止済み**です。通常の CI は Workers 向けの検証と配備を行います。
+外部取得リレーは Rust 版 `narou_relay`（ワークスペース crate `relay/`）を別途管理します
+（手順は [`relay.md`](../relay.md) / [`docs/vps-relay.md`](../docs/vps-relay.md) /
+[`docs/home-relay.md`](../docs/home-relay.md)）。旧 Node 版リレーの SORAHOST への配備は
+非推奨（2026-10-21）で、実装は削除済みです。
+
+```
+Browser ──https──▶ PteWorker (公開 URL / TLS)
+                      │ ループバックへ転送
+                      ▼
+              SORAHOST コンテナ内
+                narou_rs web (127.0.0.1:$PORT)
+                      │
+                      └─ 挿絵だけ S3 (Wasabi など) へ
+```
+
+コンテナ (プロジェクトルート = ボリューム) の中身:
+
+```
+sorahost.json   配備の定義 (リポジトリの sorahost/sorahost.json)
+start.sh        起動スクリプト (リポジトリの sorahost/start.sh)
+app/            実行ファイル + webnovel/  (配備で入れ替わる)
+library/        narou のデータ (.narou / 小説データ / webnovel)。配備に含めない
+```
+
+- アプリは **PteWorker から渡される `PORT`** にループバックで束縛する
+  (外部へ直接公開しない。受信ポートの設定は不要)
+- メタデータ・本文はライブラリ内の SQLite (`.narou/db.sqlite`)、挿絵だけ S3 に置く
+- 公開 URL は PteWorker が発行する (`sorahost-cli deploy` の出力 `url`、または
+  コンソールの `url` コマンド)
+
+## 1. ビルド (Linux バイナリを用意する)
+
+Linux x86_64 の実行ファイルが必要です。手元に Linux 環境がない場合でも、以下の GitHub Actions を利用して作成可能です。
+
+### A. GitHub Actions で作る (推奨)
+
+Actions の **Linux build** を `workflow_dispatch` で実行し、完了後に
+artifact `narou_rs-linux-x86_64` をダウンロードして展開する。中身:
+
+```
+narou_rs-<版>-linux-x86_64-gpl/
+  narou_rs / narou_rs_backup / narou_rs_login
+  webnovel/   同梱のサイト定義
+  preset/     外部 AozoraEpub3 を使う場合の雛形 (組み込みエンジンでは不要)
+  Third-Party-License.md
+```
+
+ビルドは GitHub ホストの runner (ubuntu-22.04 = glibc 2.35) で行うので、
+**self-hosted runner は使わない**(公開リポジトリの fork PR を手元で走らせないため)。
+`lto = true` のリンク処理は数 GB のメモリを消費するため、リソースの限られた VPS 上でのビルドは推奨しません。
+
+置ける環境は glibc 2.35 以降 (Debian 12 / Ubuntu 22.04 以降)。それより古い
+コンテナなら、一致するイメージ内でビルドするか musl ターゲットに切り替える。
+
+### B. 手元の Linux / WSL で作る
+
+```sh
+cargo build --release --features lite
+```
+
+`target/release/` の `narou_rs`(+ `narou_rs_backup` / `narou_rs_login`)を、
+リポジトリの `webnovel/*.yaml` と一緒に配置する。`narou init` は実行ファイルの
+隣の `webnovel/` から定義をコピーするため、**`webnovel/` を同梱しないと
+サイト定義が空になる**。
+
+配置 (コンテナ内。プロジェクトルート = ボリュームの直下):
+
+```
+sorahost.json            リポジトリの sorahost/sorahost.json
+start.sh                 リポジトリの sorahost/start.sh
+app/narou_rs             実行ファイル (chmod +x)
+app/narou_rs_backup      バックアップ用ヘルパー (Web UI のバックアップが使う)
+app/webnovel/*.yaml      同梱のサイト定義 (初回 init が library/ へコピーする)
+library/                 初回起動で作られる (.narou / 小説データ / webnovel)
+```
+
+`library/` は配備対象外のため、再デプロイを繰り返しても作品データは保持されます（※ 初回導入時は 2 回デプロイを試行し、データが正常に保持されることを確認してください）。
+
+## 2. 公開
+
+2 通り。どちらでもアプリは `127.0.0.1:$PORT` にだけ束縛する。
+
+### A. 前段に Cloudflare のコネクタ + Access を置く (推奨)
+
+TLS と本人確認 (Zero Trust) を前段に置く。直の IP:ポート宛は narou の Host 許可リストで
+弾かれるので、公開経路はトンネルだけになる。
+
+1. コネクタ・向き先・DNS・Access は Cloudflare 側で用意する（このリポジトリの CI は構築しない）。
+2. コネクタの接続トークンをサーバー直下の `.env` の `NAROU_CONNECTOR_TOKEN` に置き、
+   `NAROU_PUBLIC_HOST=<公開ホスト名>` を設定して再起動する。
+3. `https://<公開ホスト名>/` が Access のログインを要求し、`http://<IP>:<PORT>/` が **400** になれば成功。
+
+- `NAROU_CONNECTOR_TOKEN` は CI では扱わない (公開リポジトリのログに出さないため)。ダッシュボードで
+  確認してサーバー直下の `.env` に置く
+- 向き先 (ingress) は narou が実際に待ち受ける `127.0.0.1:<port>`。
+  `NAROU_RS_PORT` を変えたら合わせる。
+- basic 認証は既定で有効のまま。前段の Access に認証を任せて二重にしたくない場合だけ
+  `NAROU_ALLOW_NO_PASSWORD=1` を `.env` に置く (トンネルの有無では切らない)
+
+### B. PteWorker の公開 URL をそのまま使う
+
+追加設定は不要 (`start.sh` は reverse proxy モードで動く)。ただし**平文 HTTP** なので
+basic 認証のパスワードが回線上を平文で流れることになります。推測困難なランダム値を設定した上で、早期に A の方式（コネクタ＋Access 構成）へ移行することを推奨します。
+
+## 3. 環境変数
+
+置き場は 2 つだけ。**アプリの値はサーバー上の `.env`**、**CI の値は GitHub** に置く。
+ここに記載されている名前がシステム側で読み取られる環境変数の一覧です。名称が異なると認識されませんのでご注意ください。
+
+### 3.0 アプリの値をどこに書くか
+
+PteWorker の `sorahost.json` には環境変数を渡す項目が無く、Pterodactyl の
+**Startup 変数**は名前が egg 側で決まっているため、こちらで用意した名前
+(`NAROU_*`) を足せないことが多い。そこで `start.sh` は起動時に
+**ボリューム直下の `.env`** を読み込む:
+
+```
+<ボリューム直下>          = アプリのログに出る /home/container
+  .env                    ← これを置く (下記)
+  narou-library/          作品データ
+  bin/                    コネクタのバイナリ
+  .sorahost/releases/...  配備ごとの実行ファイル
+```
+
+`.env` の作り方 (どちらでもよい):
+
+- パネルの**ファイルマネージャ**で直下に `.env` を作って編集する
+- SFTP (`sorahost-cli` の接続情報と同じホスト) で置く
+
+```sh
+# 例 (/home/container/.env)
+NAROU_WEB_PASSWORD=長いランダム文字列
+NAROU_WEB_USER=admin
+NAROU_CONNECTOR_TOKEN=eyJ...            # ダッシュボードの Add a replica の値
+NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
+```
+
+- 形式は `KEY=VALUE` の行、`#` で始まる行は無視。値は前後の空白も含めてそのまま使われる
+- **既に環境にある値の方が優先**(プラットフォームの `PORT` や Startup 変数は上書きされない)
+- パスを変えたいときは `NAROU_RS_ENV_FILE` で指定する
+- 変更後は再起動(パネルの `restart`、または次の配備)で反映される
+
+### 3.1 サーバー側の `.env` に書く値 (アプリの動作)
+
+| 変数 | 何のため | 設定する値 | 設定ファイルとの優先 |
+| --- | --- | --- | --- |
+| `NAROU_WEB_PASSWORD` | Web UI の basic 認証。素の公開 URL では必須 (コネクタ併用時も有効) | 長いランダム文字列 | start.sh が `server-basic-auth.password` に書く |
+| `NAROU_WEB_USER` | basic 認証のユーザ名 | 例 `admin` | 同 `server-basic-auth.user` (**未設定なら `admin` を補う**) |
+| `NAROU_ALLOW_NO_PASSWORD` | `1` で「パスワード無しでも起動する」 | 検証済みの Cloudflare Access 等に認証を任せるときだけ `1` | — |
+| `NAROU_RS_ASSET_BACKEND` | `s3` で挿絵だけ S3 へ | `s3` (未設定 = ローカル保存) | **設定 `s3.asset-backend` が優先** |
+| `S3_ENDPOINT` | S3 互換の接続先 | Wasabi: `https://s3.ap-northeast-1.wasabisys.com` | 設定 `s3.endpoint` が優先 |
+| `S3_BUCKET` | バケット | 例 `mybucket` | 設定 `s3.bucket` が優先 |
+| `S3_REGION` | リージョン | 例 `ap-northeast-1` | 設定 `s3.region` が優先 |
+| `S3_PREFIX` | バケット内の接頭辞 | 例 `narou/library` | 設定 `s3.prefix` が優先 |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 資格情報 | ストレージのキー | 設定 `s3.access-key-id` / `s3.secret-access-key` が優先 |
+| `NAROU_RS_LOGIN_KEY` | ログイン Cookie の暗号鍵 (base64) | `openssl rand -base64 24` | `.narou/login.key` より優先 |
+| `NAROU_RS_MIRROR_FILES` | `0` で `小説データ/` を作らない | 通常は未設定 (start.sh が `sqlite.mirror-files=false` を入れる) | **環境変数が設定より優先** |
+| `NAROU_RS_SECTION_CACHE` | `0` で話ごとの変換キャッシュを作らない | 通常は未設定 (start.sh が `convert.section-cache=false` を入れる) | **環境変数が優先** |
+| `NAROU_RS_KEEP_TXT` | `0` で変換済みテキストを残さない (ファイルにも DB にも。EPUB は都度再変換) | 通常は未設定 (start.sh が `convert.keep-txt=false`) | **環境変数が優先** |
+| `NAROU_RS_LEGACY_YAML` | `1` で SQLite をやめ YAML 管理に戻す | 通常は未設定 | 環境変数のみ |
+| `NAROU_RS_EPUB_ENGINE` | EPUB エンジン | `lite` / `external` / `auto` (未設定 = auto) | **環境変数が `convert.epub-engine` より優先** |
+| `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 | 通常は未設定 (配備パスから自動) | start.sh |
+| `NAROU_RS_PORT` | 待受ポート | 通常は未設定 (プラットフォームの `PORT` を使う) | start.sh |
+| `NAROU_CONNECTOR_TOKEN` | コネクタ (cloudflared) の接続トークン。置くと起動する (basic 認証は既定で有効のまま) | ダッシュボードの Add a replica の値 | start.sh |
+| `NAROU_PUBLIC_HOST` | 公開ホスト名。置くとその Host 以外を弾く | 例 `narou.example.com` | start.sh |
+| `NAROU_CONNECTOR_TOKEN_FILE` | トークンをファイルで渡す場合のパス | 既定 `$VOLUME_DIR/.connector-token` | start.sh |
+
+- `PORT` はプラットフォームから渡される値のため、**ユーザー側では設定しないでください** (narou はこのポートにバインドします)
+- `s3` を選択して設定値が 1 つでも不足している場合、**起動に失敗します** (自動的にローカル保存へフォールバックすることはありません)
+- ログインが必要なサイトを利用する場合は `NAROU_RS_LOGIN_KEY` を設定してください (鍵を変更すると保存済み Cookie は復号できなくなるため再インポートが必要です)
+- basic 認証は **資格情報が空だと無効** (素通し) になる実装。コネクタなしの素の公開では
+  `NAROU_WEB_PASSWORD` を必ず設定すること (`NAROU_WEB_USER` は未設定なら `admin` が入る)。
+  未設定のまま起動すると `start.sh` がその場でランダムなパスワードを作って設定し、
+  コンソールに表示する (誰も入れない状態で公開だけは避ける)。起動自体は成功するので配備は
+  成功する (止めると PteWorker がデプロイ失敗 422 と見なし、前のリリースを配り続けるため)。
+  コネクタ (トンネル) は利用者の認証ではないため、basic 認証はコネクタ併用時も有効のままにする。
+  検証済みの Cloudflare Access 等に認証を任せる場合だけ `NAROU_ALLOW_NO_PASSWORD=1` を明示する。
+
+### 3.2 CI との分離
+
+SORAHOST 用の Repository variable・Environment・配備ジョブは現行 CI では使用しません。
+§3.1 の値はサーバー直下の `.env` に置き、配置・更新も手動で行います。
+Workers の配備設定と外部リレーの設定は [プラットフォーム設計](../docs/platform-abstraction.md) を参照してください。
+
+
+### 3.3 鍵・資格情報の仕様
+
+| 値 | 仕様 (コードが受け付ける形) | 作り方 |
+| --- | --- | --- |
+| `NAROU_WEB_PASSWORD` | 任意の文字列。**空だと basic 認証が無効になる**実装なので空にしない | 未設定なら `start.sh` が 24 文字の英数を自動生成。自分の値にするなら `.env` に置く |
+| `NAROU_WEB_USER` | 任意の文字列 | 未設定なら `admin` を補う |
+| `NAROU_RS_LOGIN_KEY` | **base64** (標準・パディングあり)。復号後 **16 バイト以上**が必要。32 バイトはそのまま、16〜31 バイトは SHA-256 で 32 バイトへ伸長。前後の空白は無視、壊れた base64 はエラー | `openssl rand -base64 24` (または `-base64 32`) |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 空でない文字列 (SigV4 の鍵。長さの規定なし) | ストレージ側で発行 |
+| `S3_ENDPOINT` | `scheme://host` (必要なら `:port`)。path-style で扱う | Wasabi: `https://s3.<region>.wasabisys.com` |
+| `S3_REGION` | 空でない文字列 (署名に必須) | 例 `ap-northeast-1` |
+| `SORAHOST_ENDPOINT` | URL。パス込みでよく、`<endpoint>/deploy` へ送る | PteWorker コンソールの「エンドポイント」 |
+| `SORAHOST_TOKEN` | 不透明な文字列。`Authorization: Bearer` で送る | 同「デプロイトークン」(`token rotate` で再発行) |
+
+内部形式 (実装が決めているもの。手で作らない):
+
+- 保存するログイン Cookie は `enc:v1:<base64 nonce>:<base64 暗号文>`。XChaCha20-Poly1305、nonce 24 バイト、
+  AAD は `narou.rs/login-cookie` でサイト (ホスト) を束ねるため、別サイトへ流用できない。
+  旧形式の平文は読める (次回保存で暗号化)
+- `narou login export` の書き出しは version 3 (version 1 / 2 も読める)。
+  `--passphrase` 指定時は Argon2id (19 MiB / t=2 / p=1、salt 16 バイト) → XChaCha20-Poly1305
+  (AAD `narou.rs/login-export`)
+- 資格情報の ID は UUIDv4 形 (小文字 hex)
+- 鍵を変更すると保存済みの Cookie は復号できなくなるため、再インポートが必要
+- `NAROU_ADMIN_TOKEN` は Worker 用。定数時間比較で、未設定なら 500
+  `authentication_not_configured`
+
+Worker 側の CI は別系統の値を使う (Environment `Cloudflare`): `CLOUDFLARE_API_TOKEN` /
+`CLOUDFLARE_ACCOUNT_ID` / `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` / `NAROU_S3_*`。
+**native の `S3_*` と Worker の `NAROU_S3_*` は別物**なので混同しないこと。
+
+## 4. 起動
+
+起動コマンドは `sorahost.json` が持つ (`"start": "bash start.sh"`)。Pterodactyl の
+画面で起動コマンドを設定する必要はない (`sorahost-cli deploy` が反映する)。
+
+初回起動でライブラリを作り、`storage-backend` を `sqlite` に切り替え、
+`server-bind=127.0.0.1` / `server-port=$PORT` / `server-reverse-proxy.enable=true`
+を設定する。
+
+配備で消えない場所 (実測で確認した挙動):
+
+- **ライブラリは release ディレクトリの外**に置く。PteWorker は配備ごとに
+  `/home/container/.sorahost/releases/<日時>-<hash>/` を作り直すため、その中に
+  ライブラリを置くと配備のたびに作品が消える。`start.sh` は配備パスから
+  ボリューム直下を割り出して `$VOLUME_DIR/narou-library` を使う
+  (上書きは `NAROU_RS_LIBRARY`)
+- **`server-ws-port=0` を設定する**。narou.rb は `server-port + 1` も WebSocket に
+  使うが、PteWorker はその番号を自分のルータ (workerd, 例 18081) に使うため
+  `Address already in use` でプラットフォーム側が落ちる。`0` にすると併設リスナーを
+  作らず、本体ポートの `/ws` で受ける (Web UI の接続先は元から `/ws` のため機能は落ちない)
+
+## 5. 既存ライブラリの移行
+
+手元のライブラリ (`.narou` + `小説データ`) を SORAHOST へ持って行き、挿絵だけを
+S3 へ逃がす場合:
+
+```sh
+narou setting s3.asset-backend=s3          # 以降 this ライブラリは S3 を使う
+narou illust s3-push                       # 件数と容量を数えるだけ (dry-run)
+narou illust s3-push -f                    # 実際に S3 へ写す
+narou illust s3-verify                     # バイト単位で突き合わせる
+```
+
+`narou setting s3.asset-backend=local` に戻せば、移行前のローカル保存へ即座に
+戻せる (S3 側は消さない)。
+
+## 6. 容量
+
+実測 (13 作品・画像主体の Pixiv 作品を含む) の内訳と、SORAHOST での考え方:
+
+| 保存先 | 内容 | 実測 (13 作品) |
+| --- | --- | --- |
+| S3 | 挿絵のバイナリ | 36.8 MB (S3 へ移動) |
+| `db.sqlite` | メタデータ + 本文 + 変換済みテキスト (brotli 圧縮) | 79 MB |
+| `小説データ/` | 本文・raw HTML・変換済みテキスト・EPUB | 148 MB (挿絵を除く) |
+| 変換キャッシュ | `.narou/section_convert_cache/` | 0 (start.sh が無効化) |
+
+- 挿絵を S3 に置くと、ローカルのミラーと `db.sqlite` の両方から消える (この構成で -73 MB)
+- `start.sh` は `convert.section-cache=false` を設定する。無効にすると変換のたびに
+  全話を変換し直す代わりに、容量を使わない (有効時の実測で 1 作品あたり約 1.5 MB)
+- `start.sh` は初回に `economy=nosave_diff,nosave_raw` / `convert.no-epub=true` /
+  `convert.keep-txt=false` を入れる。止まるものと実測 (1 作品あたり):
+  - 差分スナップショット (`nosave_diff`): 6.7 MB
+  - raw HTML (`nosave_raw`): 19.4 MB。挿絵のローカライズは取得時にメモリ上の HTML で
+    行うので、新規話の挿絵は従来どおり保存される
+  - 保存 EPUB (`no-epub`): テキスト作品で 2 MB、画像主体で 40〜55 MB
+  - txt (`keep-txt`): 5.2 MB。変換結果は SQLite に残り、Web UI の
+    「EPUB をダウンロード」はそこから都度生成する
+  - 実ファイルのミラー (`sqlite.mirror-files=false`): `小説データ/` を作らない。
+    **保存先は `.narou/db.sqlite` だけ**になり、変換は必要な間だけ
+    `toc.yaml` / `本文/*.yaml` / `setting.ini` / `replace.txt` を取り出して消す。
+    この構成では `narou illust orphan|rebuild|fix-ext` と `narou clean` は
+    (対象の実ファイルが無いので) 実質何もしない。`narou backup` と
+    `narou db export-yaml --in-place` によるロールバックは従来どおり動く
+- 挿絵の削除を伴う `narou illust orphan -f` は、raw が無い構成ではキャッシュを唯一の
+  参照源にする (キャッシュは保存時に必ず書かれるが、これを失っていると孤児と判定される)
+- **古い出力ファイルは残る**: 出力名の設定 (`convert.filename-to-ncode` や
+  `[作者名]` 接頭辞) を変えると、同じ本文の `novel.txt` / `.epub` が別名で増える。
+  手元のライブラリをそのまま持ち込むと重複を引き継ぐので、気になる場合は削除する
+  (実測: なろう長編 1 作品で txt 3 重複 14.9 MB + epub 2 重複 4.4 MB)
+- **EPUB を溜めないのが一番効く**: 画像主体の作品は 1 冊 40〜55 MB になる。Web UI の
+  「EPUB をダウンロード」は保存済みテキストから都度生成するので、`narou convert` で
+  EPUB を作らない設定 (`convert.no-epub=true`) にしておけばディスクを消費しない
+- バックアップ (`narou backup`) は挿絵が S3 にあるためテキスト主体で小さくなる
+
+## 7. メモリ
+
+実測 (Windows の debug ビルド = 上限側の値。Linux の release は通常もっと小さい):
+
+| 構成要素 | 実測 |
+| --- | --- |
+| `narou web` 常駐 (13 作品・API 1 回) | 31 MB |
+| `narou convert` (391 話の長編) | ピーク 61 MB |
+| `narou convert` 2 本同時 (concurrency 相当) | 合計ピーク 120 MB |
+| SQLite | ディスク backed (ページキャッシュは既定で 2MB 程度) |
+
+`start.sh` は `concurrency=true` を設定する (DL/update と convert/send を別レーンで並行)。
+トンネルを同居させない構成 (既定) のピークは次のとおり:
+
+| メモリ割当 | 通常 (2 ジョブが普通サイズ) | スパイク含む最悪ケース |
+| --- | --- | --- |
+| 256 MB | 約 180 MB (余裕 70 MB) | 超過し得る (うごイラ + 大きい EPUB が重なるとき) |
+| **384 MB** | 約 180 MB (余裕 200 MB) | 約 300〜320 MB で収まる見込み |
+
+スパイク込みでも安全側に倒すなら **384 MB** を推奨。256 MB でも通常運用は収まるが、
+画像の多い作品を同時に 2 本処理するときだけ余裕がなくなる。
+
+- 小説単位の排他 (`.narou/lock.yaml`) があるので、同じ小説が両レーンで同時に走らない
+- スパイクが大きいのは うごイラ (APNG) の組み立て (実例 19 フレームで約 56MB) と
+  挿絵入りの大きい EPUB (S3 は 1 オブジェクトを最大 64MB まで一括で読み書きする)
+- OOM で落ちる場合は `narou setting concurrency=false` にするか、メモリ割当を増やす
+
+## 8. 更新
+
+Linux バイナリ等を更新し、手元から手動配備する:
+
+```sh
+cd <sorahost.json があるフォルダー>
+SORAHOST_ENDPOINT=... SORAHOST_TOKEN=... npx sorahost-cli deploy --yes
+```
+
+配備すると PteWorker が起動し直す。`self-update` は使わない。
+`app/webnovel/*.yaml` を差し替えたときも、配備 (か手動の `restart`) で反映される。
+
+## 9. CI の扱い
+
+SORAHOST への自動配備は提供しません。Linux バンドルの作成は **Linux build** を使えますが、
+その後の配置・更新は手動で行ってください。`develop` への push はこのホストを更新しません。
+通常の `platform.yml` は Native・Wasm・Worker 等を検証して対象の Worker を配備し、
+外部リレーの再配備やホスティング先の切り替え変数には依存しません。
+既存のサービスや Secret を自動削除する処理はありません。
+
+## 10. 取得リレーとの関係
+
+Worker の取得リレーは **別サーバー（VPS または自宅回線）** に置くのが既定です。SORAHOST 上へ
+リレーを同居させる構成は非推奨（2026-10-21）で、Node 版リレー（`scripts/relay/` の
+`server.mjs` / `security.mjs` / `transport.mjs` と `worker/`）は削除しました。現在のリレーは
+Rust バイナリ `narou_relay` です。
+
+- VPS リレー: [`relay.md`](../relay.md)（現行デプロイ `relay.rumia-ch.uk`）/
+  [`docs/vps-relay.md`](../docs/vps-relay.md)（一般手順）
+- 自宅回線リレー: [`docs/home-relay.md`](../docs/home-relay.md) と
+  `scripts/relay/home-relay.ps1`
+- リレーのビルド: `cargo build --release -p narou_relay`
+- リレーと Worker には同じ `NAROU_RELAY_KEY` を設定する。ずれると Worker からは 403 になり、
+  元の取得結果へ戻るため一部サイトの取得が失敗する。配置後は接続先と合言葉を環境に設定して
+  `python3 scripts/relay/verify_auth.py` で一致を確認する
+- リレーのプロトコル（`GET|POST /proxy` + `X-Proxy-Token`、`GET /health`）と安全策
+  （許可ホスト・DNS 検証と接続先固定・非追跡・TLS 検証・上限）は従来どおり。詳細は
+  [`docs/platform-abstraction.md`](../docs/platform-abstraction.md) を参照する
+- リレーのテストは Rust で `cargo test -p narou_relay`（ワークスペース CI は
+  `cargo test --workspace`）
+
+SORAHOST のコンテナ内でリレーを動かす前提だった `start.sh` の `NAROU_RELAY=1`
+分岐は、旧 Node 版 (`server.mjs`) の削除に合わせて撤去しました。リレーはこの
+ホストに置かないでください。
+
+## 11. 使えない機能
+
+SORAHOST のコンテナで動かすため、次は動かない (Web UI 側では 501 相当):
+
+- `browser` / `folder` (デスクトップ操作)
+- `send` / `mail` (端末送信・SMTP。設定の読み書きはできる)
+- 外部 AozoraEpub3 (`aozoraepub3dir` は設定しない。Lite を同梱して使う)
+- `narou_rs_login` (ブラウザのある端末で実行し、`narou login import` で取り込む)
+
+## 12. 確認
+
+```sh
+curl -I https://<公開 URL>/                     # basic 認証のチャレンジが返る
+curl -u admin:<password> https://<公開 URL>/api/novels/count
+```
+
+ブラウザで開き、ジョブの進捗 (WebSocket) が出ることを確認する。
+配備直後は反映に数秒かかることがある (コンソールの `logs` で起動ログを確認できる)。

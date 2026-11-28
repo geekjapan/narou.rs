@@ -29,10 +29,10 @@ pub fn resolve_named(inner: &str) -> Option<String> {
     }
 
     // 面区点 (N-N-N) によるマッピング。
-    if let Some(menku) = extract_menku(inner) {
-        if let Some(c) = resolve_menku(menku) {
-            return Some(c.to_string());
-        }
+    if let Some(menku) = extract_menku(inner)
+        && let Some(c) = resolve_menku(menku)
+    {
+        return Some(c.to_string());
     }
     None
 }

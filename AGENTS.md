@@ -58,7 +58,7 @@ cargo local-build        # Release と同構成の narou/ フォルダを生成
 
 **重要**: `cargo run` は `sample/novel/` をCWDとして実行する必要がある（`.narou/` ディレクトリが必要なため）。
 
-バイナリは 3 つ: `narou_rs`(`src/main.rs`)、`narou_rs_updater`(`src/bin/updater.rs`)、`cargo-local-build`(`src/bin/cargo-local-build.rs`)。
+CLI は `src/main.rs`、補助バイナリは `src/bin/` にある。
 テストは `tests/convert_parity.rs`（byte-for-byte fixture テスト）と各モジュール内のインラインユニットテスト。
 
 ## COMMANDS.md 同期ルール

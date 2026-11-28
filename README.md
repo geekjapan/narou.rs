@@ -5,6 +5,10 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 
 README では、導入方法、基本操作、主な注意点をまとめます。詳細なコマンド互換性や未完了項目は `COMMANDS.md` を参照してください。
 
+## 変更履歴
+
+各バージョンの主な変更点は [VERSION.md](VERSION.md) にまとめています。
+
 ## 謝辞
 このソフトウェアは [whiteleaf氏](https://github.com/whiteleaf7) が作成した [narou.rb](https://github.com/whiteleaf7/narou) 及び [ponpon.USA氏](https://github.com/ponponusa) の [フォーク版](https://github.com/ponponusa/narou-mod) をベースに作成されています。
 
@@ -31,6 +35,10 @@ README では、導入方法、基本操作、主な注意点をまとめます�
 + Arcadia http://www.mai-net.net/
 + 暁 http://www.akatsuki-novels.com/
 + カクヨム https://kakuyomu.jp/
++ Pixiv https://www.pixiv.net/ （小説・小説シリーズ・イラスト/漫画・漫画シリーズ）
++ アルファポリス https://www.alphapolis.co.jp/ （公開小説・各話 URL・作者一覧）
+
+アルファポリスは作品トップの目次順・章構造を保ち、無料公開・レンタル済みの話を取得します。未レンタル話が混ざっていても作品全体を非公開扱いにせず、取得範囲を警告して閲覧可能な部分を保存します。各章の最初に閲覧できる話へ章名を付け、全話が閲覧不可の章は出力しません。作者一覧のページ送りにも対応します。電子書籍特典や CAPTCHA は本文として保存せずエラーにします。R18 作品にも既存の `over18` 設定を適用し、R18 表記だけでログイン必須とは判断しません。
 
 ## セットアップ
 
@@ -40,12 +48,16 @@ README では、導入方法、基本操作、主な注意点をまとめます�
 
 [GitHub Releases](https://github.com/Rumia-Channel/narou.rs/releases) から利用環境に合う配布 zip をダウンロードし、任意の場所に展開してください。
 
+配布 zip はプラットフォームごとに GPL 版（AozoraEpub3_Lite 組込み）と通常版（外部 AozoraEpub3）の 2 種類があります。`narou_rs_win_x64-GPL.zip` のように `-GPL` が付くのが GPL 版、付かないのが通常版です。GPL 版は EPUB 変換を組み込みの AozoraEpub3_Lite (GPL-3.0) で実行するため外部ツールなしで使えますが、配布物全体が GPL-3.0 の扱いになります。通常版は BSD-2-Clause で、EPUB 変換には別途 AozoraEpub3 が必要です。
+
 配布 zip は `narou/` ディレクトリをルートに持つ構成です。実行に必要なファイルはその中にまとまっています。
 
 ```text
 narou/
   narou_rs(.exe)
   narou_rs_updater(.exe).new
+  narou_rs_backup(.exe)
+  narou_rs_login(.exe)
   webnovel/
   preset/
   LICENSE
@@ -55,6 +67,12 @@ narou/
 ```
 
 `narou_rs` は、実行ファイルの近くにある `webnovel/`、`preset/`、`commitversion` を参照します。これらを分離しないでください。
+
+`preset/` には EPUB 変換の設定が入っています。同梱されているのは既定値 (`AozoraEpub3.ini.default` / `custom_chuki_tag.txt.default`) だけで、利用者が編集する設定は別の名前 (`AozoraEpub3.ini` / `custom_chuki_tag.txt`) で同じフォルダに作ります。編集したいときは既定値をコピーしてください (例: `Copy-Item preset\AozoraEpub3.ini.default preset\AozoraEpub3.ini`)。利用者が作った設定は配布物に含まれないため、セルフアップデートで書き換わらず内容が残ります。設定の優先順位は「ユーザー設定 → 同梱の既定値」です。
+
+Windows 版の zip に含まれる実行ファイル (`narou_rs.exe`、`narou_rs_updater.exe.new`、`narou_rs_backup.exe`、`narou_rs_login.exe`) は Authenticode 署名済みです。署名のないバイナリはパッケージング時に検出して処理を中断するため、リリース zip に未署名の実行ファイルが含まれることはありません。
+
+どちらの版も zip の展開後の手順は同じです。`self-update.variant` は今後のセルフアップデートで取得する版を決める設定で、実行中のバイナリは切り替わりません。Web UI の設定画面 (Global タブ) で選ぶか、`narou_rs setting self-update.variant=gpl` または `narou_rs setting self-update.variant=standard` で変更できます。
 
 Windows では、展開した `narou/` を `Path` に追加してから、小説を管理したいフォルダで `narou_rs init` を実行します。`$narouDir` は自分が zip を展開した `narou/` フォルダ、`$novelDir` は小説を管理したいフォルダに置き換えてください。
 
@@ -104,12 +122,15 @@ cargo run -- init
 Release と同じ構成の `narou/` フォルダをリポジトリ直下に作る場合は、`cargo local-build` を使います。
 
 ```powershell
-cargo local-build
+cargo local-build         # 通常版
+cargo local-build --gpl   # GPL版（AozoraEpub3_Lite 組込み）
 ```
 
-`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
+`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`narou_rs_login(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
 
-作成された `narou/` は Release 版と同じように `Path` に追加し、小説を管理したいフォルダで `narou_rs init` を実行してください。`narou/` の中を作業ディレクトリにはしません。
+未指定の場合は従来どおり通常版をビルドし、コピーレフト条項を含まない `Third-Party-License-non-GPL.md` を `Third-Party-License.md` として同梱します。`--gpl` を指定すると本体を `lite` feature 付きでビルドし、GPL 版の `Third-Party-License.md` を同梱します。いずれの場合も同じ `narou/` フォルダを再生成し、`--locked` や `--target <triple>` と併用可能です。
+
+作成された `narou/` は Release 版と同様に `Path` に追加し、小説を管理したいフォルダで `narou_rs init` を実行してください（※ `narou/` の中を作業ディレクトリにはしないでください）。
 
 初期化時に AozoraEpub3 の場所も指定する場合は、次のように実行します。
 
@@ -120,10 +141,10 @@ cargo run -- init -p $aozoraDir -l 1.8
 
 ## 初期化後のディレクトリ
 
-`narou init` を実行すると、作業ディレクトリに主に以下を作成します。
+`narou_rs init` を実行すると、作業ディレクトリに主に以下を作成します。
 
 ```text
-.narou/                  ローカル設定、DB、キュー、タグ色など
+.narou/                  ローカル設定、キュー、タグ色、ログイン Cookie など
 小説データ/             ダウンロードした小説データ
 webnovel/               ユーザー編集用のサイト定義 YAML
 ```
@@ -172,6 +193,12 @@ narou_rs web
 | `trace` | panic 時のトレース表示 |
 | `help` | ヘルプ表示 |
 | `version` | バージョン情報表示 |
+| `login` | ログイン Cookie の取り込み・管理 (Rust 拡張) |
+| `illust` | 挿絵キャッシュのメンテナンス (Rust 拡張) |
+| `db` | SQLite 管理データの保守 (verify / export-yaml / vacuum。Rust 拡張) |
+| `api` | 外部公開 API の Bearer トークン管理 (Rust 拡張) |
+
+コマンドは narou.rb と同じ短縮規則（先頭 1〜2 文字）で呼べます。`w` / `we` は `web`、`s` / `se` は `setting` に解決されます。
 
 すべてのコマンド仕様、オプション、完了度は `COMMANDS.md` にまとめています。
 
@@ -213,7 +240,7 @@ narou_rs web --hide-console
 
 ### Web 公開時の上級者向け設定
 
-通常の `web` 利用は localhost 前提です。外部公開や reverse proxy 配下で使う場合だけ、CLI から hidden 設定を変更してください。なお `s` は `setting` サブコマンドの短縮であり、`web` の短縮ではありません（`web` の短縮は未定義です）。
+通常の `web` 利用は localhost 前提です。LAN やリバースプロキシ経由で公開する場合は、接続先と認証、許可ホストを確認してください。一部の詳細設定は CLI からのみ変更できます。
 
 ```powershell
 # LAN から直接アクセスさせたいとき（どちらでも可）
@@ -235,7 +262,114 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
   narou_rs setting server-add-accepted-hosts=narou.example.com,*.lan.example
   ```
   unsafe なワイルドカードパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視されます。
-- これらのうち Web UI の設定画面に出るのは `server-bind` だけで、それ以外は hidden のまま CLI からのみ変更します。
+- このうち Web UI 設定画面 (Global タブ) に出るのは `server-bind`、`server-basic-auth.*`、`server-ws-add-accepted-domains`、`server-add-accepted-hosts` などです。`server-reverse-proxy.enable` と `server-basic-auth.require-for-external-bind` は hidden のままなので、CLI からのみ変更してください。
+
+### 外部公開 API と MCP
+
+外部のツール (表の生成・自動化・LLM) からライブラリの読み取り専用データへアクセスできます。仕様の詳細は [`docs/external-api.md`](docs/external-api.md) を参照してください。
+
+```powershell
+# Bearer トークンを作る (表示された値を Authorization ヘッダに載せる)
+narou_rs api create 表生成
+
+# 保存済みトークンの確認・削除
+narou_rs api list
+narou_rs api delete <ID>
+```
+
+```powershell
+# 一覧を取得する (JSON / JSON Lines / XML が選べる)
+curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8888/api/v1/novels?limit=20&format=jsonl"
+curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8888/api/v1/novels/1/toc"
+curl -H "Authorization: Bearer <token>" "http://127.0.0.1:8888/api/v1/novels/1/sections/1"
+```
+
+- 認証には Bearer トークンを使用します (`Authorization: Bearer <token>` または `x-narou-api-token`)。トークンは設定ページの「外部API」タブからも作成・確認・削除できます。
+- `/api/v1` はブラウザの UI トークンや Basic 認証から独立しており、トークンのみで読み取り専用データにアクセス可能です。
+- MCP (Model Context Protocol) は同じ API の上で動作します。HTTP 経由では `POST /api/v1/mcp`、ローカル環境では `narou_rs_mcp` (stdIO) を使用します。
+- Cloudflare Workers 環境では Cloudflare Zero Trust の Service Token が優先されます (Access を設定していない場合は narou の Bearer トークンを使用)。
+
+### ログインが必要な小説
+
+ログインが必要なサイトの小説は、ブラウザで取得したログイン Cookie を保存してからダウンロードします。Cookie の取得は同梱の `narou_rs_login` が担当し、保存した値は `.narou/login.key` の鍵で暗号化されます。1 サイトに複数のログイン Cookie を保存でき、一覧の順に試行されます。
+
+ブラウザと narou_rs が同じマシンにある場合は、ライブラリのフォルダで利用するサイトを選んで実行します。
+
+```powershell
+narou_rs_login ncode.syosetu.com
+narou_rs_login alphapolis.co.jp --name 本垢
+```
+
+Chromium 系ブラウザがログイン URL で開くので、ログインが完了したら Enter キーを押してください。2 段階認証や CAPTCHA もそのままブラウザ上で通過できます。ブラウザが見つからない環境では `--browser <パス>` で指定するか、ブラウザからコピーした Cookie 文字列を直接渡せます。
+
+```powershell
+narou_rs_login ncode.syosetu.com --browser "C:\path\to\chrome.exe"
+narou_rs_login ncode.syosetu.com --cookie "over18=yes; ses=..."
+```
+
+ブラウザのある端末と narou_rs を動かすサーバーが別の場合は、ブラウザ側で書き出しファイルを作って持ち込みます。ライブラリ外で実行した場合は書き出し (`narou_login_export.yaml`) が既定の出力になります。
+
+```powershell
+# ブラウザ側 (ライブラリ外でも可)
+narou_rs_login ncode.syosetu.com --export login.yaml --passphrase <パスフレーズ>
+
+# narou_rs 側 (ライブラリのフォルダ)
+narou_rs login import login.yaml --passphrase <パスフレーズ>
+```
+
+`--passphrase` を付けると書き出しファイルは Argon2id + XChaCha20-Poly1305 で暗号化されます。Web UI を使う場合は、設定ページの「ログイン」タブからファイルを選択して取り込めます。
+
+`narou_rs_login` の主なオプションは以下です。
+
+| オプション | 意味 |
+| --- | --- |
+| `--cookie <文字列>` | ブラウザを開かず、コピーした Cookie 文字列を保存 |
+| `--browser <パス>` | 使用する Chromium 系ブラウザを指定 |
+| `--export <ファイル>` | 取得した Cookie を書き出しファイル (YAML) に出力 |
+| `--passphrase <パス>` | 書き出しファイルを暗号化 (書き出し時は 8 文字以上) |
+| `--clear-text` | パスフレーズ指定時でも平文で書き出す |
+| `--name <名前>` | 取得したログインに名前を付ける |
+| `--profile <DIR>` | 既存のブラウザプロファイルを使う (未指定時は毎回新しい一時プロファイル) |
+| `--list` | 保存済みの Cookie を表示 (値ではなく名前のみ) |
+| `--clear` | 指定サイトの Cookie を削除 |
+| `--port <ポート>` | ブラウザのリモートデバッグポート (既定 0 = 自動検出。`DevToolsActivePort` を検証して接続) |
+| `--timeout <秒>` | ログイン完了を待つ秒数 (既定 300) |
+
+保存済みの情報は `narou_rs login` サブコマンドでも管理できます。
+
+```powershell
+narou_rs login list                                       # 一覧 (値は伏せて表示)
+narou_rs login import login.yaml --name 本垢              # 名前を付けて取り込み
+narou_rs login rename <サイト> 1 本垢                      # 保存済みログインの名前を変更
+narou_rs login order <サイト> 2,1                          # 全件を指定して試行順を入れ替え
+narou_rs login export login.yaml --passphrase P           # 書き出し
+narou_rs login import login.yaml --replace                # 取り込みに無いサイトを削除
+narou_rs login clear <サイト>                              # 1 サイト分を削除
+narou_rs login clear <サイト> --index 1                    # そのサイトの 1 件だけ削除
+narou_rs login clear                                      # すべて削除
+```
+
+※ 本体の `login set` / `login add` コマンドは廃止されました。資格情報の登録には `narou_rs_login` または書き出しファイルの取り込み機能をご利用ください。
+
+複数のログイン Cookie は一覧の順に試行され、成功した資格情報は小説レコードに記憶されるため、同じ小説の次回以降は最初のリクエストからその Cookie が使われます。
+
+保存した Cookie は、ダウンロード時に 404 またはサイト定義の `login_pattern` に一致するログイン壁が返った場合に自動で使われます。`webnovel/*.yaml` に `login_url` (ログイン用 bin が開く URL) と `login_pattern` (ログイン壁を検出する正規表現) を定義すると、サイトごとの挙動を調整できます。
+
+アルファポリスの Cookie は親ドメインと `www` を同一のログインとしてまとめ、無関係な他の `*.co.jp` ドメインは含めません。未レンタル話が含まれる場合は保存済みのログインを試行し、閲覧可能な話数が増加した場合に採用します。閲覧権が付与されていない場合でも無料公開分は取得可能で、後からレンタルした話は `narou_rs update <登録ID>` で追加取得できます。権利失効などで保存済みの話が目次から欠落した場合は、既存データを保護して更新を見送ります。※ 電子書籍特典には未対応です。
+
+#### カクヨムネクスト
+
+無料公開されている話はログインなしで取得できます。有料部分まで取得する場合は、有効な閲覧権を持つアカウントの Cookie を保存します。作品 URL を取得用 bin に渡すと、保存後にその作品の閲覧制限も確認します。
+
+```powershell
+# 有料部分の閲覧権を持つアカウントを使う場合
+narou_rs_login https://kakuyomu.jp/works/2912051601247823656 --name NEXT
+narou_rs download https://kakuyomu.jp/works/2912051601247823656
+```
+
+目次に閲覧不可の `EmptyEpisode` があれば、保存済みのログインを順に試します。ログインだけでは有料部分を読めない場合があり、制限が残ると「現在閲覧できる N 話のみ」の警告を出して無料分を取得します。無料分を先に登録した作品は、Cookie 保存後に `narou_rs update <登録ID>` で追加分を取得できます。本文の代わりに返された作品トップは空本文として保存しません。通常の公開作品には Cookie を送りません。
+
+現在の部分一覧に以前保存した話が含まれない場合は、強制指定でも既存データを保持して更新を見送ります。閲覧制限を話の削除や作品の非公開と取り違えず、保存済みの有料部分を無料分で置き換えません。閲覧できる話が 0 件の場合も空の小説として登録しません。
 
 ## グローバルオプション
 
@@ -257,7 +391,10 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
 
 - 作業ディレクトリ単位で `.narou/` を持つ設計です。`download`、`update`、`convert` などは基本的に初期化済みディレクトリで実行してください。
 - サイトごとの取得・抽出ルールは `webnovel/*.yaml` を使います。ユーザーがこの YAML を編集すると、挙動もそれに追従します。
+- 全作品を `小説` または `漫画` に分類し、通常タグと別の項目に保存します。サイト定義の `work_type_rules:` と `preprocess:` DSL で判定を変更でき、条件が無い場合は小説です。Pixiv の `a` / `c` は漫画扱い（単体イラスト・うごイラを含む）です。編集不可の属性タグとして表示・検索する機能は既定 OFF で、Web UI のタグメニューまたは `narou setting tag.attributes-enabled=true` で有効にできます。ON 時の個別表示は `tag.show-novel`（既定 false）と `tag.show-manga`（既定 true）で切り替えます。OFF 中も分類は保持されます。定義例と既存データの扱いは [コマンド一覧](COMMANDS.md) を参照してください。
 - 保存データや設定ファイルは [narou.rb](https://github.com/whiteleaf7/narou) 互換の YAML / ディレクトリ構成を重視しています。
+- Pixiv は本文・目次・作品情報を `/ajax/*` の JSON から取得します (`webnovel/www.pixiv.net.yaml`)。挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は画像 URL を追加 API から解決して `挿絵/` に取り込みます。ログイン限定作品やログインでしか全部見えない作品一覧は、保存したログイン Cookie を順に試して再取得します。
+- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。うごイラ (フレーム集約 zip) は APNG に組み立てて取り込みます。APNG 化に必要なコーデックは `illustration-animation` feature にあり、native と Worker の両方で有効です（`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞っています）。R18 作品はログインしていないと一覧に表示されないため、R18 作品を含むシリーズは事前に `narou_rs_login` で Cookie を保存してください。
 - 変換結果は青空文庫向け整形を基準にし、設定や device 指定に応じて追加出力を行います。
 - `update` は `general_lastup`、差分 cache、strong update、freeze などの挙動を持ちます。
 - `web` は localhost 利用を基本にしています。非 loopback で公開する場合は認証設定を行ってください。
@@ -265,11 +402,13 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
 
 ## 注意点
 
-- `narou init` 前に多くのコマンドを実行しても、初期化を促す表示になります。
+- `narou_rs init` 前に多くのコマンドを実行しても、初期化を促す表示になります。
 - `webnovel/*.yaml` を Rust 側のハードコードより優先する方針です。サイト追従が必要な場合は、まず YAML の更新を検討してください。
 - 配布物を移動するときは、実行ファイルだけでなく `webnovel/` と `preset/` も一緒に配置してください。
 - `send`、`mail`、AozoraEpub3 連携は、端末や SMTP の実環境設定が前提です。
-- `mail` 機能と Kindle / Kobo などの実機送信は、開発者の手元に端末が無いため十分な実地確認ができていません。動作確認や不具合報告、再現情報、修正提案に協力してもらえると助かります。
+- `mail` 機能と Kindle / Kobo などの実機送信は、開発者の手元に実機端末がないため十分な実地確認ができていません。動作確認や不具合報告、再現情報、修正提案にご協力いただけますと幸いです。
+- 管理データの保存形式は既定で従来どおりの YAML / ファイル構成です。SQLite 管理はオプトインで、Web UI の初回ツアーか `.narou/storage-backend` (`sqlite` / `yaml`) で切り替えます。`narou_rs db verify` / `export-yaml` / `vacuum` で SQLite 側を保守できます。
+- 新機能ツアーは Web UI 起動時に、まだ見ていないバージョンの項目だけを表示します。表示メニューの「新機能ツアーを表示」から全項目を再表示でき、「以降新機能ツアーは表示しない」で自動表示を止められます。既読バージョンと表示設定はライブラリのローカル設定に保存されます。
 
 ## 開発用コマンド
 

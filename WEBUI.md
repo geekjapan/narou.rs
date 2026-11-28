@@ -38,37 +38,45 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 
 | # | ID | ラベル | Rust |
 |---|-----|--------|------|
-| 1 | `#action-view-frozen` | ❄ 凍結中を表示 (チェック) | ✅ (localStorage永続化) |
-| 2 | `#action-view-nonfrozen` | 📖 凍結中以外を表示 (チェック) | ✅ |
+| 1 | `#action-view-all` | 全ての項目を表示 | ✅ (凍結/非凍結ともに表示) |
+| 2 | `#action-view-setting` | 表示する項目を設定 | ✅ (列可視性モーダル `#colvis-modal`) |
 | — | divider | — | ✅ |
-| 3 | `#action-view-wide` | 📐 小説リストの幅を広げる (トグル) | ✅ |
+| 3 | `#action-view-novel-list-wide` | 小説リストの幅を広げる [W] (チェック) | ✅ |
 | — | divider | — | ✅ |
-| 4 | `#action-view-setting-newtab` | 🔗 設定を別タブで開く (チェック) | ✅ |
+| 4 | `#action-view-nonfrozen` | 凍結中以外を表示 [Shift+F] (チェック) | ✅ |
+| 5 | `#action-view-frozen` | 凍結中を表示 [F] (チェック) | ✅ (localStorage永続化) |
 | — | divider | — | ✅ |
-| 5 | `#action-view-buttons-top` | ⬆ ボタンを上に表示 (チェック) | ✅ |
-| 6 | `#action-view-buttons-footer` | ⬇ ボタンをフッターに表示 (チェック) | ✅ |
+| 6 | `#action-view-toggle-setting-new-tab` | 変換設定ページは新規タブで開く (チェック) | ✅ |
 | — | divider | — | ✅ |
-| 7 | `#action-view-col-visibility` | 🔲 列の表示/非表示... | ✅ (列可視性モーダル) |
+| 7 | `#action-view-toggle-buttons-top` | ボタンをページ上部に表示 (チェック) | ✅ |
+| 8 | `#action-view-toggle-buttons-footer` | ボタンを画面下部に表示 (チェック) | ✅ |
+| — | divider | — | ✅ |
+| 9 | `#action-view-link-to-edit-menu` | 個別メニューを編集... | ✅ (`/edit_menu` を別タブで開く) |
+| 10 | `#action-view-select-menu-style` | 個別メニューの表示スタイルを選択 | ✅ (表示スタイルモーダル) |
+| — | divider | — | ✅ |
+| 11 | `#action-view-feature-tour` | 新機能ツアーを表示 | ✅ (feature_tour モーダルを全エントリで開く) |
+| — | divider | — | ✅ |
+| 12 | `#action-view-reset` | 表示設定を全てリセット | ✅ (localStorage の表示系設定を初期値へ) |
 
 #### 2.1.3 選択(Select)メニュー (左ドロップダウン2)
 
 | # | ID | ラベル | Rust |
 |---|-----|--------|------|
-| 1 | `#action-select-all` | ✅ 全て選択 (Ctrl+A) | ✅ |
-| 2 | `#action-select-all-visible` | 📋 表示中を全て選択 (Shift+A) | ✅ |
-| 3 | `#action-deselect-all` | ⬜ 全て解除 (Ctrl+Shift+A) | ✅ |
+| 1 | `#action-select-view` | 表示されている小説を選択 (Ctrl+A) | ✅ |
+| 2 | `#action-select-all` | 全ての小説を選択 (Shift+A) | ✅ |
+| 3 | `#action-select-clear` | 選択を全て解除 (ESC) | ✅ |
 | — | divider | — | ✅ |
-| 4 | `#action-select-mode-single` | 🔘 シングル選択 [S] | ✅ (チェック表示) |
-| 5 | `#action-select-mode-rect` | ⬛ 範囲選択 [R] | ✅ |
-| 6 | `#action-select-mode-hybrid` | 🔀 ハイブリッド選択 [H] | ✅ |
+| 4 | `#action-select-mode-single` | シングル選択モード [S] (チェック) | ✅ |
+| 5 | `#action-select-mode-multi` | 範囲選択モード [R] (チェック) | ✅ |
+| 6 | `#action-select-mode-hybrid` | ハイブリッド選択モード [H] (チェック) | ✅ |
 
 #### 2.1.4 タグ(Tag)メニュー (左ドロップダウン3)
 
 | # | ID | ラベル | Rust |
 |---|-----|--------|------|
-| 1 | `#action-tag-edit` | 🏷 タグ編集 [T] | ✅ (タグ編集モーダル起動) |
+| 1 | `#tag-list-canvas` | 既存タグ一覧 (クリックでフィルタ) | ✅ (API: `/api/tag_list`) |
 | — | divider | — | ✅ |
-| 2–N | 動的タグリスト | 既存タグ一覧 (クリックでフィルタ) | ✅ (API: `/api/tag_list`) |
+| 2 | `#action-tag-edit` | 選択した小説のタグを編集 [T] | ✅ (タグ編集モーダル起動) |
 
 #### 2.1.5 ツールメニュー (左ドロップダウン4)
 
@@ -86,24 +94,34 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 
 | # | ID | ラベル | Rust |
 |---|-----|--------|------|
-| 1 | `#action-option-settings` | 🔧 環境設定... | ✅ |
+| 1 | `#action-option-settings` | 環境設定... | ✅ |
+| 2 | `#action-option-hidden` | 非表示設定... | ✅ |
+| 3 | `#action-option-export` | 選択した作品をダウンロード... | ✅ |
+| 4 | `#action-option-import` | 小説データをアップロード... | ✅ |
+| 5 | `#action-option-virtual-add` | 選択した作品をバーチャル小説にまとめる... | ✅ |
+| 6 | `#action-option-virtual-append` | 選択した作品をバーチャル小説に追加... | ✅ |
+| 7 | `#action-option-virtual-order` | バーチャル小説の順序を変更... | ✅ |
+| 8 | `#action-option-virtual-convert` | バーチャル小説を変換... | ✅ |
+| 9 | `#action-option-virtual-remove` | バーチャル小説を削除... | ✅ |
 | — | divider | — | ✅ |
-| 2 | `#action-option-help` | ❓ ヘルプ... | ✅ |
-| 3 | `#action-option-about` | ℹ️ Narou.rs について | ✅ (バージョン表示モーダル) |
+| 10 | `#action-option-help` | ヘルプ... | ✅ |
+| 11 | `#action-option-about` | Narou.rs について | ✅ (バージョン表示モーダル) |
 | — | divider | — | ✅ |
-| 4 | — | Language切替 (日本語 ↔ English) | ✅ (Rust独自) |
+| 12 | `#action-lang-toggle` | Language切替 (日本語 ↔ English) | ✅ (Rust独自) |
 | — | divider | — | ✅ |
-| 5 | — | テーマ選択 (Cerulean/Darkly/Readable/Slate/Superhero/United) | ✅ (セレクトボックス、localStorage永続化) |
+| 13 | `#theme-select` | テーマ選択 (Cerulean/Darkly/Readable/Slate/Superhero/United) | ✅ (セレクトボックス、localStorage永続化) |
 | — | divider | — | ✅ |
-| 6 | `#action-option-server-reboot` | 🔄 サーバを再起動 | ✅ (確認ダイアログ付き) |
-| 7 | `#action-option-shutdown` | ⏻ サーバをシャットダウン | ✅ (確認ダイアログ付き) |
+| 14 | `#action-option-server-reboot` | サーバを再起動 | ✅ (確認ダイアログ付き) |
+| 15 | `#action-option-shutdown` | サーバをシャットダウン | ✅ (確認ダイアログ付き) |
+
+非表示設定のタグ・作者・サイトは、非表示中も含む一覧対象の作品から入力候補を表示する（バーチャル小説のメンバー行は一覧対象外）。候補は入力で絞り込み、クリックまたは矢印キーと Enter で選択できる。手入力も可能。
 
 #### 2.1.7 キュー表示 (右ナビバー)
 
 | 要素 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
-| アイコン | `.glyphicon-inbox` | 📥 (Unicode) | ✅ |
-| サイズバッジ | `.queue__sizes` (default + convert分割) | `#queue-count` 単一 | ✅ (concurrency 時も単一表示) |
+| アイコン | `.glyphicon-inbox` | material icon `move_to_inbox` | ✅ |
+| サイズバッジ | `.queue__sizes` (default + convert分割) | `#queue-sizes` (`#queue-count` + 区切り + `#queue-count-convert`)。concurrency 有効時だけ convert 側を表示 | ✅ |
 | クリックでモーダル表示 | キューマネージャー | キューマネージャーモーダル | ✅ |
 | ツールチップ | "クリックでキュー一覧を表示" | "クリックでキュー一覧を表示" | ✅ |
 | アクティブ状態 (色変化) | `.queue.active` | `queue-size-active` | ✅ |
@@ -117,6 +135,13 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | クリアボタン | `#myFilter-clear` (.glyphicon-remove-circle) | `#filter-clear` (×) | ✅ |
 | placeholder | "Filter" | "Filter" | ✅ |
 | タグフィルタ構文 | `tag:xxx` | `tag:xxx` | ✅ |
+| URL / Nコード / 数値ID 検索 | — | 貼り付けた URL (`https://ncode.syosetu.com/n0421du/`)、Nコード (`n0421du`)、URL 末尾の数値 ID (`16818093093698047858`)、レコード ID (`3`) | ✅ |
+
+一致規則はサーバ側の検索 (`/api/list` の `search[value]`) と同じで、URL は
+レコードの `toc_url` に対する部分一致（末尾 `/` は無視）、Nコードは
+`ncode` の部分一致または `toc_url` 最終セグメントとの完全一致、数値 ID は
+レコード ID との完全一致。`-`/`^`/`!` の否定、`|` の OR、`tag:` / `author:` /
+`site:` / `title:` / `status:` / `id:` のフィールド指定も同じ入力欄で使える。
 
 ---
 
@@ -137,20 +162,18 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 
 ### 2.3 コントロールパネル
 
-#### 2.3.1 ボタン一覧
-
 | # | ボタン | サブメニュー | Rust | 状態 |
 |---|--------|-------------|------|------|
-| 1 | **Download** (primary/青) | ドロップダウン: 強制再DL | ✅ (モーダル入力+D&D+強制再DLサブメニュー) | ✅ |
-| 2 | **Update** (success/緑) | ドロップダウン: GL確認/タグ指定/表示中/凍結済み | ✅ (全4サブメニュー) | ✅ |
-| 3 | **な** (success/緑) | — | ✅ | ✅ |
-| 4 | **他** (success/緑) | — | ✅ | ✅ |
-| 5 | **🔄** (success/緑) | — | ✅ (modifiedタグ付き更新) | ✅ |
-| 6 | **Send** (warning/橙) | ドロップダウン: 栞バックアップ | ✅ (ドロップダウン+backup_bookmark) | ✅ |
-| 7 | **Freeze** (info/水色) | ドロップダウン: 凍結/解除 | ✅ | ✅ |
-| 8 | **Remove** (danger/赤) | — | ✅ (確認ダイアログ付き) | ✅ |
-| 9 | **Convert** (default/白) | — | ✅ | ✅ |
-| 10 | **Other** (default/白) | ドロップダウン: 差分/調査/フォルダ/バックアップ/設定焼付/メール | ✅ (全6サブメニュー) | ✅ |
+| 1 | **Download** (primary/青) | ドロップダウン: 選択した小説を強制再ダウンロード | ✅ (`#btn-download` モーダル入力 + 強制再DLサブメニュー) | ✅ |
+| 2 | **Update** (success/緑) | ドロップダウン: 最新話掲載日を確認/タグを指定して更新/表示されている小説を更新/凍結済みでも更新 | ✅ (`#btn-update` + 全4サブメニュー) | ✅ |
+| 3 | **な** (success/緑) | — | ✅ (`#btn-gl-narou`) | ✅ |
+| 4 | **他** (success/緑) | — | ✅ (`#btn-gl-other`) | ✅ |
+| 5 | **🔄** (success/緑) | — | ✅ (`#btn-gl-modified`、modifiedタグ付き更新) | ✅ |
+| 6 | **Send** (warning/橙) | ドロップダウン: 端末の栞データをバックアップ | ✅ (`#btn-send` + backup_bookmark) | ✅ |
+| 7 | **Freeze** (info/水色) | ドロップダウン: 選択した小説を凍結/凍結を解除 | ✅ | ✅ |
+| 8 | **Remove** (danger/赤) | — | ✅ (`#btn-remove`、確認ダイアログ付き) | ✅ |
+| 9 | **Convert** (default/白) | — | ✅ (`#btn-convert`) | ✅ |
+| 10 | **Other** (default/白) | ドロップダウン: 差分表示/調査ログ/保存フォルダ/バックアップ/設定焼付/メール送信 | ✅ (全6サブメニュー) | ✅ |
 | 11 | **Eject** (default/白, 隠し) | ドロップダウン | なし | ❌ |
 
 #### 2.3.2 enable-selected 制御
@@ -173,7 +196,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 
 #### 2.4.1 カラム一覧
 
-`/api/list` の日時系 (`last_update`, `new_arrivals_date`, `general_lastup`, `last_check_date`) は narou.rb と同じく epoch integer を返し、描画側で表示文字列へ変換する。
+`/api/list` の日時系 (`last_update`, `new_arrivals_date`, `general_lastup`, `last_check_date`) は narou.rb と同じく epoch integer を返し、描画側で表示文字列へ変換する。テーブルは全 19 列で、列可視性モーダル (`#colvis-modal`) はそのうちタイトル列以外の 18 列を切り替え対象にする。
 
 | # | カラム | 説明 | Rust | 状態 |
 |---|--------|------|------|------|
@@ -188,10 +211,14 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 9 | タグ | 色付きバッジ (7色対応)、クリックでフィルタ | ✅ (tag:xxxフィルタ) | ✅ |
 | 10 | 話数 | `N話` 形式 | ✅ | ✅ |
 | 11 | 文字数 | 万字/千字 表示 (unitizeNumeric) | ✅ | ✅ |
-| 12 | 状態 | 連載中/完結/中断 | ✅ | ✅ |
-| 13 | リンク | ToC URL (🔗アイコン) | ✅ | ✅ |
-| 14 | 個別 | ⋯ メニューボタン (→コンテキストメニュー) | ✅ | ✅ |
-| 15 | あらすじ | ℹボタンでポップオーバー表示 | ✅ (API: `/api/story`) | ✅ |
+| 12 | 平均文字数 | 文字数÷話数 (narou.rb 相当) | ✅ | ✅ |
+| 13 | 状態 | 連載中/完結/中断 | ✅ | ✅ |
+| 14 | リンク | ToC URL (🔗相当アイコン) | ✅ | ✅ |
+| 15 | ＤＬ | `/novels/:id/download` への ebook ダウンロードリンク | ✅ | ✅ |
+| 16 | 保存先 | 保存フォルダを開くボタン (folder API) | ✅ | ✅ |
+| 17 | 更新 | 凍結済みでも更新ボタン (update_force) | ✅ | ✅ |
+| 18 | あらすじ | ℹ相当ボタンでポップオーバー表示 | ✅ (API: `/api/story`) | ✅ |
+| 19 | 個別 | ⋯ メニューボタン (→コンテキストメニュー) | ✅ | ✅ |
 
 #### 2.4.2 行の状態表示
 
@@ -260,6 +287,69 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 ---
 
+### 2.7.1 お気に入りタグ
+
+**Rust版: ✅ 実装済み (issue #46 の要望)**
+
+自動付与されるタグは数百個まで増えるため、「タグの編集」画面から検索しないと
+よく使うタグを選べない。お気に入りタグを登録すると、タグ編集画面の先頭へ
+常設表示して検索なしで選べる。
+
+- 登録: タグ編集画面の入力欄の「★」ボタン、または作品に付いているタグの「☆」ボタン
+- 解除: お気に入り一覧の「×」ボタン、または「★」ボタンの切り替え
+- お気に入り一覧の「追加」ボタンで、選択中の小説へそのタグを付ける
+- 登録順は保持する (登録した順に並ぶ)
+- **並べ替え**: お気に入り一覧のタグはドラッグ＆ドロップで並べ替えられる
+  (2 件以上のときだけドラッグ可)。ドロップ位置はカーソルがチップの左半分なら
+  「前」、右半分なら「後」。並べ替えた順序は保存される
+- 保存先: 在庫の `favorite_tags` キー (Native は `.narou/favorite_tags.yaml` /
+  SQLite `app_state('inv','favorite_tags')`、Worker は D1 の同じキー)
+- タグ色は独立した設定。お気に入りに登録しても色は変わらず、色を変えても
+  お気に入りは外れない
+- API: GET / POST `/api/favorite_tags` (`action`: `add` / `remove` / `clear` / `reorder`)
+
+### 2.7.2 タグ一覧の並び順
+
+**Rust版: ✅ 実装済み (issue #46 の要望)**
+
+メインメニューの「タグ」と、作品一覧の各行の「タグ」列は同じ並び順を使う。
+設定は `webui.tag-sort-order` (Web UI の設定ページ、または `narou setting
+webui.tag-sort-order=...` で変更)。
+
+| 値 | 並び | 備考 |
+|:---|:---|:---|
+| `favorites_first` (既定) | お気に入り優先 | お気に入りタグが先頭。残りは件数降順 → 名前昇順 |
+| `alphabetical` | アルファベット順 | タグ名の昇順 |
+| `count` | 使用件数順 | 件数の降順、同数は名前昇順 |
+| `registered` | 登録順 | タグがライブラリへ入った順 (初めて付いた順) |
+
+- 並べ替えは保存しないと次の起動で元に戻る (設定なので永続化される)
+- `webui.tag-sort-order` は Worker 側でも同じ設定名を使う。Native / Worker とも `/api/webui/config` の `tag_sort_order` で現在の選択を返す。
+- 設定画面で保存すると、変更通知を受けたメイン画面がタグ一覧を取り直し、メニューと作品行の両方に反映する。
+  Native の CLI から変更した場合は、既存の 30 秒間隔の監視で検知した後に反映する。
+  メイン画面の再読み込みやサーバーの再起動は不要。作品に保存されたタグの順序、お気に入りの登録内容、タグ色は変えない。
+- **登録順の保存先**: 在庫の `tag_sequence` キー (Native は
+  `.narou/tag_sequence.yaml`、SQLite 管理と Worker は
+  `app_state('inv','tag_sequence')`)。タグごとにグローバルな連番を振り、
+  最初にタグが付いたとき順番が決まります。小説 ID の順ではないため、古い
+  小説へ後からタグを付けても「タグが library へ入った順」が保たれます。
+  既存ライブラリには連番が無いので、最初の書き込みで最小小説 ID → タグ名の
+  順にバックフィルします (以後の新しいタグは登録順の末尾に足ります)。
+- 連番表の更新は作品と同じ直列化境界の中で行います (Native は同じ
+  トランザクション / ファイルロック、Worker は同じ D1 batch)。そのため
+  同時に作品へタグを付けても、並んだ順が保存した順と食い違えません。
+
+### 2.7.3 属性タグ
+
+各作品の `小説` / `漫画` の分類は通常タグと別に保存し、手動で追加・削除できない。
+「タグ」メニューの「属性タグ機能を使う」、または
+`narou setting tag.attributes-enabled=true` で機能を有効にすると表示・検索できる。
+既定は OFF。OFF 中も分類は保持されるが、タグ表示・検索・非表示タグの照合には使わない。
+ON 時の「小説」「漫画」チェックは表示だけを切り替える (既定は小説 OFF・漫画 ON)。
+分類条件と既存データの移行については [コマンド一覧](COMMANDS.md) を参照。
+
+---
+
 ### 2.8 アラート・通知
 
 | 種類 | Ruby版 | Rust版 | 状態 |
@@ -295,8 +385,13 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 既存タグ表示 | 色付きバッジ | タグバッジ (×削除ボタン付き) | ✅ |
 | タグ追加 | テキスト入力 | `#new-tag-input` + 追加ボタン | ✅ |
 | タグ削除 | ×ボタン | `.tag-remove` ×ボタン | ✅ |
+| 色の変更 / お気に入り | なし | バッジの 2 段目 (タグ名の下) に `色` と `★ / ☆` のボタン | ✅ |
 | 複数小説一括適用 | あり | あり (selectedIds / single ID) | ✅ |
 | Enter で追加 | あり | あり | ✅ |
+
+バッジはタグ名の上に文字、下に操作ボタン (色 / ★) を並べる 2 段組みで、ボタンも
+1.35em 角に如其して押しやすい大きさにしてある。削除の × だけは色・★ と押し間違えない
+ようにタグ名のすぐ隣 (同じ段) に置いている。お気に入りタグの一覧も同じ形。
 
 ### 3.3 Aboutモーダル
 
@@ -324,10 +419,25 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 ### 3.5 確認ダイアログ
 
+**Rust版: ✅ 実装済み (`js/ui/dialog.js`)**
+
+ブラウザ標準の `alert` / `confirm` / `prompt` は使わず、ページと同じテーマの
+モーダルで表示する。`index.html` と `settings.html` の両方から使えるよう、
+markup は初回表示時に JS が組み立てる (`#app-dialog`、HTML 側の変更は不要)。
+
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
-| 汎用確認モーダル | bootbox.js カスタム | `#confirm-modal` (HTML) + `confirm()` (JS) | ✅ |
+| 確認 (OK / キャンセル) | bootbox.js カスタム | `confirmDialog()` | ✅ |
+| 通知 (OK のみ) | bootbox.js カスタム | `alertDialog()` | ✅ |
+| 1 行入力 (必須/任意) | — | `promptDialog()` (空欄は入力欄へフォーカスして閉じない) | ✅ |
+| 複数項目の入力 | — | `formDialog()` (候補リスト付きの入力欄も可) | ✅ |
+| 一覧からの選択 | — | `selectDialog()` (ラジオ形式、`detail` に補足) | ✅ |
+| キャンセル操作 | — | × / キャンセル / Escape / 背景クリック | ✅ |
 | サーバー主導モーダル | `ping.modal` WebSocket | なし | ❌ |
+
+置き換え済みの箇所: バーチャル小説の登録・操作対象の選択・削除・追加、
+シャットダウン / 再起動 / セルフアップデートの確認、設定ページのデータ管理方式
+切替・ログイン名変更・ログイン情報の削除。
 
 ### 3.6 メモ帳モーダル
 
@@ -359,7 +469,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
-| 全列のチェックボックス | DataTables ColVis | 13列のチェックリスト | ✅ |
+| 表示切替可能な列のチェックボックス | DataTables ColVis | 18列のチェックリスト (タイトル列は常時表示で対象外) | ✅ |
 | 全て表示/全て隠す/リセット | — | ✅ (3ボタン) | ✅ |
 | localStorage永続化 | — | `narou-rs-webui-hidden-cols` | ✅ |
 
@@ -389,6 +499,30 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | localStorage永続化 | `update_general_lastup_checked` | 同左 | ✅ |
 | 確認実行 | POST `/api/update_general_lastup` | 同左 | ✅ |
 | 公式サイトリンク | `http://dev.syosetu.com/man/api/` | 同左 | ✅ |
+
+### 3.11 バーチャル小説
+
+**Rust版: ✅ 実装済み (`#action-option-virtual-*` / `#virtual-order-modal`)**
+
+| 機能 | Rust版 | 状態 |
+|------|--------|------|
+| 選択した作品をバーチャル小説にまとめる | `#action-option-virtual-add` → `formDialog` (タイトル / 作者名 / サイト名) | ✅ |
+| 選択した作品を既存のバーチャル小説へ追加 | `#action-option-virtual-append` → `POST /api/virtual_novels/{id}/members` | ✅ |
+| 登録順の変更 | `#action-option-virtual-order` → `#virtual-order-modal` (↑ / ↓) | ✅ |
+| 変換 | `#action-option-virtual-convert` → `POST /api/virtual_novels/{id}/convert` (native) | ✅ |
+| 削除 | `#action-option-virtual-remove` → `DELETE /api/virtual_novels/{id}` | ✅ |
+
+- バーチャル小説の作者名・サイト名の入力欄は候補リスト付き (入力で絞り込み、↓ / ↑ で
+  候補を動かして Enter またはクリックで入力欄へ入れる)。ブラウザ標準の `datalist` は
+  使わず、同じスタイルの一覧を自前で描画する。
+- 操作対象の決め方: 一覧で**バーチャル小説をちょうど 1 件選択**しているときは、
+  その作品を対象にして ncode の入力を求めない。登録が 1 件だけのときも同様。
+  それ以外は `selectDialog` で一覧から選ぶ (以前の ncode 手入力は廃止)。
+- 追加した作品はメンバーとして通常の一覧から隠れ、EPUB には登録順の末尾へ結合
+  される。仮想小説のタグ・話数 (`general_all_no`)・最新話掲載日も再計算される。
+- API: `POST /api/virtual_novels/{id}/members` (native / Worker 共通、body は
+  `{"members": [id, ...]}`)。既に別の仮想小説に属する作品、仮想小説自身、
+  重複は 400 で拒否する。
 
 ---
 
@@ -451,6 +585,36 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/novels/{id}` | DELETE | ✅ |
 | `/api/webui/config` | GET | ✅ |
 
+### 6.1b クライアント主体の小説データ転送
+
+**未公開の別ブランチ実装。統合動作検証は未完了。** ZIP の生成・検証・展開は端末内の Dedicated Worker + WASM で行い、Native / Workers との通信は `/api/transfer/v2` の生バイトと制御 JSON に限定する。ZIP 全体 POST・サーバー ZIP・Base64 応答へのフォールバックはない。
+
+| エンドポイント (`/api/transfer/v2` 配下) | 用途 |
+|---|---|
+| `GET /capabilities` | 宛先・role・codec / ABI・上限を確認 |
+| `POST /imports` / `/exports` | セッション作成 |
+| `GET /{direction}/{id}` / `catalog` / `files` / `plan` | 状態・選別・計画・再開位置の確認 |
+| `PUT /imports/{id}/manifest/chunks/{n}` / `chunks` | 選別済み manifest / ファイルを有界フレームで送信 |
+| `GET /exports/{id}/manifest/chunks/{n}` / `batches/{n}` | 固定 snapshot のメタデータ / 生バイトを受信 |
+| `POST /{direction}/{id}/advance` | 準備・作品単位の公開・回復を進める |
+| `GET /sessions` / `DELETE /sessions/{id}` | 残ったセッションの確認・削除 |
+
+#### 選別と保存
+
+- 既定の `runtime` は現行本文・目次・作品情報・設定・挿絵・挿絵索引・未知の利用者ファイルを保持する。raw・任意の履歴・アプリ生成と証明できた出力は既定で送らない。
+- `complete` は保存可能な追加データも含める。Worker は raw を新規保存しない。本文 YAML や挿絵索引は SQLite / D1 でも必要で、DB 管理だけを理由に除外しない。
+- 取り込みは端末内で ZIP **全体を検証し、選別した後**にセッションを作成する。書き出しはサーバーの列挙から選別した後だけ snapshot を作る。不要な raw を送ってから捨てる方式ではない。
+- ZIP と本文は全量を `Blob` / `ArrayBuffer` にしない。File System Access または Service Worker の pull 型保存へ逐次書き出す。両方使えない場合はエラーにし、全量メモリ保存へ戻さない。Service Worker 経路の最終保存結果はブラウザのダウンロード一覧で確認する。
+
+#### 再開・失敗
+
+- 1 HTTP バイナリ本文はフレーミング込み 8 MiB / 100 レコード以下。ZIP 合計の旧 512 MiB 制限とは別で、ZIP64 の大きなファイルも分割する。
+- UUID と秘密値をセッション作成前に端末へ保存する。通信断では受領済み offset / SHA を照会し、同じ operation ID と revision で重複実行を防ぐ。取り込み再開では同じ ZIP を選び直し、確認済み prefix を再検証する。
+- 公開は作品単位。中断しても完了済み作品は保持し、公開中の作品は元の epoch と保存済み journal に従って回復する。HTTP 切断・容量不足・保存失敗を完了表示にしない。
+- codec の欠落、ABI / build ID 不一致は開始前にエラーにする。Worker の重い処理枠不足 (`503 memory_capacity`) も成功ではない。
+
+ZIP 書式・用途別ファイル表は [`docs/transfer-archive-format.md`](docs/transfer-archive-format.md)、通信・認証・有界処理・公開境界は [`docs/client-transfer-design.md`](docs/client-transfer-design.md) を参照。
+
 ### 6.2 ダウンロード・更新・変換
 
 | エンドポイント | メソッド | Rust |
@@ -472,6 +636,19 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/update_general_lastup` | POST | ✅ (GL確認更新) |
 | `/api/cancel` | POST | ✅ (実行中タスクkillのみ、キュー消去なし) |
 | `/api/download_force` | POST | ✅ (強制再DL) |
+
+### 6.2b ログイン
+
+| エンドポイント | メソッド | Rust |
+|-------------|--------|------|
+| `/api/login` | GET | ✅ (サイト別・試行順つき一覧。値はマスク) |
+| `/api/login` | DELETE | ✅ (全削除) |
+| `/api/login/import` | POST | ✅ (書き出しファイル取り込み、replace 対応) |
+| `/api/login/set` | POST | ✅ (サイトの資格情報を置き換え) |
+| `/api/login/add` | POST | ✅ (サイトの資格情報を末尾に追加) |
+| `/api/login/order` | POST | ✅ (試行順の並替) |
+| `/api/login/{host}` | DELETE | ✅ (サイト単位で削除) |
+| `/api/login/{host}/{index}` | DELETE | ✅ (1 件だけ削除) |
 
 ### 6.3 凍結・削除 (バッチ)
 
@@ -526,6 +703,35 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/global_setting` | GET | ✅ |
 | `/api/global_setting` | POST | ✅ |
 
+### 6.8 外部公開 API (読み取り専用)
+
+`/api/v1` は外部のツール (表の生成・自動化・MCP) 用の読み取り専用 API。
+ブラウザの UI トークンとも Basic 認証とも独立しており、Bearer トークン
+だけでアクセスする。仕様は [`docs/external-api.md`](docs/external-api.md) を参照。
+
+| エンドポイント | メソッド | Rust |
+|-------------|--------|------|
+| `/api/v1` | GET | ✅ (案内) |
+| `/api/v1/novels` | GET | ✅ (一覧。`format=json\|jsonl\|xml`) |
+| `/api/v1/novels/{id}` | GET | ✅ |
+| `/api/v1/novels/{id}/toc` | GET | ✅ (バーチャル小説は連結) |
+| `/api/v1/novels/{id}/sections` | GET | ✅ (全話) |
+| `/api/v1/novels/{id}/sections/{key}` | GET | ✅ (1 話の本文) |
+| `/api/v1/novels/{id}/epub` | GET | ✅ (EPUB) |
+| `/api/v1/tags` | GET | ✅ |
+| `/api/v1/mcp` | POST | ✅ (MCP / JSON-RPC 2.0) |
+
+### 6.9 外部 API の設定 (トークン管理)
+
+設定ページの「外部API」タブが使う。ブラウザの UI トークン (または Worker
+の管理トークン) で保護される。
+
+| エンドポイント | メソッド | Rust |
+|-------------|--------|------|
+| `/api/external_api` | GET | ✅ (接続情報・トークン一覧・Access 資格情報) |
+| `/api/external_api/token` | POST | ✅ (トークン作成) |
+| `/api/external_api/token/{id}` | DELETE | ✅ (トークン削除) |
+
 ### 6.7 ユーティリティ
 
 | エンドポイント | メソッド | Rust |
@@ -543,6 +749,11 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/story` | GET | ✅ (あらすじ取得) |
 | `/api/taginfo.json` | POST | ✅ (タグ情報+HTML) |
 | `/api/validate_url_regexp_list` | GET | ✅ (URL正規表現一覧) |
+| `/api/diff_history` | GET | ✅ (小説本文のバージョン履歴。SQLite 管理時) |
+| `/api/diff_show` | GET | ✅ (保存済み差分の表示) |
+| `/api/diff_restore` | POST | ✅ (指定バージョンへ復元) |
+| `/api/diff_merge` | POST | ✅ (指定バージョンを作業セットへマージ) |
+| `/api/novels/{id}/author_comments` | GET | ✅ (前書き/後書き取得) |
 
 ### 6.8 タスク復元
 
@@ -552,23 +763,35 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/defer_restore_pending_tasks` | POST | ✅ (保留タスク消去) |
 | `/api/confirm_running_tasks` | POST | ✅ (再実行/延期判定) |
 
+### 6.8b 新機能ツアー / ストレージ
+
+| エンドポイント | メソッド | Rust |
+|-------------|--------|------|
+| `/api/feature_tour/pending` | GET | ✅ (未表示ツアー項目) |
+| `/api/feature_tour/all` | GET | ✅ (現在バージョンまでの全項目) |
+| `/api/feature_tour/seen` | POST | ✅ (表示済み version を記録) |
+| `/api/feature_tour/config` | POST | ✅ (自動表示の有効/無効) |
+| `/api/storage/mode` | GET/POST | ✅ (管理バックエンド yaml/sqlite の取得・切替。native-runtime のみ) |
+
 ### 6.9 システム
 
 | エンドポイント | メソッド | Rust |
 |-------------|--------|------|
+| `/api/version/current.json` | GET | ✅ (現在のバージョン) |
+| `/api/version/latest.json` | GET | ✅ (最新版と更新可否) |
+| `/api/downloadable.gif` | GET | 🟡 透明 GIF を返すが、対象の登録状態に応じた画像の切替は未実装 |
 | `/api/shutdown` | POST | ✅ |
 | `/api/reboot` | POST | ✅ |
 | `/api/update/start` | POST | ✅ (Rust拡張: 同梱 updater による自動アップデート) |
+| `/api/library_backup` | GET/POST | ✅ (ライブラリ全体バックアップの状態確認/作成) |
 
-### 6.10 削除済み / 未実装 API (Ruby版にあったが Rust版では廃止)
+### 6.10 未実装 / 廃止した API
 
 | エンドポイント | 説明 |
 |-------------|------|
-| `/api/version/latest.json` | 最新バージョンチェック (外部API依存, narou.rb と同等実装) |
-| `/api/eject` | 端末取出し (実機検証必要) |
+| `/api/eject` | 端末取出し (未実装。実機検証必要) |
 | `/api/download4ssl` | **削除済み** (旧ブックマークレットのクロスオリジン POST 用。CSRF ガード導入により使用不可となり、`/?register=<url>` same-origin 方式へ移行) |
 | `/api/download_request` | **削除済み** (同上。旧 D&D ウィジェット互換の名残。`/?register=<url>` 経由で代替可能) |
-| `/api/downloadable.gif` | DL状態GIF画像 (レガシー, narou.rb 同等実装) |
 
 ### 6.11 ブックマークレット (same-origin 登録フロー)
 
@@ -613,6 +836,7 @@ Rust版では以下のように CSRF ガードと両立する same-origin 方式
 | `console.clear` | S→C | ✅ (コンソール内容クリア) | ✅ |
 | TermColorLight色付き出力 | `<span>` HTML色付き | ✅ (termcolor.rs + innerHTML) | ✅ |
 | `progressbar.init/step/clear` | S→C | ✅ (WebProgress + main.js、`stdout` / `stdout2` 各コンソール下端に表示して完了時に消去) | ✅ |
+| `queue_partial` / `queue_cancelled` | — (Rust拡張) | ✅ (部分成功/取消の通知でキュー表示を更新) | ✅ |
 | `ping.modal` (サーバー主導モーダル) | S→C | なし | ❌ |
 | `notepad.change` (メモ帳同期) | S→C | なし | ❌ |
 | `device.ejectable` | S→C | なし | ❌ |
@@ -632,14 +856,69 @@ Rust版では以下のように CSRF ガードと両立する same-origin 方式
 
 ### 8.1 リバースプロキシ / 追加ホスト
 
-外部公開や別ドメインからの `Host` ヘッダを許可するために、以下の設定キーを併用します。`s` は `setting` サブコマンドの短縮です（`web` の短縮ではありません）。
+外部公開や別ドメインからの `Host` ヘッダを許可するために、以下の設定キーを併用します。`s` は `setting` サブコマンドの短縮です（`web` は `w` / `we` で呼べます）。
 
 - `server-bind` — LAN 公開時は `0.0.0.0` か LAN IP を指定（既定 `127.0.0.1`）。
-- `server-reverse-proxy.enable` — nginx 等の前段 proxy が付与する外側 Host / Origin を許可（既定 `false`）。`true` の間は固定許可リストではなく外側 Host の構文妥当性だけで判定する。
 - `server-basic-auth.require-for-external-bind` — `0.0.0.0` など外部 bind 時に Basic 認証必須にする narou.rs 独自ガード（既定 `true`）。
+- `server-reverse-proxy.enable` — nginx 等の前段 proxy 経由のアクセスを有効化（既定 `false`）。`true` の間も Host の許可リストは維持されるため、公開ホストを `server-add-accepted-hosts` に、WebSocket を使う場合は `server-ws-add-accepted-domains` に明示してください。Origin は Host と照合され、proxy が付与する外側ホスト名で判定されます。
+- `server-ws-add-accepted-domains` が空の場合、WebSocket の許可ドメインは loopback 既定 (`127.0.0.1` / `localhost` / `::1`) になります。外部ホスト経由で WebSocket を使う場合は明示してください。
+- 外部 bind + Basic 認証は HTTP 平文です。LAN 外へ公開する場合は TLS 終端つきリバースプロキシを使用してください (起動時に警告が出ます)。
 - `server-add-accepted-hosts` — HTTP `Host` ヘッダに追加で許可するホストのリスト（カンマ区切り）。`*.example.com` のような安全なワイルドカードに対応。unsafe なパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視。既定の許可集合は bind host + loopback + 自ホスト名のまま据え置き、追加ホストだけを opt-in で広げる。
 
 Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `server-add-accepted-hosts` / `over18`。`server-reverse-proxy.enable` と `server-basic-auth.require-for-external-bind` は hidden のため CLI からのみ変更します。
+
+### 8.1.1 loopback UI トークン
+
+`127.0.0.1` / `localhost` / `::1` に bind し、Basic 認証を使わない構成では、`narou web` が起動ごとに一度きりのブートストラップ URL をブラウザへ渡します。リバースプロキシモードでも loopback なら同じ要求を行います（同じ端末の別プロセスは `Host` / `Origin` ヘッダを自由に書けるため、これらは認証の代替になりません）。
+
+- 初回の `GET /?narou_ui_token=<ticket>` だけが受け付けられ、サーバは HttpOnly / SameSite=Strict / 30 日有効の `narou_ui_token` Cookie を設定してトークン無しの `/` へリダイレクトします。チケットは使う origin（`Host`）ごとに一度使うと無効になります（reverse proxy 経由の公開ホストと直接アクセスの両方から開けます）。
+- Cookie の値は `.narou/ui_token`（0600）に永続化されるため、サーバ再起動やセルフアップデート後もブラウザのセッションは維持されます。
+- `/api/*`、`/ws`、`/novels/{id}/download` は Cookie または `x-narou-internal-token` ヘッダを要求します。静的なページと `/assets/*` はトークン不要です。
+- 起動時には「ブラウザで開く URL」（チケット付き）を常設表示します。reverse proxy 経由の公開ホストで開く場合は、同じ URL の `narou_ui_token` パラメータを付けた公開 URL を開いてください。
+- `--no-browser` のときは、起動時に表示される「ブラウザで開く URL」をそのまま開いてください。ベース URL を直接開いた場合、API は 401 を返します。
+- CLI や外部ツールから API を叩く場合は、`.narou/server.pid`（0600）に書かれた制御トークンを `x-narou-internal-token` ヘッダで送れます。
+- `server-bind` が外部公開、または Basic 認証ありの構成では従来どおり Basic 認証に認証を委ね、UI トークンは要求しません。
+
+### 8.2 セルフアップデートの variant
+
+Global タブの `self-update.variant` セレクトで、アップデート時に取得するリリースを選びます。
+
+| 選択肢 | 保存値 | 取得するファイル |
+|--------|--------|------------------|
+| GPL版（AozoraEpub3_Lite 組込み） | `gpl` | `narou_rs_<platform>_<arch>-GPL.zip` (例: `narou_rs_win_x64-GPL.zip`) |
+| 通常版（外部 AozoraEpub3） | `standard` | `narou_rs_<platform>_<arch>.zip` (例: `narou_rs_win_x64.zip`) |
+| 未設定 | （設定を削除） | 実行中のビルドと同じ variant |
+
+- CLI からも同じ設定を扱えます: `narou_rs setting self-update.variant=gpl` / `narou_rs setting self-update.variant`（読み取り）/ `narou_rs setting self-update.variant=`（削除）。
+- 0.4.0 以下から更新するときの variant 選択モーダルは、この設定が未設定のときだけ表示されます。設定済みならモーダルは出ず、保存値の variant を取得します。
+- 更新 API（`POST /api/update/start`）に `variant` を付けた場合は、その指定が最優先され、以後の更新のために保存されます。
+- 更新ファイルの取得先は GitHub Releases API が返す `browser_download_url` に固定され、リクエストで任意 URL を指定することはできません。ダウンロード後は Release asset の `sha256` digest とサイズを照合し、一致しない場合はインストールせず中止します。
+
+### 8.3 ログインタブ
+
+「ログイン」タブ (settings.js `renderLoginTab`) は `narou_rs_login` が書き出したファイルや、ブラウザからコピーした Cookie 文字列を取り込む受け口です。設定保存フォームとは独立して動き、Cookie 値は暗号化して保存されます。
+
+| 機能 | 実装 | 状態 |
+|------|------|------|
+| 保存済みサイトの一覧 | GET `/api/login` → `#login-hosts`。値はマスク表示、暗号化状態を併記 | ✅ |
+| 試行順の変更 | 各行の ↑↓ ボタン → POST `/api/login/order` | ✅ |
+| 1 件ずつ/サイト単位/全削除 | DELETE `/api/login/{host}/{index}`、`/api/login/{host}`、DELETE `/api/login` | ✅ |
+| 書き出しファイル取り込み | ファイル選択またはテキスト貼付 + パスフレーズ → POST `/api/login/import`。「取り込みに含まれないサイトを削除」は `--replace` 相当 | ✅ |
+| Cookie 直接登録 | サイト + Cookie 文字列 (+任意ラベル) → POST `/api/login/set` (置き換え) / `/api/login/add` (追加) | ✅ |
+
+### 8.4 新機能ツアー / ストレージ選択
+
+| 機能 | 実装 | 状態 |
+|------|------|------|
+| 未読分のツアー自動表示 | 起動時 GET `/api/feature_tour/pending` → `#feature-tour-modal` | ✅ (0.2.3〜) |
+| 全ツアー再表示 | 表示メニュー「新機能ツアーを表示」→ GET `/api/feature_tour/all` | ✅ |
+| 既読記録 | POST `/api/feature_tour/seen` → ローカル設定の `webui.feature-tour.seen-version` | ✅ |
+| 自動表示の無効化 | モーダル内「以降新機能ツアーは表示しない」→ POST `/api/feature_tour/config` (`webui.feature-tour.disabled`) | ✅ |
+| SQLite 移行プロンプト | 0.4.0 ツアー内で GET/POST `/api/storage/mode`（YAML→SQLite 選択、`.narou/storage-backend` マーカー） | ✅ (native-runtime のみ) |
+
+ライブラリの管理方式は既定で YAML のままです。SQLite はこのツアー (または `.narou/storage-backend`) で明示的に選んだ場合のみ有効で、CLI では `narou_rs db verify` / `export-yaml` / `vacuum` が保守用に使えます。
+
+0.4.13 の機能ツアーには「アルファポリスの小説・作者一覧に対応」「カクヨムネクストに対応」を追加しています。無料分の取得、レンタル・契約に応じたログイン Cookie の利用、保存済み本文の保護を案内します。既読になった版のツアーは起動時に再表示せず、表示メニューから全ツアーを確認できます。
 
 ---
 
@@ -676,26 +955,29 @@ Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` 
 | `narou-rs-webui-view-frozen` | 凍結表示 | ✅ |
 | `narou-rs-webui-view-nonfrozen` | 非凍結表示 | ✅ |
 | `narou-rs-webui-wide-mode` | ワイドモード | ✅ |
-| `narou-rs-webui-setting-new-tab` | 設定新タブ | ✅ |
+| `narou-rs-webui-setting-new-tab` | 変換設定ページを新規タブで開く | ✅ |
 | `narou-rs-webui-buttons-top` | ボタン上部 | ✅ |
 | `narou-rs-webui-buttons-footer` | ボタンフッター | ✅ |
 | `narou-rs-webui-select-mode` | 選択モード | ✅ |
 | `narou-rs-webui-hidden-cols` | 非表示列 | ✅ |
+| `narou-rs-webui-page-length` | 1 ページの表示件数 | ✅ |
+| `narou-rs-webui-list-state` | ソート列・方向・現在ページ (TTL 6時間) | ✅ |
+| `narou_settings_active_tab` | 設定ページのアクティブタブ | ✅ (settings.js 独自のキー) |
 
 ---
 
 ## 12. 実装サマリ
 
-**ページ**: 10/10 ✅ (メイン, 設定, ヘルプ, About, 個別設定, メモ帳, 作者コメント, ebook DL, 再起動, 編集メニュー)
-**ナビバー要素**: 全メニュー ✅ (表示/選択/タグ/ツール/オプション)
-**コントロールパネル**: 10/11 ボタン ✅ (Eject以外)
-**コンテキストメニュー**: 15/15 項目 ✅ (作者コメント表示含む)
-**モーダル**: 9/9 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性, タグ指定アップデート)
-**キーボードショートカット**: 12/12 ✅
-**テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
-**API**: 71 実装済み / 4 未実装 (eject, download4ssl, download_request, downloadable.gif)
+**ページ**: 11/11 ✅ (メイン, 設定, ヘルプ, About, 個別設定, メモ帳, 作者コメント, ebook DL, 再起動, ブックマークレット, 編集メニュー)
+**ナビバー要素**: 全メニュー ✅ (表示/選択/タグ/ツール/オプション。表示メニューに新機能ツアー・表示リセット・個別メニュー編集を含む)
+**コントロールパネル**: 実装済み 10 ボタン群 (Download/Update/な/他/🔄/Send/Freeze/Remove/Convert/Other)。Eject は未実装
+**コンテキストメニュー**: 15 項目 + divider ✅ (作者コメント表示含む。`/edit_menu` で項目編集可)
+**モーダル**: タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性, タグ指定アップデート, GL確認, 新機能ツアー等 ✅
+**キーボードショートカット**: 12 キー ✅ (shortcuts.js)
+**テーマ**: 6 テーマ ✅ (theme.css の CSS 変数で切替。フォールバック値など一部の hardcoded 色・px 値は残る)
+**API**: 主要エンドポイントは実装済み (§6 参照)。未実装/廃止は §6.10 に列挙 (eject, download4ssl, download_request 等)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload+tag.updateCanvas ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, 起動時バージョン表示+未完了タスク警告 ✅, モーダル/メモ帳同期 ❌
-**設定ページ**: ✅ (`webui.performance-mode` / `webui.table.reload-timing` に加え、`download.interval` / `download.wait-steps` / `user-agent` / `guard-spoiler` / 各種 length-limit を runtime 反映。Ruby版相当の `select_summaries` 表示と help HTML 表示にも対応。`queue.max-retries` / `queue.retry-backoff` も detail タブに表示され、夜間更新で一時的なネットワーク失敗があった場合に指数バックオフで自動リトライする)
+**設定ページ**: ✅ (`webui.performance-mode` / `webui.table.reload-timing` に加え、`download.interval` / `download.wait-steps` / `user-agent` / `guard-spoiler` / 各種 length-limit を runtime 反映。Ruby版相当の `select_summaries` 表示と help HTML 表示にも対応。`queue.max-retries` / `queue.retry-backoff` も detail タブに表示され、夜間更新で一時的なネットワーク失敗があった場合に指数バックオフで自動リトライする。Global タブに `self-update.variant`、ログインタブに Cookie 取り込み UI あり)
 **言語切替**: ✅ (Rust独自)
-**レスポンシブ**: ✅
+**レスポンシブ**: ✅ (狭い画面では列可視性の既定表示を絞る)
 **i18n 監査**: ✅ (JOB_TYPE_LABELS を Ruby版と完全一致に修正済み)

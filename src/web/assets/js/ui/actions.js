@@ -3,14 +3,20 @@
  * Mirrors narou.rb's full set of UI interactions.
  */
 import { State, El, lsSet, lsBool } from '../core/state.js';
-import { fetchJson, postJson } from '../core/http.js';
-import { toggleLanguage } from './i18n.js';
+import { fetchJson, postJson, request, assertApiSuccess } from '../core/http.js';
+import { renderConsoleLine } from '../core/console_html.js';
+import { createNotepadEditor } from '../core/notepad.js';
+import { persistSortState, postSortedJson } from '../core/sort_state.js';
+import { toggleLanguage, t } from './i18n.js';
 import { openFeatureTour } from './feature_tour.js';
+import { confirmDialog, formDialog, selectDialog, createSuggestionList } from './dialog.js';
+import { resetConsoleSize } from './console_size.js';
+import { exportSelectedNovels, importNovelArchive } from './transfer.js';
 import {
-  renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed,
+  renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed, attributeTagVisible,
   selectVisible, selectAll, clearSelection, getSelectedIdsInDisplayOrder,
   pruneSelectedIdsToCurrentList, updateEnableSelected,
-  syncViewChecks, showNotification,
+  syncViewChecks, showNotification, syncAttributeTagControls,
 } from './render.js';
 import { setShortcutHandlers, initShortcuts } from './shortcuts.js';
 import {
@@ -29,18 +35,89 @@ const TAG_COLOR_MAP = {
   red: 'tag-red',
   white: 'tag-white',
 };
-const SORT_STATE_COLUMN_INDEX = {
-  id: 0,
-  last_update: 1,
-  general_lastup: 2,
-  last_check_date: 3,
-  title: 4,
-  author: 5,
-  sitename: 6,
-  novel_type: 7,
-  general_all_no: 9,
-  length: 10,
+let notepadEditor = null;
+let notepadOpenGeneration = 0;
+let tagEditorGeneration = 0;
+let tagReadGeneration = 0;
+let tagMutationPending = false;
+let diffGeneration = 0;
+let removeTransaction = null;
+let removePending = false;
+let themeGeneration = 0;
+let themeSaveTail = Promise.resolve();
+let acknowledgedTheme = null;
+let themeReadGeneration = 0;
+let themePendingSaves = 0;
+let tagSortGeneration = 0;
+let tagSortReadGeneration = 0;
+let tagSortRefreshRequired = false;
+let tagSortPendingSaves = 0;
+let tagSortSaveTail = Promise.resolve();
+let acknowledgedTagSortOrder = null;
+let favoriteReadGeneration = 0;
+let favoriteSaveTail = Promise.resolve();
+let favoritePendingSaves = 0;
+let favoriteRefreshRequired = false;
+const hiddenSuggestionFields = {
+  tags: { suggestions: [] },
+  authors: { suggestions: [] },
+  sites: { suggestions: [] },
 };
+
+const VIRTUAL_NCODE_PATTERN = /^vs_\d+$/;
+const isAttributeTag = (tag) => tag === '小説' || tag === '漫画';
+
+/**
+ * `vs_<ID>` 形式の ncode か。一覧の行がバーチャル小説かどうかの判定に使う。
+ */
+export function isVirtualNcode(ncode) {
+  return typeof ncode === 'string' && VIRTUAL_NCODE_PATTERN.test(ncode);
+}
+
+/**
+ * 一覧で選択されている行からバーチャル小説を取り出す。
+ * 選択中のバーチャル小説がちょうど 1 件のときだけ、その作品を対象として使う。
+ */
+export function selectedVirtualNovel(novels, selectedIds) {
+  if (!selectedIds || typeof selectedIds.has !== 'function') return null;
+  const selected = (Array.isArray(novels) ? novels : []).filter(
+    (novel) => selectedIds.has(String(novel.id)) && isVirtualNcode(novel.ncode),
+  );
+  return selected.length === 1 ? selected[0] : null;
+}
+
+const VIRTUAL_ATTRIBUTE_OPTIONS = [
+  { value: '小説', label: '小説' },
+  { value: '漫画', label: '漫画' },
+];
+
+/**
+ * 一覧にある値の重複を除いて並べる (ダイアログの入力候補)。
+ */
+export function uniqueValues(novels, key) {
+  const values = (Array.isArray(novels) ? novels : [])
+    .map((novel) => novel?.[key])
+    .filter((value) => typeof value === 'string' && value.trim() !== '');
+
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b, 'ja'));
+}
+
+export function hiddenSuggestions(novels) {
+  return {
+    tags: [...new Set(novels.flatMap(novel => Array.isArray(novel.tags) ? novel.tags : [])
+      .filter(tag => typeof tag === 'string' && tag.trim() && !isVirtualNcode(tag)))].sort((a, b) => a.localeCompare(b, 'ja')),
+    authors: uniqueValues(novels, 'author'),
+    sites: uniqueValues(novels, 'sitename'),
+  };
+}
+
+/**
+ * 選択した作品に共通の値。共通でないときは空文字 (入力欄の初期値)。
+ */
+export function sharedValue(novels, key) {
+  const values = uniqueValues(novels, key);
+  return values.length === 1 ? values[0] : '';
+}
 
 export function bindActions() {
   applyColumnVisibility();
@@ -64,16 +141,6 @@ export function bindActions() {
     }
   });
 
-  El.consoleExpand?.addEventListener('click', () => {
-    El.console?.classList.toggle('expanded');
-    El.consoleStdout2?.classList.toggle('expanded');
-    State.consoleExpanded = !State.consoleExpanded;
-    // Toggle icon
-    const expand = El.consoleExpand?.querySelector('.expand-icon');
-    const collapse = El.consoleExpand?.querySelector('.collapse-icon');
-    if (expand) expand.classList.toggle('hide', State.consoleExpanded);
-    if (collapse) collapse.classList.toggle('hide', !State.consoleExpanded);
-  });
 
   El.consoleCancel?.addEventListener('click', async () => {
     await runGuardedAction(El.consoleCancel, async () => {
@@ -82,6 +149,7 @@ export function bindActions() {
   });
 
   El.consoleHistory?.addEventListener('click', async () => {
+    const revision = ++State.consoleRevision;
     try {
       const mainData = await fetchJson('/api/history?format=json');
       assertHistoryPayload(mainData);
@@ -90,6 +158,7 @@ export function bindActions() {
         subData = await fetchJson('/api/history?format=json&stream=stdout2');
         assertHistoryPayload(subData);
       }
+      if (revision !== State.consoleRevision) return;
       if (El.console) {
         replaceConsoleHistory(El.console, mainData.history);
       }
@@ -97,6 +166,7 @@ export function bindActions() {
         replaceConsoleHistory(El.consoleStdout2, subData.history);
       }
     } catch (error) {
+      if (revision !== State.consoleRevision) return;
       showNotification(error.message || '履歴の取得に失敗しました', 'error');
     }
   });
@@ -124,6 +194,16 @@ export function bindActions() {
     lsSet('page-length', String(State.pageLength));
     renderNovelList();
   });
+
+  if (El.novelListShowHidden) {
+    El.novelListShowHidden.checked = State.showHidden;
+    El.novelListShowHidden.addEventListener('change', () => {
+      State.showHidden = El.novelListShowHidden.checked;
+      lsSet('show-hidden', String(State.showHidden));
+      State.currentPage = 1;
+      refreshList();
+    });
+  }
 
   // --- View menu ---
   on('action-view-all', () => {
@@ -171,8 +251,7 @@ export function bindActions() {
   on('action-view-toggle-buttons-top', () => {
     State.buttonsTop = !State.buttonsTop;
     lsSet('buttons-top', String(State.buttonsTop));
-    const cp = El.controlPanel;
-    if (cp) cp.classList.toggle('hide', !State.buttonsTop);
+    El.controlPanel?.classList.toggle('hide', !State.buttonsTop);
     syncViewChecks();
   });
 
@@ -182,7 +261,13 @@ export function bindActions() {
     syncViewChecks();
   });
 
+  on('action-view-reset-console-size', () => {
+    resetConsoleSize();
+    showNotification(t('consoleSizeReset'), 'info');
+  });
+
   on('action-view-reset', () => {
+    resetConsoleSize();
     State.viewFrozen = true;
     State.viewNonfrozen = true;
     State.wideMode = false;
@@ -197,6 +282,7 @@ export function bindActions() {
     clearHiddenColsPreference();
     applyColumnVisibility();
     syncViewChecks();
+    renderTagList();
     renderNovelList();
     showNotification('表示設定をリセットしました', 'info');
   });
@@ -216,6 +302,75 @@ export function bindActions() {
       await openTagEditor();
     });
   });
+  // 属性タグ機能全体の ON/OFF (`tag.attributes-enabled`)。
+  // OFF の間は属性タグを一覧・タグ一覧・検索に出さない (分類の保存は続く)。
+  const attributeMaster = document.getElementById('enable-attribute-tags');
+  if (attributeMaster) {
+    attributeMaster.checked = Boolean(State.attributeTagsEnabled);
+    attributeMaster.addEventListener('click', event => event.stopPropagation());
+    attributeMaster.addEventListener('change', async () => {
+      const previous = State.attributeTagsEnabled;
+      attributeMaster.dataset.saving = '1';
+      attributeMaster.disabled = true;
+      let changed = false;
+      try {
+        const result = await postJson('/api/global_setting', {
+          settings: { 'tag.attributes-enabled': attributeMaster.checked },
+        });
+        assertApiSuccess(result, '属性タグ機能の設定を保存できませんでした');
+        State.attributeTagsEnabled = attributeMaster.checked;
+        changed = State.attributeTagsEnabled !== previous;
+      } catch (error) {
+        State.attributeTagsEnabled = previous;
+        attributeMaster.checked = previous;
+        showNotification(error.message || '属性タグ機能の設定を保存できませんでした', 'error');
+      } finally {
+        delete attributeMaster.dataset.saving;
+        attributeMaster.disabled = false;
+        syncAttributeTagControls();
+        renderTagList();
+        renderNovelList();
+      }
+      // サーバー側でも属性タグ的有無で一覧・タグ一覧・検索が変わるため、
+      // 両方を取り直す。
+      if (changed) {
+        await refreshList();
+        await refreshTags();
+      }
+    });
+  }
+  for (const [id, stateKey, settingKey] of [
+    ['show-novel-attribute', 'showNovelAttribute', 'tag.show-novel'],
+    ['show-manga-attribute', 'showMangaAttribute', 'tag.show-manga'],
+  ]) {
+    const checkbox = document.getElementById(id);
+    if (!checkbox) continue;
+    checkbox.checked = State[stateKey];
+    checkbox.addEventListener('click', event => event.stopPropagation());
+    checkbox.addEventListener('change', async () => {
+      const previous = State[stateKey];
+      checkbox.dataset.saving = '1';
+      checkbox.disabled = true;
+      try {
+        const result = await postJson('/api/global_setting', {
+          settings: { [settingKey]: checkbox.checked },
+        });
+        assertApiSuccess(result, '属性タグの表示設定を保存できませんでした');
+        State[stateKey] = checkbox.checked;
+      } catch (error) {
+        State[stateKey] = previous;
+        checkbox.checked = previous;
+        showNotification(error.message || '属性タグの表示設定を保存できませんでした', 'error');
+      } finally {
+        delete checkbox.dataset.saving;
+        syncAttributeTagControls();
+        renderTagList();
+        renderNovelList();
+      }
+    });
+  }
+  // 初期状態 (既定 OFF) でも種別スイッチの無効化状態を反映する。
+  syncAttributeTagControls();
 
   // --- Tool menu ---
   on('action-tool-notepad', () => { window.location.href = '/notepad'; });
@@ -261,14 +416,341 @@ export function bindActions() {
   });
 
   on('action-option-about', openAbout);
+  on('action-option-hidden', openHiddenSettings);
+  on('action-option-export', () => exportSelectedNovels(getSelectedIdsInDisplayOrder()));
+  on('action-option-import', () => {
+    const action = document.getElementById('action-option-import');
+    if (action?.getAttribute('aria-disabled') === 'true') { showNotification(action.title, 'error'); return; }
+    document.getElementById('transfer-import-file')?.click();
+  });
+  document.getElementById('transfer-import-file')?.addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    await importNovelArchive(file, refreshList);
+  });
+  async function fetchVirtualNovels() {
+    const response = await fetch('/api/virtual_novels');
+    const result = await response.json();
+    if (!result.success) throw new Error(result.message || '一覧を取得できません');
+    return Array.isArray(result.novels) ? result.novels : [];
+  }
 
-  on('action-option-shutdown', async () => {
-    if (!confirm('サーバをシャットダウンしますか？')) return;
-    await postJson('/api/shutdown', {});
+  /**
+   * 操作対象のバーチャル小説を決める。一覧で仮想小説をちょうど 1 件選択して
+   * いればそれを使い、登録が 1 件だけならそれを使う。どちらでもないときだけ
+   * ダイアログで選ばせる。
+   */
+  async function pickVirtualNovel(virtuals, title) {
+    const selected = selectedVirtualNovel(State.novels, State.selectedIds);
+    if (selected) {
+      const match = virtuals.find((novel) => String(novel.id) === String(selected.id));
+      if (match) return match;
+    }
+    if (virtuals.length === 1) return virtuals[0];
+    const value = await selectDialog({
+      title,
+      message: '対象のバーチャル小説を選択してください。',
+      value: String(virtuals[0].id),
+      options: virtuals.map((novel) => ({
+        value: String(novel.id),
+        label: `${novel.ncode} ${novel.title}`,
+        detail: `${Array.isArray(novel.members) ? novel.members.length : 0} 作品`,
+      })),
+    });
+    if (value === null) return null;
+    return virtuals.find((novel) => String(novel.id) === String(value)) || null;
+  }
+
+  /**
+   * 属性を変更するバーチャル小説を決める。一覧で仮想小説をちょうど 1 件
+   * 選択していればそれを使い、それ以外はダイアログで選ばせる。
+   */
+  async function pickAttributeTarget(virtuals) {
+    const selected = selectedVirtualNovel(State.novels, State.selectedIds);
+    if (selected) {
+      const match = virtuals.find((novel) => String(novel.id) === String(selected.id));
+      if (match) return match;
+    }
+    const mixed = virtuals.filter((novel) => novel.mixed);
+    if (!mixed.length) {
+      showNotification('属性を変更できるバーチャル小説がありません (小説と漫画が混在する作品のみ)', 'error');
+      return null;
+    }
+    if (mixed.length === 1) return mixed[0];
+    const value = await selectDialog({
+      title: '属性を変更するバーチャル小説',
+      message: '対象のバーチャル小説を選択してください。',
+      value: String(mixed[0].id),
+      options: mixed.map((novel) => ({
+        value: String(novel.id),
+        label: `${novel.ncode} ${novel.title}`,
+        detail: `${novel.members.length} 作品 / 現在の属性: ${novel.attribute_tag}`,
+      })),
+    });
+    if (value === null) return null;
+    return virtuals.find((novel) => String(novel.id) === String(value)) || null;
+  }
+
+  on('action-option-virtual-add', async () => {
+    const ids = getSelectedIdsInDisplayOrder();
+    if (!ids.length) {
+      showNotification('まとめる作品を選択してください', 'error');
+      return;
+    }
+    const selectedNovels = ids
+      .map((id) => State.novels.find((novel) => String(novel.id) === String(id)))
+      .filter(Boolean);
+    let classification;
+    try {
+      const response = await fetch('/api/virtual_novels/classify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ members: ids.map(Number) }),
+      });
+      classification = await response.json();
+      if (!response.ok || !classification.success) {
+        throw new Error(classification.message || '分類の判定に失敗しました');
+      }
+    } catch (error) {
+      showNotification(error.message || '分類の判定に失敗しました', 'error');
+      return;
+    }
+    const input = await formDialog({
+      title: 'バーチャル小説の登録',
+      message: `選択した ${ids.length} 作品を 1 つの EPUB にまとめます。`,
+      okLabel: '登録',
+      fields: [
+        { name: 'title', label: 'タイトル', required: true },
+        {
+          name: 'author',
+          label: '作者名',
+          value: sharedValue(selectedNovels, 'author'),
+          suggestions: uniqueValues(State.novels, 'author'),
+          placeholder: '候補から選択、または入力',
+        },
+        {
+          name: 'sitename',
+          label: 'サイト名',
+          value: sharedValue(selectedNovels, 'sitename'),
+          suggestions: uniqueValues(State.novels, 'sitename'),
+          placeholder: '候補から選択、または入力',
+        },
+      ],
+    });
+    if (!input) return;
+    let attributeTag = null;
+    if (classification.mixed) {
+      // 混在するときは利用者に属性を選んでもらう (既定は小説)。
+      const chosen = await selectDialog({
+        title: 'バーチャル小説の属性',
+        message: '小説と漫画が混在しています。属性タグを選択してください。',
+        value: '小説',
+        options: VIRTUAL_ATTRIBUTE_OPTIONS,
+      });
+      if (chosen === null) return;
+      attributeTag = chosen;
+    }
+    try {
+      const response = await fetch('/api/virtual_novels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: input.title,
+          author: input.author,
+          sitename: input.sitename,
+          tags: [],
+          members: ids.map(Number),
+          ...(attributeTag ? { attribute_tag: attributeTag } : {}),
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || '登録に失敗しました');
+      }
+      showNotification(`バーチャル小説を登録しました: ${result.ncode}`, 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '登録に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-attribute', async () => {
+    try {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const novel = await pickAttributeTarget(virtuals);
+      if (!novel) return;
+      if (!novel.mixed) {
+        showNotification(
+          `${novel.ncode} は小説と漫画が混在していないため属性を変更できません`,
+          'error',
+        );
+        return;
+      }
+      const chosen = await selectDialog({
+        title: 'バーチャル小説の属性',
+        message: `${novel.ncode} ${novel.title} の属性タグを選択してください。`,
+        value: isAttributeTag(novel.attribute_tag) ? novel.attribute_tag : '小説',
+        options: VIRTUAL_ATTRIBUTE_OPTIONS,
+      });
+      if (chosen === null) return;
+      const response = await fetch(`/api/virtual_novels/${novel.id}/attribute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attribute_tag: chosen }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || '属性タグの保存に失敗しました');
+      }
+      showNotification(`属性を変更しました: ${result.attribute_tag || chosen}`, 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '属性の変更に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-append', async () => {
+    const memberIds = getSelectedIdsInDisplayOrder().filter((id) => {
+      const novel = State.novels.find((item) => String(item.id) === String(id));
+      return !isVirtualNcode(novel?.ncode);
+    });
+    if (!memberIds.length) {
+      showNotification('追加する作品を選択してください', 'error');
+      return;
+    }
+    try {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const novel = await pickVirtualNovel(virtuals, '作品を追加するバーチャル小説');
+      if (!novel) return;
+      const ok = await confirmDialog({
+        title: 'バーチャル小説へ追加',
+        message: `${novel.ncode} ${novel.title} へ ${memberIds.length} 作品を追加します。\n追加した作品は一覧から隠れ、EPUB の末尾へ結合されます。`,
+        okLabel: '追加する',
+      });
+      if (!ok) return;
+      const response = await fetch(`/api/virtual_novels/${novel.id}/members`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ members: memberIds.map(Number) }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || '追加に失敗しました');
+      }
+      showNotification(`バーチャル小説へ追加しました: ${novel.ncode}`, 'info');
+      clearSelection();
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '追加に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-order', async () => {
+    try {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const novel = await pickVirtualNovel(virtuals, '順序を変更するバーチャル小説');
+      if (!novel) return;
+      openVirtualOrderModal(novel);
+    } catch (error) {
+      showNotification(error.message || '並べ替えに失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-convert', async () => {
+    try {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const novel = await pickVirtualNovel(virtuals, '変換するバーチャル小説');
+      if (!novel) return;
+      showNotification('変換を開始しました', 'info');
+      const converted = await fetch(`/api/virtual_novels/${novel.id}/convert`, { method: 'POST' });
+      const convertedResult = await converted.json();
+      if (!converted.ok || !convertedResult.success) {
+        throw new Error(convertedResult.message || '変換に失敗しました');
+      }
+      showNotification(`出力しました: ${convertedResult.filename}`, 'info');
+    } catch (error) {
+      showNotification(error.message || '変換に失敗しました', 'error');
+    }
+  });
+  on('action-option-virtual-remove', async () => {
+    try {
+      const virtuals = await fetchVirtualNovels();
+      if (!virtuals.length) {
+        showNotification('バーチャル小説は登録されていません', 'error');
+        return;
+      }
+      const novel = await pickVirtualNovel(virtuals, '削除するバーチャル小説');
+      if (!novel) return;
+      const ok = await confirmDialog({
+        title: 'バーチャル小説の削除',
+        message: `${novel.ncode} ${novel.title} を削除しますか？\nメンバー作品は一覧へ戻ります。`,
+        okLabel: '削除する',
+        danger: true,
+      });
+      if (!ok) return;
+      const removed = await fetch(`/api/virtual_novels/${novel.id}`, { method: 'DELETE' });
+      const removedResult = await removed.json();
+      if (!removed.ok || !removedResult.success) {
+        throw new Error(removedResult.message || '削除に失敗しました');
+      }
+      showNotification('バーチャル小説を削除しました', 'info');
+      await refreshList();
+    } catch (error) {
+      showNotification(error.message || '削除に失敗しました', 'error');
+    }
+  });
+  for (const [kind, id] of Object.entries({ tags: 'hidden-tag-input', authors: 'hidden-author-input', sites: 'hidden-site-input' })) {
+    const input = document.getElementById(id);
+    if (input && !input.appDialogSuggestions) input.parentElement.appendChild(createSuggestionList(hiddenSuggestionFields[kind], input));
+  }
+  on('hidden-close', () => closeModal(document.getElementById('hidden-modal')));
+  on('virtual-order-close', () => closeModal(document.getElementById('virtual-order-modal')));
+  on('virtual-order-cancel', () => closeModal(document.getElementById('virtual-order-modal')));
+  on('virtual-order-save', saveVirtualOrder);
+  on('hidden-cancel', () => closeModal(document.getElementById('hidden-modal')));
+  on('hidden-novel-add', () => addHiddenValue('novels', 'hidden-novel-input'));
+  on('hidden-tag-add', () => addHiddenValue('tags', 'hidden-tag-input'));
+  on('hidden-author-add', () => addHiddenValue('authors', 'hidden-author-input'));
+  on('hidden-site-add', () => addHiddenValue('sites', 'hidden-site-input'));
+  on('hidden-all-clear', async () => {
+    await postJson('/api/hidden', { action: 'clear' });
+    await refreshHiddenSettings();
+    await refreshList();
+  });
+
+  on('action-option-shutdown', async (e) => {
+    const ok = await confirmDialog({
+      title: 'サーバのシャットダウン',
+      message: 'サーバをシャットダウンしますか？',
+      okLabel: 'シャットダウン',
+      danger: true,
+    });
+    if (!ok) return;
+    await runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/shutdown', {});
+      assertApiSuccess(result, 'サーバを停止できませんでした');
+    }, 'サーバを停止できませんでした');
   });
 
   on('action-option-server-reboot', async () => {
-    if (!confirm('サーバを再起動しますか？')) return;
+    const ok = await confirmDialog({
+      title: 'サーバの再起動',
+      message: 'サーバを再起動しますか？',
+      okLabel: '再起動',
+    });
+    if (!ok) return;
     rememberRebootReturnTo();
     try {
       const result = await postJson('/api/reboot', {});
@@ -283,22 +765,34 @@ export function bindActions() {
 
   // Theme selection
   El.themeSelect?.addEventListener('change', async () => {
-    const previousTheme = State.theme || 'default';
+    if (acknowledgedTheme === null) acknowledgedTheme = State.theme || 'default';
+    const generation = ++themeGeneration;
+    ++themeReadGeneration;
+    ++themePendingSaves;
     const theme = El.themeSelect.value;
     State.theme = theme;
     lsSet('theme', theme);
     document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
     try {
-      const result = await postJson('/api/global_setting', {
-        settings: { 'webui.theme': theme === 'default' ? null : theme },
+      const save = themeSaveTail.then(async () => {
+        const result = await postJson('/api/global_setting', {
+          settings: { 'webui.theme': theme === 'default' ? null : theme },
+        });
+        assertApiSuccess(result, 'テーマ設定の保存に失敗しました');
+        acknowledgedTheme = theme;
       });
-      assertApiSuccess(result, 'テーマ設定の保存に失敗しました');
+      themeSaveTail = save.catch(() => {});
+      await save;
     } catch (error) {
-      State.theme = previousTheme;
-      lsSet('theme', previousTheme);
-      document.documentElement.dataset.theme = previousTheme === 'default' ? '' : previousTheme;
-      if (El.themeSelect) El.themeSelect.value = previousTheme;
+      if (generation !== themeGeneration) return;
+      State.theme = acknowledgedTheme;
+      lsSet('theme', acknowledgedTheme);
+      document.documentElement.dataset.theme = acknowledgedTheme === 'default' ? '' : acknowledgedTheme;
+      if (El.themeSelect) El.themeSelect.value = acknowledgedTheme;
       showNotification(error.message || 'テーマ設定の保存に失敗しました', 'error');
+    } finally {
+      --themePendingSaves;
+      ++themeReadGeneration;
     }
   });
 
@@ -317,31 +811,33 @@ export function bindActions() {
       await refreshQueueDetailed();
     }, 'キューの消去に失敗しました');
   });
+  on('queue-clear-all-button', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
+      const confirmed = await confirmDialog({
+        title: 'キューをすべてクリア',
+        message: '実行中の処理を中断し、待機中・再試行待ちのジョブをすべて削除します。小説データや取得済みの本文は削除しません。実行中の処理は安全な区切りで中断されます。よろしいですか？',
+        okLabel: 'はい', cancelLabel: 'いいえ', danger: true,
+      });
+      if (!confirmed) return;
+      const result = await postJson('/api/queue/cancel', {});
+      assertApiSuccess(result, 'キューの一括クリアに失敗しました');
+      await Promise.all([refreshQueue(), refreshQueueDetailed()]);
+    }, 'キューの一括クリアに失敗しました');
+  });
   on('queue-reload-button', async () => {
     await refreshQueueDetailed();
   });
 
   // --- Notepad modal ---
-  on('notepad-close', () => El.notepadModal?.classList.add('hide'));
+  on('notepad-close', () => closeModal(El.notepadModal));
   on('save-notepad-button', (e) => {
+    const generation = notepadOpenGeneration;
     void runGuardedAction(e.currentTarget, async () => {
-      const text = El.notepad?.value || '';
-      const result = await postJson('/api/notepad/save', {
-        text,
-        content: text,
-        object_id: State.notepadObjectId,
-      });
-      if (result?.conflict) {
-        await reloadNotepadFromServer(
-          result.message || '他の画面で変更されたため、メモ帳を再読み込みしました',
-          'warning'
-        );
-        return null;
-      }
-      assertApiSuccess(result, 'メモ帳の保存に失敗しました');
-      applyNotepadSnapshot(result);
-      El.notepadModal?.classList.add('hide');
-      showNotification(result.message || 'メモ帳を保存しました', 'success');
+      const result = await getNotepadEditor().save();
+      if (!result.dirty && generation === notepadOpenGeneration) closeModal(El.notepadModal);
+      if (result.saved) showNotification(result.dirty
+        ? '前の入力を保存しました。新しい入力は未保存です'
+        : result.data.message || 'メモ帳を保存しました', result.dirty ? 'info' : 'success');
       return result;
     }, 'メモ帳の保存に失敗しました');
   });
@@ -350,6 +846,12 @@ export function bindActions() {
   on('tag-edit-close', closeTagEditor);
   on('tag-edit-cancel', closeTagEditor);
   on('add-tag-button', addTagFromInput);
+  on('favorite-tag-button', addFavoriteTagFromInput);
+  // タグ一覧の並び順 (メインメニューの「タグ」)。
+  El.tagSortOrderSelect?.addEventListener('change', (event) => {
+    void saveTagSortOrder(event.target.value);
+  });
+  syncTagSortOrderSelect();
   El.newTagInput?.addEventListener('input', renderTagSuggestions);
   El.newTagInput?.addEventListener('focus', renderTagSuggestions);
   El.newTagInput?.addEventListener('blur', () => {
@@ -370,42 +872,35 @@ export function bindActions() {
     await updateLatestVersionInfo();
   });
   on('about-update', async () => {
-    if (!confirm('最新バージョンへ更新します。WEBサーバーは一旦停止し、自動的に再起動します。よろしいですか？')) return;
-    const btn = El.aboutUpdate;
-    if (btn) btn.disabled = true;
-    if (El.aboutUpdateStatus) {
-      El.aboutUpdateStatus.classList.remove('hide');
-      El.aboutUpdateStatus.textContent = 'アップデートを開始しています...';
+    if (latestVersionData?.variant_choice_required) {
+      El.updateVariantModal?.classList.remove('hide');
+      return;
     }
-    try {
-      const result = await postJson('/api/update/start', {});
-      if (!result?.success) {
-        throw new Error(result?.message || 'アップデート開始に失敗しました');
-      }
-      if (El.aboutUpdateStatus) {
-        El.aboutUpdateStatus.textContent = 'ダウンロード中... 完了後に再起動します';
-      }
-      // Server triggers reboot; the existing /_rebooting page handles reconnection.
-      setTimeout(() => { window.location.href = '/_rebooting'; }, 1500);
-    } catch (error) {
-      if (El.aboutUpdateStatus) {
-        El.aboutUpdateStatus.textContent = `アップデート失敗: ${error.message || error}`;
-      }
-      if (btn) btn.disabled = false;
-      showNotification(error.message || 'アップデートに失敗しました', 'error');
-    }
+    await startSelfUpdate(null);
   });
 
-  on('queue-restore-yes', async () => {
-    El.queueRestoreModal?.classList.add('hide');
-    await postJson('/api/restore_pending_tasks', {});
-    await refreshQueueDetailed();
+  on('update-variant-close', () => El.updateVariantModal?.classList.add('hide'));
+  on('update-variant-cancel', () => El.updateVariantModal?.classList.add('hide'));
+  on('update-variant-standard', async () => {
+    El.updateVariantModal?.classList.add('hide');
+    await startSelfUpdate('standard');
   });
-  on('queue-restore-no', async () => {
-    El.queueRestoreModal?.classList.add('hide');
-    await postJson('/api/defer_restore_pending_tasks', {});
-    await refreshQueueDetailed();
+  on('update-variant-gpl', async () => {
+    El.updateVariantModal?.classList.add('hide');
+    await startSelfUpdate('gpl');
   });
+
+  for (const [id, endpoint] of [
+    ['queue-restore-yes', '/api/restore_pending_tasks'],
+    ['queue-restore-no', '/api/defer_restore_pending_tasks'],
+  ]) {
+    on(id, (e) => runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson(endpoint, {});
+      assertApiSuccess(result, '待機キューの復元操作に失敗しました');
+      closeModal(El.queueRestoreModal);
+      await Promise.all([refreshQueue(), refreshQueueDetailedIfOpen()]);
+    }, '待機キューの復元操作に失敗しました'));
+  }
 
   // --- Column visibility modal ---
   on('colvis-close', () => El.colvisModal?.classList.add('hide'));
@@ -427,9 +922,6 @@ export function bindActions() {
     resetColvisCheckboxesToDefault();
   });
 
-  // --- Confirm modal ---
-  on('confirm-cancel', () => El.confirmModal?.classList.add('hide'));
-
   // --- Bookmarklet register modal ---
   function clearRegisterUrl() {
     if (El.registerModal) delete El.registerModal.dataset.registerUrl;
@@ -448,7 +940,7 @@ export function bindActions() {
       return;
     }
     void runGuardedAction(triggerEl, async () => {
-      const result = await postJson('/api/download', { targets: [url] });
+      const result = await postSortedJson('/api/download', { targets: [url] });
       assertApiSuccess(result, 'ブックマークレット登録に失敗しました');
       hideRegisterModal();
       showNotification('ブックマークレットから登録しました', 'success');
@@ -456,7 +948,9 @@ export function bindActions() {
   });
 
   // --- Diff modal ---
-  on('diff-close', () => El.diffModal?.classList.add('hide'));
+  on('diff-close', () => closeModal(El.diffModal));
+  on('remove-cancel', () => closeModal(El.removeModal));
+  on('remove-ok', confirmRemove);
 
   // --- Download modal ---
   const downloadModal = document.getElementById('download-modal');
@@ -482,7 +976,7 @@ export function bindActions() {
     if (targets.length === 0) return;
     const mail = document.getElementById('download-mail')?.checked || false;
     void runGuardedAction(triggerEl, async () => {
-      const result = await postJson('/api/download', { targets, mail });
+      const result = await postSortedJson('/api/download', { targets, mail });
       assertApiSuccess(result, 'ダウンロード要求の送信に失敗しました');
       downloadModal?.classList.add('hide');
     }, 'ダウンロード要求の送信に失敗しました');
@@ -517,7 +1011,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/download', { targets: ids, force: true });
+      const result = await postSortedJson('/api/download', { targets: ids, force: true });
       assertApiSuccess(result, '強制ダウンロード要求の送信に失敗しました');
     }, '強制ダウンロード要求の送信に失敗しました');
   });
@@ -528,11 +1022,10 @@ export function bindActions() {
       const selectedCount = State.selectedIds.size;
       const allSelected = total > 0 && selectedCount >= total;
       const result = (selectedCount > 0 && !allSelected)
-        ? await postJson('/api/update', {
+        ? await postSortedJson('/api/update', {
           targets: [...State.selectedIds],
-          ...currentSortStatePayload(),
         })
-        : await postJson('/api/update', { update_all: true });
+        : await postSortedJson('/api/update', { update_all: true });
       assertApiSuccess(result, 'アップデート要求の送信に失敗しました');
     }, 'アップデート要求の送信に失敗しました');
   });
@@ -552,14 +1045,14 @@ export function bindActions() {
   on('gl-update-close', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
   on('gl-update-cancel', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
   const queueGeneralLastupUpdate = async (option, isUpdateModified = false) => {
-    const result = await postJson('/api/update_general_lastup', {
+    const result = await postSortedJson('/api/update_general_lastup', {
       option,
       is_update_modified: isUpdateModified
     });
     assertApiSuccess(result, '最新話掲載日確認の要求送信に失敗しました');
   };
 
-  on('gl-update-submit', () => {
+  on('gl-update-submit', (e) => {
     const glNarou = document.getElementById('gl-update-narou')?.checked;
     const glOther = document.getElementById('gl-update-other')?.checked;
     const isUpdateModified = document.getElementById('gl-update-modified')?.checked;
@@ -571,9 +1064,13 @@ export function bindActions() {
       document.getElementById('gl-update-modal')?.classList.add('hide');
       return;
     }
-    let option = (glNarou && glOther) ? 'all' : (glNarou ? 'narou' : 'other');
-    queueGeneralLastupUpdate(option, isUpdateModified);
+    const option = (glNarou && glOther) ? 'all' : (glNarou ? 'narou' : 'other');
     document.getElementById('gl-update-modal')?.classList.add('hide');
+    void runGuardedAction(
+      e.currentTarget,
+      () => queueGeneralLastupUpdate(option, isUpdateModified),
+      '最新話掲載日確認の要求送信に失敗しました'
+    );
   });
 
   on('action-update-by-tag', (e) => {
@@ -612,7 +1109,7 @@ export function bindActions() {
 
   on('update-by-tag-close', () => document.getElementById('update-by-tag-modal')?.classList.add('hide'));
   on('update-by-tag-cancel', () => document.getElementById('update-by-tag-modal')?.classList.add('hide'));
-  on('update-by-tag-submit', () => {
+  on('update-by-tag-submit', async (e) => {
     const tags = [];
     const exclusion_tags = [];
     document.querySelectorAll('#update-by-tag-include input[data-tagname]:checked').forEach(cb => {
@@ -625,25 +1122,37 @@ export function bindActions() {
       showNotification('タグを選択してください', 'warning');
       return;
     }
-    postJson('/api/update_by_tag', { tags, exclusion_tags, ...currentSortStatePayload() });
-    document.getElementById('update-by-tag-modal')?.classList.add('hide');
+    await runGuardedAction(e.currentTarget, async () => {
+      const result = await postSortedJson('/api/update_by_tag', { tags, exclusion_tags });
+      assertApiSuccess(result, 'タグ指定の更新要求に失敗しました');
+      document.getElementById('update-by-tag-modal')?.classList.add('hide');
+    }, 'タグ指定の更新要求に失敗しました');
   });
 
   on('action-update-view', (e) => {
     const ids = getVisibleIds();
+    if (ids.length === 0) return;
     void runGuardedAction(e.currentTarget, async () => {
       const total = Array.isArray(State.novels) ? State.novels.length : 0;
       const allVisible = total > 0 && ids.length >= total;
       const result = allVisible
-        ? await postJson('/api/update', { update_all: true, ...currentSortStatePayload() })
-        : await postJson('/api/update', { targets: ids, ...currentSortStatePayload() });
+        ? await postSortedJson('/api/update', { update_all: true })
+        : await postSortedJson('/api/update', { targets: ids });
       assertApiSuccess(result, '表示中小説のアップデート要求に失敗しました');
     }, '表示中小説のアップデート要求に失敗しました');
   });
 
   on('action-update-force', (e) => {
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/update', { update_all: true, force: true });
+      const total = Array.isArray(State.novels) ? State.novels.length : 0;
+      const selectedCount = State.selectedIds.size;
+      const allSelected = total > 0 && selectedCount >= total;
+      const result = (selectedCount > 0 && !allSelected)
+        ? await postSortedJson('/api/update', {
+          targets: [...State.selectedIds],
+          force: true,
+        })
+        : await postSortedJson('/api/update', { update_all: true, force: true });
       assertApiSuccess(result, '強制アップデート要求の送信に失敗しました');
     }, '強制アップデート要求の送信に失敗しました');
   });
@@ -662,10 +1171,9 @@ export function bindActions() {
 
   on('btn-gl-modified', (e) => {
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/update_by_tag', {
+      const result = await postSortedJson('/api/update_by_tag', {
         tags: ['modified'],
         exclusion_tags: [],
-        ...currentSortStatePayload(),
       });
       assertApiSuccess(result, 'modifiedタグ更新の要求送信に失敗しました');
     }, 'modifiedタグ更新の要求送信に失敗しました');
@@ -675,7 +1183,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/send', { targets: ids });
+      const result = await postSortedJson('/api/send', { targets: ids });
       assertApiSuccess(result, '送信要求の送信に失敗しました');
     }, '送信要求の送信に失敗しました');
   });
@@ -704,7 +1212,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/convert', { targets: ids, ...currentSortStatePayload() });
+      const result = await postSortedJson('/api/convert', { targets: ids });
       assertApiSuccess(result, '変換要求の送信に失敗しました');
     }, '変換要求の送信に失敗しました');
   });
@@ -715,10 +1223,13 @@ export function bindActions() {
     openDiffList(ids);
   });
 
-  on('action-other-inspect', () => {
+  on('action-other-inspect', (e) => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/inspect', { targets: ids });
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/inspect', { targets: ids });
+      assertApiSuccess(result, '調査状況ログの表示に失敗しました');
+    }, '調査状況ログの表示に失敗しました');
   });
 
   on('action-other-folder', () => {
@@ -731,7 +1242,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/backup', { targets: ids });
+      const result = await postSortedJson('/api/backup', { targets: ids });
       assertApiSuccess(result, 'バックアップ要求の送信に失敗しました');
     }, 'バックアップ要求の送信に失敗しました');
   });
@@ -749,7 +1260,7 @@ export function bindActions() {
     const ids = requireSelectedIds();
     if (!ids) return;
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/mail', { targets: ids });
+      const result = await postSortedJson('/api/mail', { targets: ids });
       assertApiSuccess(result, 'メール送信要求の送信に失敗しました');
     }, 'メール送信要求の送信に失敗しました');
   });
@@ -787,11 +1298,9 @@ export function bindActions() {
       if (State.sortAsc) th.classList.add('sort-asc');
       renderNovelList();
 
-      // Persist sort state to server (single source of truth for actions).
-      const sort_state = currentSortStateFromUI();
-      if (sort_state) {
-        postJson('/api/sort_state', sort_state).catch(() => {});
-      }
+      void persistSortState().catch(error => {
+        showNotification(error.message || '並び順の保存に失敗しました', 'error');
+      });
     });
   });
 
@@ -811,6 +1320,7 @@ export function bindActions() {
     selectView: () => selectVisible(),
     selectAll: () => selectAll(),
     selectClear: () => clearSelection(),
+    closeModal,
     refreshAll: () => { refreshList(); refreshQueue(); refreshTags(); },
     toggleWide: () => {
       State.wideMode = !State.wideMode;
@@ -843,22 +1353,35 @@ export function bindActions() {
     },
     showDiff: (id) => openDiffList([id]),
     tagEditSingle: (id) => openTagEditor([id]),
-    freezeToggle: async (id) => {
-      await postJson('/api/freeze', { ids: [Number(id)] });
+    hiddenToggle: async (id) => {
+      const current = await fetchJson('/api/hidden');
+      const novels = Array.isArray(current?.novels) ? current.novels : [];
+      const isHidden = novels.includes(Number(id));
+      await postJson('/api/hidden', {
+        action: isHidden ? 'remove' : 'add',
+        novels: [Number(id)],
+      });
       await refreshList();
     },
-    updateSingle: (id) => postJson('/api/update', { targets: [String(id)] }),
-    updateForceSingle: (id) => postJson('/api/update', { targets: [String(id)], force: true }),
-    sendSingle: (id) => postJson('/api/send', { targets: [String(id)] }),
+    freezeToggle: toggleFreeze,
+    updateSingle: (id) => postSortedJson('/api/update', { targets: [String(id)] }),
+    updateForceSingle: (id) => postSortedJson('/api/update', { targets: [String(id)], force: true }),
+    sendSingle: (id) => postSortedJson('/api/send', { targets: [String(id)] }),
     removeSingle: async (id) => {
       showRemoveModal([Number(id)]);
     },
-    convertSingle: (id) => postJson('/api/convert', { targets: [String(id)] }),
-    inspectSingle: (id) => postJson('/api/inspect', { targets: [String(id)] }),
+    convertSingle: (id) => runGuardedAction(null, async () => {
+      const result = await postSortedJson('/api/convert', { targets: [String(id)] });
+      assertApiSuccess(result, '変換要求の送信に失敗しました');
+    }, '変換要求の送信に失敗しました'),
+    inspectSingle: (id) => runGuardedAction(null, async () => {
+      const result = await postJson('/api/inspect', { targets: [String(id)] });
+      assertApiSuccess(result, '調査状況ログの表示に失敗しました');
+    }, '調査状況ログの表示に失敗しました'),
     folderSingle: (id) => openFolderTargets([String(id)]),
-    backupSingle: (id) => postJson('/api/backup', { targets: [String(id)] }),
-    downloadForceSingle: (id) => postJson('/api/download', { targets: [String(id)], force: true }),
-    mailSingle: (id) => postJson('/api/mail', { targets: [String(id)] }),
+    backupSingle: (id) => postSortedJson('/api/backup', { targets: [String(id)] }),
+    downloadForceSingle: (id) => postSortedJson('/api/download', { targets: [String(id)], force: true }),
+    mailSingle: (id) => postSortedJson('/api/mail', { targets: [String(id)] }),
     authorComments: (id) => {
       const popup = window.open(
         '/novels/' + id + '/author_comments',
@@ -870,6 +1393,7 @@ export function bindActions() {
     refreshTags: () => refreshTags(),
     tagColorChanged: () => refreshOpenTagEditor(),
     refreshList: () => refreshList(),
+    notifyError: message => showNotification(message, 'error'),
   };
 
   setShortcutHandlers(handlers);
@@ -927,9 +1451,14 @@ export function handleRegisterParam(url) {
 /* ===== Helpers ===== */
 
 function on(id, handler) {
-  document.getElementById(id)?.addEventListener('click', (e) => {
+  document.getElementById(id)?.addEventListener('click', async (e) => {
     e.preventDefault();
-    handler(e);
+    try {
+      const result = await handler(e);
+      assertApiSuccess(result, '操作に失敗しました');
+    } catch (error) {
+      showNotification(error.message || '操作に失敗しました', 'error');
+    }
   });
 }
 
@@ -996,11 +1525,33 @@ export async function runGuardedAction(buttonEl, action, errorMessage) {
   }
 }
 
-function assertApiSuccess(result, fallbackMessage) {
-  if (result && result.success === false) {
-    throw new Error(result.message || fallbackMessage);
+export function captureThemeRead() {
+  return ++themeReadGeneration;
+}
+
+export function applyThemeSnapshot(theme, generation) {
+  if (generation !== themeReadGeneration || themePendingSaves > 0) return;
+  acknowledgedTheme = theme;
+  State.theme = theme;
+  lsSet('theme', theme);
+  document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
+  if (El.themeSelect) El.themeSelect.value = theme;
+}
+
+function closeModal(modal) {
+  if (!modal) return;
+  if (modal === El.removeModal) removeTransaction = null;
+  if (modal === El.tagEditModal) {
+    ++tagEditorGeneration;
+    ++tagReadGeneration;
+    hideTagSuggestions();
   }
-  return result;
+  if (modal === El.diffModal) ++diffGeneration;
+  if (modal === El.notepadModal) {
+    ++notepadOpenGeneration;
+    notepadEditor?.invalidateReads();
+  }
+  modal.classList.add('hide');
 }
 
 function assertHistoryPayload(result) {
@@ -1022,43 +1573,16 @@ function rememberRebootReturnTo() {
   }
 }
 
-function getNotepadText(data) {
-  if (data && typeof data === 'object') {
-    return data.text || data.content || '';
+function getNotepadEditor() {
+  if (!notepadEditor) {
+    notepadEditor = createNotepadEditor(El.notepad);
   }
-  return typeof data === 'string' ? data : '';
+  return notepadEditor;
 }
 
-function getNotepadObjectId(data) {
-  if (!data || typeof data !== 'object') return null;
-  return typeof data.object_id === 'string' ? data.object_id : null;
-}
-
-export function applyNotepadSnapshot(data, options = {}) {
-  const text = getNotepadText(data);
-  const objectId = getNotepadObjectId(data);
-  const keepLocalEdits = options.keepLocalEdits === true
-    && El.notepad instanceof HTMLTextAreaElement
-    && document.activeElement === El.notepad
-    && El.notepad.value !== text;
-
-  if (!keepLocalEdits && El.notepad) {
-    El.notepad.value = text;
-  }
-  if (!keepLocalEdits || !El.notepad || El.notepad.value === text) {
-    State.notepadObjectId = objectId;
-  }
-
-  return { text, objectId, keptLocalEdits: keepLocalEdits };
-}
-
-async function reloadNotepadFromServer(message, type = 'warning') {
-  const data = await fetchJson('/api/notepad/read');
-  applyNotepadSnapshot(data);
-  if (message) {
-    showNotification(message, type);
-  }
-  return data;
+export function applyNotepadSnapshot(data) {
+  if (!El.notepad) return { keptLocalEdits: false };
+  return getNotepadEditor().applySnapshot(data);
 }
 
 function clearRebootReturnTo() {
@@ -1083,7 +1607,8 @@ async function openFolderTargets(ids) {
   }
 }
 
-function clearConsoleHistoryUi() {
+export function clearConsoleHistoryUi() {
+  State.consoleRevision++;
   if (El.console) {
     var lines = El.console.querySelectorAll('.console-line');
     lines.forEach(function(el) { el.remove(); });
@@ -1103,17 +1628,21 @@ function populateFooterPanel() {
   if (!src || !dst || dst.children.length > 0) return;
   const clone = src.cloneNode(true);
   clone.removeAttribute('id');
-  // Remap IDs on cloned elements to avoid duplicate IDs;
-  // use click delegation instead
-  clone.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+  clone.querySelectorAll('[id]').forEach(el => {
+    const originalId = el.id;
+    el.dataset.mainControlId = originalId;
+    el.id = 'footer-' + originalId;
+  });
+  clone.querySelectorAll('[data-dropdown]').forEach(el => {
+    el.dataset.dropdown = 'footer-' + el.dataset.dropdown;
+  });
   while (clone.firstChild) dst.appendChild(clone.firstChild);
 
-  // Delegate clicks from footer panel to main panel buttons by class/text
+  // Footer controls forward actions by captured source ID, never by label.
   dst.addEventListener('click', (e) => {
     const link = e.target.closest('a, button');
-    if (!link) return;
-    // Find the matching element in the main control panel
-    const mainEl = findMainPanelMatch(link);
+    if (!link || link.hasAttribute('data-dropdown')) return;
+    const mainEl = document.getElementById(link.dataset.mainControlId);
     if (mainEl) {
       e.preventDefault();
       mainEl.click();
@@ -1121,19 +1650,6 @@ function populateFooterPanel() {
   });
 }
 
-function findMainPanelMatch(clonedEl) {
-  const src = El.mainControlPanel;
-  if (!src) return null;
-  // Match by original ID attribute (stored as data-orig-id) or by text content
-  const text = clonedEl.textContent.trim();
-  const title = clonedEl.getAttribute('title');
-  const candidates = src.querySelectorAll('a, button');
-  for (const c of candidates) {
-    if (title && c.getAttribute('title') === title) return c;
-    if (c.textContent.trim() === text) return c;
-  }
-  return null;
-}
 
 function getVisibleIds() {
   const rows = El.novelListBody?.querySelectorAll('tr[data-id]') || [];
@@ -1152,8 +1668,18 @@ async function batchAction(endpoint, triggerEl, errorMessage = '操作に失敗�
   await runGuardedAction(triggerEl, async () => {
     const result = await postJson(endpoint, { ids: ids.map(Number) });
     assertApiSuccess(result, errorMessage);
-    await refreshList();
+    await Promise.all([refreshList(), refreshTags()]);
   }, errorMessage);
+}
+
+async function toggleFreeze(id) {
+  const selected = getSelectedIdsInDisplayOrder();
+  const ids = selected.some(selectedId => String(selectedId) === String(id)) ? selected : [id];
+  await runGuardedAction(null, async () => {
+    const result = await postJson('/api/freeze', { ids: ids.map(Number) });
+    assertApiSuccess(result, '凍結状態の切り替えに失敗しました');
+    await Promise.all([refreshList(), refreshTags()]);
+  }, '凍結状態の切り替えに失敗しました');
 }
 
 function requireSelectedIds() {
@@ -1163,29 +1689,46 @@ function requireSelectedIds() {
   return null;
 }
 
-function currentSortStateFromUI() {
-  const column = SORT_STATE_COLUMN_INDEX[State.sortCol];
-  if (column == null) return null;
-  return {
-    column,
-    dir: State.sortAsc ? 'asc' : 'desc',
-  };
-}
-
-// Action endpoints rely on the server-stored sort state as the single
-// source of truth. Only a timestamp is sent so the server can detect
-// stale callers; the actual ordering is taken from /api/sort_state.
-function currentSortStatePayload() {
-  return {
-    timestamp: Date.now(),
-  };
-}
 
 /* ===== Tag editor ===== */
 
+function isCurrentTagEditor(ids, generation = tagEditorGeneration) {
+  return generation === tagEditorGeneration
+    && El.tagEditModal && !El.tagEditModal.classList.contains('hide')
+    && El.tagEditModal.dataset.ids === JSON.stringify(ids);
+}
+
+function setTagEditorPending() {
+  for (const control of [El.addTagButton, El.newTagInput]) {
+    if (control) control.disabled = tagMutationPending;
+  }
+  El.tagEditorCurrent?.querySelectorAll('.tag-remove').forEach(control => {
+    control.disabled = tagMutationPending;
+  });
+}
+
+async function mutateEditorTags(ids, states, fallbackMessage, onSuccess) {
+  if (tagMutationPending || !isCurrentTagEditor(ids)) return;
+  const generation = tagEditorGeneration;
+  tagMutationPending = true;
+  ++tagReadGeneration;
+  setTagEditorPending();
+  try {
+    await applyBulkTagEdit(ids, states, fallbackMessage);
+    if (isCurrentTagEditor(ids, generation)) onSuccess?.();
+    await refreshList();
+    await refreshTags();
+    if (isCurrentTagEditor(ids, generation)) await refreshTagEditor(ids);
+  } catch (error) {
+    showNotification(error.message || fallbackMessage, 'error');
+  } finally {
+    tagMutationPending = false;
+    setTagEditorPending();
+  }
+}
+
 function closeTagEditor() {
-  hideTagSuggestions();
-  El.tagEditModal?.classList.add('hide');
+  closeModal(El.tagEditModal);
 }
 
 async function refreshOpenTagEditor() {
@@ -1199,14 +1742,18 @@ async function refreshOpenTagEditor() {
 }
 
 async function openTagEditor(ids) {
-  const targetIds = ids || requireSelectedIds();
+  const targetIds = [...(ids || requireSelectedIds() || [])];
   if (!targetIds || targetIds.length === 0) return;
+  const generation = ++tagEditorGeneration;
+  ++tagReadGeneration;
 
   El.tagEditModal?.classList.remove('hide');
   El.tagEditModal.dataset.ids = JSON.stringify(targetIds);
   El.tagEditModal.dataset.selectedCount = String(targetIds.length);
   renderTagEditorSummary(targetIds.length, { loading: true });
   renderTagEditorTags(targetIds, []);
+  renderFavoriteTags();
+  setTagEditorPending();
 
   if (El.newTagInput) {
     El.newTagInput.value = '';
@@ -1217,6 +1764,7 @@ async function openTagEditor(ids) {
   try {
     await refreshTagEditor(targetIds);
   } catch (error) {
+    if (!isCurrentTagEditor(targetIds, generation)) return;
     renderTagEditorSummary(targetIds.length, { error: true });
     renderTagEditorTags(targetIds, []);
     showNotification(error.message || 'タグ情報の取得に失敗しました', 'error');
@@ -1225,24 +1773,23 @@ async function openTagEditor(ids) {
 
 async function addTagFromInput() {
   const input = El.newTagInput;
-  if (!input) return;
-  const tags = splitTagInput(input.value);
+  if (!input || tagMutationPending) return;
+  const submitted = input.value;
+  const tags = splitTagInput(submitted);
   if (tags.length === 0) return;
+  if (tags.some(isAttributeTag)) {
+    showNotification('属性タグは編集できません', 'warning');
+    return;
+  }
 
   const idsJson = El.tagEditModal?.dataset.ids;
   const ids = idsJson ? JSON.parse(idsJson) : [...State.selectedIds];
   const states = Object.fromEntries(tags.map(tag => [tag, 2]));
 
-  try {
-    await applyBulkTagEdit(ids, states, 'タグの追加に失敗しました');
-    input.value = '';
+  await mutateEditorTags(ids, states, 'タグの追加に失敗しました', () => {
+    if (input.value === submitted) input.value = '';
     hideTagSuggestions();
-    await refreshList();
-    await refreshTags();
-    await refreshTagEditor(ids);
-  } catch (error) {
-    showNotification(error.message || 'タグの追加に失敗しました', 'error');
-  }
+  });
 }
 
 function splitTagInput(value) {
@@ -1255,6 +1802,17 @@ function splitTagInput(value) {
     tags.push(tag);
   }
   return tags;
+}
+
+// 入力欄のタグをお気に入りに登録する (作品への付与はしない)。
+async function addFavoriteTagFromInput() {
+  const input = El.newTagInput;
+  if (!input) return;
+  const tags = splitTagInput(input.value);
+  if (tags.length === 0) return;
+  if (await setFavoriteTags({ action: 'add', tags })) {
+    showNotification(`「${tags.join('」「')}」をお気に入りに登録しました`, 'success');
+  }
 }
 
 function renderTagSuggestions() {
@@ -1271,7 +1829,7 @@ function renderTagSuggestions() {
 
   const currentTags = getCurrentEditorTags();
   const candidates = State.tags
-    .filter(tag => !currentTags.has(tag))
+    .filter(tag => !currentTags.has(tag) && !isAttributeTag(tag))
     .map(tag => ({ tag, score: tagSuggestionScore(tag, query) }))
     .filter(item => item.score >= 0)
     .sort((a, b) => a.score - b.score || a.tag.localeCompare(b.tag, 'ja'))
@@ -1364,16 +1922,20 @@ function getCurrentEditorTags() {
 }
 
 async function refreshTagEditor(ids) {
+  if (!isCurrentTagEditor(ids)) return;
+  const generation = ++tagReadGeneration;
+  const editorGeneration = tagEditorGeneration;
   const selectionCount = ids.length;
   const taginfo = await postJson('/api/taginfo.json', {
     ids,
-    ...currentSortStatePayload(),
   });
+  if (generation !== tagReadGeneration || !isCurrentTagEditor(ids, editorGeneration)) return;
   const selectedTagInfo = Array.isArray(taginfo)
-    ? taginfo.filter(info => Number(info?.count || 0) > 0)
+    ? taginfo.filter(info => Number(info?.count || 0) > 0 && attributeTagVisible(info.tag))
     : [];
   renderTagEditorSummary(selectionCount);
   renderTagEditorTags(ids, selectedTagInfo);
+  syncFavoriteStars();
 }
 
 function renderTagEditorSummary(selectionCount, options = {}) {
@@ -1423,14 +1985,38 @@ function renderTagEditorTags(ids, taginfo) {
     chip.dataset.tag = info.tag;
     chip.dataset.presentCount = String(presentCount);
     chip.dataset.selectedCount = String(selectionCount);
-    chip.textContent = info.tag;
 
+    // タグ名の隣に × ボタン、色と ★ はその下の段に並べる (押し間違えないように)。
+    const label = document.createElement('span');
+    label.className = 'tag-edit-text';
+    label.textContent = info.tag;
     if (selectionCount > 1) {
       const count = document.createElement('span');
       count.className = 'tag-edit-count';
       count.textContent = ` ${presentCount}/${selectionCount}`;
-      chip.appendChild(count);
+      label.appendChild(count);
     }
+    if (isAttributeTag(info.tag)) {
+      label.title = '属性タグは編集できません';
+      chip.appendChild(label);
+      container.appendChild(chip);
+      return;
+    }
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'tag-remove';
+    removeBtn.disabled = tagMutationPending;
+    removeBtn.textContent = '×';
+    removeBtn.title =
+      selectionCount > 1
+        ? `選択中の${selectionCount}件から「${info.tag}」を外す`
+        : `「${info.tag}」を外す`;
+    removeBtn.addEventListener('click', async () => {
+      await mutateEditorTags(ids, { [info.tag]: 0 }, 'タグの削除に失敗しました');
+    });
+    label.appendChild(removeBtn);
+    chip.appendChild(label);
 
     const colorBtn = document.createElement('button');
     colorBtn.type = 'button';
@@ -1441,29 +2027,30 @@ function renderTagEditorTags(ids, taginfo) {
     colorBtn.addEventListener('click', (event) => {
       showTagColorMenu(event, info.tag);
     });
-    chip.appendChild(colorBtn);
+
+    const favoriteBtn = document.createElement('button');
+    favoriteBtn.type = 'button';
+    favoriteBtn.className = 'tag-favorite-edit';
+    const isFavorite = (State.favoriteTags || []).includes(info.tag);
+    favoriteBtn.textContent = isFavorite ? '★' : '☆';
+    favoriteBtn.title = isFavorite
+      ? `「${info.tag}」をお気に入りから外す`
+      : `「${info.tag}」をお気に入りに登録する`;
+    favoriteBtn.setAttribute('aria-label', favoriteBtn.title);
+    favoriteBtn.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await toggleFavoriteTag(info.tag);
+    });
+
+    const actions = document.createElement('span');
+    actions.className = 'tag-edit-actions';
+    actions.appendChild(colorBtn);
+    actions.appendChild(favoriteBtn);
+    chip.appendChild(actions);
     chip.addEventListener('contextmenu', (event) => {
       showTagColorMenu(event, info.tag);
     });
 
-    const removeBtn = document.createElement('span');
-    removeBtn.className = 'tag-remove';
-    removeBtn.textContent = '×';
-    removeBtn.title =
-      selectionCount > 1
-        ? `選択中の${selectionCount}件から「${info.tag}」を外す`
-        : `「${info.tag}」を外す`;
-    removeBtn.addEventListener('click', async () => {
-      try {
-        await applyBulkTagEdit(ids, { [info.tag]: 0 }, 'タグの削除に失敗しました');
-        await refreshList();
-        await refreshTags();
-        await refreshTagEditor(ids);
-      } catch (error) {
-        showNotification(error.message || 'タグの削除に失敗しました', 'error');
-      }
-    });
-    chip.appendChild(removeBtn);
     container.appendChild(chip);
   });
 }
@@ -1473,15 +2060,314 @@ function tagColorClass(tag) {
   return TAG_COLOR_MAP[colorName] || 'tag-default';
 }
 
+/* ===== お気に入りタグ ===== */
+
+// お気に入りタグの一覧を描画する。登録済みのタグは常設表示し、クリックで
+// 入力欄へ入れる。解除ボタンで登録から外す。
+function renderFavoriteTags() {
+  const list = El.tagFavoritesList;
+  const empty = El.tagFavoritesEmpty;
+  if (!list) return;
+  list.textContent = '';
+  const favorites = Array.isArray(State.favoriteTags) ? State.favoriteTags : [];
+  if (empty) {
+    empty.classList.toggle('hide', favorites.length > 0);
+  }
+  favorites.forEach((tag) => {
+    const chip = document.createElement('span');
+    chip.className = `tag-label ${tagColorClass(tag)} tag-favorite`;
+    chip.dataset.tag = tag;
+    chip.title = `「${tag}」を入力欄へ入れる`;
+
+    // ドラッグ＆ドロップで並べ替えられるようにする (2 件以上のときだけ)。
+    if (favorites.length > 1) {
+      chip.draggable = true;
+      chip.classList.add('tag-favorite-draggable');
+      chip.addEventListener('dragstart', onFavoriteTagDragStart);
+      chip.addEventListener('dragend', onFavoriteTagDragEnd);
+      chip.addEventListener('dragover', onFavoriteTagDragOver);
+      chip.addEventListener('dragleave', onFavoriteTagDragLeave);
+      chip.addEventListener('drop', onFavoriteTagDrop);
+    }
+
+    const label = document.createElement('span');
+    label.className = 'tag-edit-text';
+    label.textContent = tag;
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'tag-remove';
+    removeBtn.textContent = '×';
+    removeBtn.title = `「${tag}」をお気に入りから外す`;
+    removeBtn.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await setFavoriteTags({ action: 'remove', tags: [tag] });
+    });
+    label.appendChild(removeBtn);
+    chip.appendChild(label);
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'tag-favorite-add';
+    addBtn.textContent = '追加';
+    addBtn.title = `「${tag}」をタグに追加する`;
+    addBtn.disabled = isAttributeTag(tag);
+    addBtn.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await addFavoriteTagToSelection(tag);
+    });
+
+    const actions = document.createElement('span');
+    actions.className = 'tag-edit-actions';
+    actions.appendChild(addBtn);
+    chip.appendChild(actions);
+
+    chip.addEventListener('click', () => {
+      if (!El.newTagInput) return;
+      El.newTagInput.value = tag;
+      hideTagSuggestions();
+      El.newTagInput.focus();
+    });
+
+    list.appendChild(chip);
+  });
+}
+
+// ─── お気に入りタグのドラッグ＆ドロップ並べ替え ───
+
+// ドラッグ中のお気に入りタグ (null なら無効)。
+let favoriteTagDragTag = null;
+
+/** ドラッグ中の要素をグレーにして、掴んでいることを示す。 */
+function onFavoriteTagDragStart(event) {
+  const chip = event.currentTarget;
+  favoriteTagDragTag = chip.dataset.tag || null;
+  chip.classList.add('tag-favorite-drag-source');
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    // Firefox はデータなしでは dragstart を认识和しない。
+    event.dataTransfer.setData('text/plain', favoriteTagDragTag || '');
+  }
+}
+
+function onFavoriteTagDragEnd(event) {
+  favoriteTagDragTag = null;
+  event.currentTarget.classList.remove('tag-favorite-drag-source');
+  clearFavoriteTagDropMarks();
+}
+
+function onFavoriteTagDragOver(event) {
+  if (!favoriteTagDragTag) return;
+  // preventDefault がないと drop イベントが発火しない。
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+  clearFavoriteTagDropMarks();
+  const chip = event.currentTarget;
+  if (chip.dataset.tag === favoriteTagDragTag) return;
+  const rect = chip.getBoundingClientRect();
+  const before = event.clientX < rect.left + rect.width / 2;
+  chip.classList.add(before ? 'tag-favorite-drop-before' : 'tag-favorite-drop-after');
+}
+
+function onFavoriteTagDragLeave(event) {
+  if (event.relatedTarget && event.currentTarget.contains(event.relatedTarget)) return;
+  event.currentTarget.classList.remove('tag-favorite-drop-before', 'tag-favorite-drop-after');
+}
+
+async function onFavoriteTagDrop(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  const chip = event.currentTarget;
+  const dragged = favoriteTagDragTag;
+  const target = chip.dataset.tag;
+  clearFavoriteTagDropMarks();
+  favoriteTagDragTag = null;
+  if (!dragged || !target || dragged === target) return;
+
+  const order = (Array.isArray(State.favoriteTags) ? State.favoriteTags : []).slice();
+  const from = order.indexOf(dragged);
+  if (from < 0) return;
+  // ドラッグしたタグを取り除く。
+  order.splice(from, 1);
+  const targetIndex = order.indexOf(target);
+  if (targetIndex < 0) return;
+  const rect = chip.getBoundingClientRect();
+  const before = event.clientX < rect.left + rect.width / 2;
+  // カーソルが半分より左なら前、右なら後に挿入する。
+  order.splice(before ? targetIndex : targetIndex + 1, 0, dragged);
+  await setFavoriteTags({ action: 'reorder', tags: order });
+}
+
+function clearFavoriteTagDropMarks() {
+  El.tagFavoritesList?.querySelectorAll('.tag-favorite-drop-before, .tag-favorite-drop-after')
+    .forEach((chip) => chip.classList.remove('tag-favorite-drop-before', 'tag-favorite-drop-after'));
+}
+
+// ─── タグ一覧の並び順 ───
+
+// 並び順の選択肢 (サーバ側の `webui.tag-sort-order` と同じ値)。
+const TAG_SORT_ORDERS = [
+  { value: 'favorites_first', labelKey: 'tagSortOrderFavoritesFirst' },
+  { value: 'alphabetical', labelKey: 'tagSortOrderAlphabetical' },
+  { value: 'count', labelKey: 'tagSortOrderCount' },
+  { value: 'registered', labelKey: 'tagSortOrderRegistered' },
+];
+
+// 並び順のセレクトボックスを現在の設定に合わせる。
+export function syncTagSortOrderSelect() {
+  const select = El.tagSortOrderSelect;
+  if (!select) return;
+  if (select.options.length === 0) {
+    TAG_SORT_ORDERS.forEach((order) => {
+      const option = document.createElement('option');
+      option.value = order.value;
+      option.textContent = t(order.labelKey);
+      select.appendChild(option);
+    });
+  }
+  select.value = State.tagSortOrder || 'favorites_first';
+  const label = select.closest('.tag-sort-order')?.querySelector('label');
+  if (label) label.textContent = t('tagSortOrderLabel');
+}
+export function captureTagSortRead() {
+  if (tagSortPendingSaves) tagSortRefreshRequired = true;
+  return { writes: tagSortGeneration, reads: ++tagSortReadGeneration };
+}
+
+export function applyTagSortOrder(value, generation = captureTagSortRead()) {
+  if (tagSortPendingSaves) {
+    tagSortRefreshRequired = true;
+    return;
+  }
+  if (generation.writes !== tagSortGeneration || generation.reads !== tagSortReadGeneration) return;
+  tagSortRefreshRequired = false;
+  acknowledgedTagSortOrder = value;
+  State.tagSortOrder = value;
+  syncTagSortOrderSelect();
+}
+
+
+// 並び順を変えたら保存してタグ一覧を取り直す。
+async function saveTagSortOrder(value) {
+  const generation = ++tagSortGeneration;
+  if (acknowledgedTagSortOrder === null) acknowledgedTagSortOrder = State.tagSortOrder;
+  tagSortPendingSaves++;
+  State.tagSortOrder = value;
+  syncTagSortOrderSelect();
+  const save = tagSortSaveTail.catch(() => {}).then(async () => {
+    const result = await postJson('/api/global_setting', {
+      settings: { 'webui.tag-sort-order': value },
+    });
+    assertApiSuccess(result, '並び順の保存に失敗しました');
+    acknowledgedTagSortOrder = value;
+  });
+  tagSortSaveTail = save;
+  try {
+    await save;
+  } catch (error) {
+    showNotification(error.message || '並び順の保存に失敗しました', 'error');
+  } finally {
+    tagSortPendingSaves--;
+    if (generation === tagSortGeneration) {
+      State.tagSortOrder = acknowledgedTagSortOrder;
+      syncTagSortOrderSelect();
+      if (tagSortRefreshRequired) {
+        const read = captureTagSortRead();
+        try {
+          const config = await fetchJson('/api/webui/config?fresh=1');
+          if (config?.tag_sort_order) applyTagSortOrder(config.tag_sort_order, read);
+        } catch { /* preserve the acknowledged value; the next invalidation retries */ }
+      }
+      await refreshTags();
+    }
+  }
+}
+
+// お気に入りタグの登録 / 解除を切り替える。
+async function toggleFavoriteTag(tag) {
+  await setFavoriteTags(() => ({
+    action: (State.favoriteTags || []).includes(tag) ? 'remove' : 'add',
+    tags: [tag],
+  }));
+}
+
+// お気に入りの登録状態を更新して一覧を描き直す。
+function setFavoriteTags(request) {
+  favoritePendingSaves++;
+  const mutation = favoriteSaveTail.then(() => saveFavoriteTags(
+    typeof request === 'function' ? request() : request,
+  )).finally(async () => {
+    favoritePendingSaves--;
+    if (!favoritePendingSaves && favoriteRefreshRequired) {
+      favoriteRefreshRequired = false;
+      await refreshFavoriteTags();
+    }
+  });
+  favoriteSaveTail = mutation.catch(() => false);
+  return mutation;
+}
+
+async function saveFavoriteTags(body) {
+  ++favoriteReadGeneration;
+  try {
+    const result = await postJson('/api/favorite_tags', body);
+    if (!result || result.success !== true || !Array.isArray(result.tags)) {
+      showNotification(result?.message || 'お気に入りの更新に失敗しました', 'error');
+      return false;
+    }
+    ++favoriteReadGeneration;
+    State.favoriteTags = result.tags;
+    renderFavoriteTags();
+    syncFavoriteStars();
+    await refreshTags();
+    return true;
+  } catch (error) {
+    showNotification(error.message || 'お気に入りの更新に失敗しました', 'error');
+    return false;
+  }
+}
+
+// 作品に付いているタグの ★ ボタンをお気に入りの状態に合わせて更新する。
+function syncFavoriteStars() {
+  const favorites = Array.isArray(State.favoriteTags) ? State.favoriteTags : [];
+  El.tagEditorCurrent?.querySelectorAll('.tag-editable[data-tag]').forEach((chip) => {
+    const button = chip.querySelector('.tag-favorite-edit');
+    const tag = chip.dataset.tag;
+    if (!button || !tag) return;
+    const isFavorite = favorites.includes(tag);
+    button.textContent = isFavorite ? '★' : '☆';
+    button.title = isFavorite
+      ? `「${tag}」をお気に入りから外す`
+      : `「${tag}」をお気に入りに登録する`;
+    button.setAttribute('aria-label', button.title);
+  });
+}
+
+// 選択中の小説へ、お気に入りタグを付ける。
+async function addFavoriteTagToSelection(tag) {
+  const ids = getCurrentEditorTargetIds();
+  if (ids.length === 0) return;
+  await mutateEditorTags(ids, { [tag]: 2 }, 'タグの追加に失敗しました');
+}
+
+// 現在のタグ編集モーダルで対象になっている小説 ID。
+function getCurrentEditorTargetIds() {
+  const idsJson = El.tagEditModal?.dataset.ids;
+  if (idsJson) {
+    try {
+      const ids = JSON.parse(idsJson);
+      if (Array.isArray(ids) && ids.length > 0) return ids;
+    } catch { /* fall through */ }
+  }
+  return [...(State.selectedIds || [])];
+}
+
 async function applyBulkTagEdit(ids, states, fallbackMessage) {
   const result = await postJson('/api/edit_tag', {
     ids,
     states,
-    ...currentSortStatePayload(),
   });
-  if (!result || result.success !== true) {
-    throw new Error(result?.error || result?.message || fallbackMessage);
-  }
+  assertApiSuccess(result, fallbackMessage);
   return result;
 }
 
@@ -1532,16 +2418,198 @@ async function openNotepad() {
     return;
   }
 
+  const generation = ++notepadOpenGeneration;
+  El.notepadModal?.classList.remove('hide');
   try {
-    const data = await fetchJson('/api/notepad/read');
-    applyNotepadSnapshot(data);
-    El.notepadModal?.classList.remove('hide');
+    await getNotepadEditor().load();
+    if (generation !== notepadOpenGeneration) return;
   } catch (error) {
+    if (generation !== notepadOpenGeneration) return;
     showNotification(error.message || 'メモ帳の読み込みに失敗しました', 'error');
   }
 }
 
 /* ===== About ===== */
+
+let virtualOrderState = null;
+
+function openVirtualOrderModal(novel) {
+  virtualOrderState = {
+    id: novel.id,
+    ncode: novel.ncode,
+    members: novel.members.slice(),
+    titles: (novel.member_titles || []).slice(),
+  };
+  const modal = document.getElementById('virtual-order-modal');
+  if (!modal) return;
+  modal.classList.remove('hide');
+  renderVirtualOrderList();
+}
+
+function renderVirtualOrderList() {
+  const list = document.getElementById('virtual-order-list');
+  const state = virtualOrderState;
+  if (!list || !state) return;
+  list.replaceChildren();
+  state.members.forEach((memberId, index) => {
+    const row = document.createElement('div');
+    row.className = 'hidden-item';
+    const label = document.createElement('span');
+    label.className = 'virtual-order-title';
+    const title = state.titles[index] || `ID:${memberId}`;
+    label.textContent = `${index + 1}. ${title} (ID:${memberId})`;
+    row.appendChild(label);
+
+    const up = document.createElement('button');
+    up.type = 'button';
+    up.className = 'btn btn-default btn-sm';
+    up.textContent = '↑';
+    up.title = '上へ';
+    up.disabled = index === 0;
+    up.addEventListener('click', () => {
+      if (index === 0) return;
+      [state.members[index - 1], state.members[index]] = [
+        state.members[index],
+        state.members[index - 1],
+      ];
+      [state.titles[index - 1], state.titles[index]] = [
+        state.titles[index],
+        state.titles[index - 1],
+      ];
+      renderVirtualOrderList();
+    });
+    row.appendChild(up);
+
+    const down = document.createElement('button');
+    down.type = 'button';
+    down.className = 'btn btn-default btn-sm';
+    down.textContent = '↓';
+    down.title = '下へ';
+    down.disabled = index === state.members.length - 1;
+    down.addEventListener('click', () => {
+      if (index === state.members.length - 1) return;
+      [state.members[index + 1], state.members[index]] = [
+        state.members[index],
+        state.members[index + 1],
+      ];
+      [state.titles[index + 1], state.titles[index]] = [
+        state.titles[index],
+        state.titles[index + 1],
+      ];
+      renderVirtualOrderList();
+    });
+    row.appendChild(down);
+    list.appendChild(row);
+  });
+}
+
+async function saveVirtualOrder() {
+  const state = virtualOrderState;
+  if (!state) return;
+  try {
+    const response = await fetch(`/api/virtual_novels/${state.id}/order`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ members: state.members }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+      throw new Error(result.message || '並べ替えに失敗しました');
+    }
+    closeModal(document.getElementById('virtual-order-modal'));
+    showNotification(`順序を変更しました: ${state.ncode}`, 'info');
+    await refreshList();
+  } catch (error) {
+    showNotification(error.message || '並べ替えに失敗しました', 'error');
+  }
+}
+
+async function openHiddenSettings() {  const modal = document.getElementById('hidden-modal');
+  if (!modal) return;
+  modal.classList.remove('hide');
+  await Promise.all([refreshHiddenSettings(), refreshHiddenSuggestions()]);
+}
+
+async function refreshHiddenSuggestions() {
+  let novels;
+  try {
+    const result = await fetchJson('/api/list?all=true&show_hidden=true');
+    if (!Array.isArray(result?.data)) throw new Error('一覧の形式が不正です');
+    novels = result.data;
+  } catch {
+    showNotification('入力候補の取得に失敗しました', 'error');
+    return;
+  }
+  const suggestions = hiddenSuggestions(novels);
+  for (const kind of Object.keys(hiddenSuggestionFields)) {
+    hiddenSuggestionFields[kind].suggestions = suggestions[kind];
+  }
+  const focused = document.activeElement;
+  if (focused && ['hidden-tag-input', 'hidden-author-input', 'hidden-site-input'].includes(focused.id)) {
+    focused.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+}
+
+async function refreshHiddenSettings() {
+  let data;
+  try {
+    data = await fetchJson('/api/hidden');
+  } catch {
+    return;
+  }
+  const render = (containerId, values, kind) => {
+    const box = document.getElementById(containerId);
+    if (!box) return;
+    box.textContent = '';
+    const list = Array.isArray(values) ? values : [];
+    if (!list.length) {
+      const empty = document.createElement('span');
+      empty.className = 'hidden-empty';
+      empty.textContent = 'なし';
+      box.appendChild(empty);
+      return;
+    }
+    for (const value of list) {
+      const row = document.createElement('span');
+      row.className = 'hidden-item';
+      const label = document.createElement('span');
+      label.textContent = String(value);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'hidden-remove';
+      remove.textContent = '×';
+      remove.title = '表示に戻す';
+      remove.addEventListener('click', async () => {
+        await postJson('/api/hidden', { action: 'remove', [kind]: [kind === 'novels' ? Number(value) : value] });
+        await refreshHiddenSettings();
+        await refreshList();
+      });
+      row.appendChild(label);
+      row.appendChild(remove);
+      box.appendChild(row);
+    }
+  };
+  render('hidden-novel-list', data?.novels, 'novels');
+  render('hidden-tag-list', data?.tags, 'tags');
+  render('hidden-author-list', data?.authors, 'authors');
+  render('hidden-site-list', data?.sites, 'sites');
+}
+
+async function addHiddenValue(kind, inputId) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  const raw = input.value.trim();
+  if (!raw) return;
+  const value = kind === 'novels' ? Number(raw) : raw;
+  if (kind === 'novels' && !Number.isInteger(value)) {
+    showNotification('作品IDを数字で入力してください', 'error');
+    return;
+  }
+  await postJson('/api/hidden', { action: 'add', [kind]: [value] });
+  input.value = '';
+  await refreshHiddenSettings();
+  await refreshList();
+}
 
 async function openAbout() {
   try {
@@ -1569,6 +2637,7 @@ async function updateLatestVersionInfo() {
   if (!El.aboutLatestVersion) return;
   try {
     const data = await fetchJson('/api/version/latest.json');
+    latestVersionData = data?.success ? data : null;
     if (data?.success) {
       const latest = data.latest_version || '-';
       const current = data.current_version || '-';
@@ -1606,16 +2675,54 @@ async function updateLatestVersionInfo() {
   }
 }
 
+let latestVersionData = null;
+
+async function startSelfUpdate(variant) {
+  const ok = await confirmDialog({
+    title: '最新バージョンへ更新',
+    message: '最新バージョンへ更新します。WEBサーバーは一旦停止し、自動的に再起動します。よろしいですか？',
+    okLabel: '更新する',
+  });
+  if (!ok) return;
+  const btn = El.aboutUpdate;
+  if (btn) btn.disabled = true;
+  if (El.aboutUpdateStatus) {
+    El.aboutUpdateStatus.classList.remove('hide');
+    El.aboutUpdateStatus.textContent = 'アップデートを開始しています...';
+  }
+  try {
+    const body = variant ? { variant } : {};
+    const result = await postJson('/api/update/start', body);
+    if (!result?.success) {
+      throw new Error(result?.message || 'アップデート開始に失敗しました');
+    }
+    if (El.aboutUpdateStatus) {
+      El.aboutUpdateStatus.textContent = 'ダウンロード中... 完了後に再起動します';
+    }
+    // Server triggers reboot; the existing /_rebooting page handles reconnection.
+    setTimeout(() => { window.location.href = '/_rebooting'; }, 1500);
+  } catch (error) {
+    if (El.aboutUpdateStatus) {
+      El.aboutUpdateStatus.textContent = `アップデート失敗: ${error.message || error}`;
+    }
+    if (btn) btn.disabled = false;
+    showNotification(error.message || 'アップデートに失敗しました', 'error');
+  }
+}
+
 /* ===== Diff list ===== */
 
 async function openDiffList(ids) {
   const container = El.diffListContainer;
   if (!container) return;
+  const generation = ++diffGeneration;
+  const targetIds = [...ids];
   container.innerHTML = '<p>読み込み中...</p>';
   El.diffModal?.classList.remove('hide');
 
   try {
-    const data = await postJson('/api/diff_list', { targets: ids });
+    const data = await postJson('/api/diff_list', { targets: targetIds });
+    if (generation !== diffGeneration || El.diffModal?.classList.contains('hide')) return;
     if (data?.error) {
       throw new Error(data.error);
     }
@@ -1650,6 +2757,7 @@ async function openDiffList(ids) {
       container.innerHTML = '<p>差分データがありません</p>';
     }
   } catch (error) {
+    if (generation !== diffGeneration || El.diffModal?.classList.contains('hide')) return;
     container.innerHTML = '<p>' + escHtml(error.message || '差分の取得に失敗しました') + '</p>';
   }
 }
@@ -1668,6 +2776,7 @@ function escAttr(s) {
 
 function showRemoveModal(ids) {
   if (!ids || ids.length === 0) return;
+  closeModal(El.removeModal);
   const numericIds = ids.map(id => Number(id)).filter(id => Number.isFinite(id));
   if (numericIds.length === 0) {
     showNotification('削除対象のIDが不正です', 'error');
@@ -1682,35 +2791,36 @@ function showRemoveModal(ids) {
   El.removeWithFile.checked = false;
   El.removeModal?.classList.remove('hide');
 
-  // One-shot handlers
-  const cleanup = () => {
-    El.removeModal?.classList.add('hide');
-    El.removeOk.removeEventListener('click', onOk);
-    El.removeCancel.removeEventListener('click', onCancel);
-  };
-  const onOk = async () => {
-    await runGuardedAction(El.removeOk, async () => {
-      const withFile = El.removeWithFile.checked;
-      const result = await postJson('/api/novels/remove', {
-        ids: numericIds,
-        with_file: withFile,
-        ...currentSortStatePayload(),
-      });
-      assertApiSuccess(result, '削除に失敗しました');
-      cleanup();
-      await refreshList();
-    }, '削除に失敗しました');
-  };
-  const onCancel = () => cleanup();
-  El.removeOk.addEventListener('click', onOk);
-  El.removeCancel.addEventListener('click', onCancel);
+  removeTransaction = { ids: numericIds };
+  El.removeOk.disabled = removePending;
+}
+
+async function confirmRemove() {
+  const transaction = removeTransaction;
+  if (!transaction || removePending || El.removeModal?.classList.contains('hide')) return;
+  const withFile = El.removeWithFile.checked;
+  removePending = true;
+  El.removeOk.disabled = true;
+  try {
+    const result = await postJson('/api/novels/remove', {
+      ids: transaction.ids,
+      with_file: withFile,
+    });
+    assertApiSuccess(result, '削除に失敗しました');
+    if (removeTransaction === transaction) closeModal(El.removeModal);
+    await refreshList();
+  } catch (error) {
+    showNotification(error.message || '削除に失敗しました', 'error');
+  } finally {
+    removePending = false;
+    El.removeOk.disabled = false;
+  }
 }
 
 /* ===== CSV ===== */
 
 async function downloadCsv() {
-  const resp = await fetch('/api/csv/download');
-  if (!resp.ok) return;
+  const resp = await request('/api/csv/download');
   const blob = await resp.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1869,62 +2979,146 @@ function closeMenuStyleModal() {
 
 /* ===== Data refresh ===== */
 
-export async function refreshList() {
-  try {
-    const resp = await fetchJson('/api/list?all=true');
-    if (resp && Array.isArray(resp.data)) {
-      State.novels = resp.data;
-      State.frozenIds = new Set(
-        resp.data.filter(n => n.frozen).map(n => String(n.id))
-      );
-      pruneSelectedIdsToCurrentList();
-    }
-  } catch { /* ignore */ }
-  renderNovelList();
+const refreshRequests = new Map();
+let listRefreshGeneration = 0;
+let tagListGeneration = 0;
+
+function runRefresh(key, action) {
+  const existing = refreshRequests.get(key);
+  if (existing) {
+    existing.dirty = true;
+    return existing.promise;
+  }
+  const work = { dirty: false, promise: null };
+  work.promise = Promise.resolve().then(async () => {
+    let result;
+    do {
+      work.dirty = false;
+      result = await action();
+    } while (work.dirty);
+    return result;
+  }).finally(() => refreshRequests.delete(key));
+  refreshRequests.set(key, work);
+  return work.promise;
+}
+
+let queueStatusObserver = null;
+
+export function setQueueStatusObserver(observer) {
+  queueStatusObserver = observer;
+}
+
+export async function refreshList(redraw = true) {
+  ++listRefreshGeneration;
+  return runRefresh('list', async () => {
+    const generation = listRefreshGeneration;
+    try {
+      const resp = await fetchJson(`/api/list?all=true${State.showHidden ? '&show_hidden=true' : ''}`);
+      if (generation !== listRefreshGeneration) return;
+      if (resp && Array.isArray(resp.data)) {
+        State.novels = resp.data;
+        State.frozenIds = new Set(resp.data.filter(n => n.frozen).map(n => String(n.id)));
+        pruneSelectedIdsToCurrentList();
+      }
+    } catch { /* keep the last successfully loaded list */ }
+    if (redraw && generation === listRefreshGeneration) renderNovelList();
+  });
 }
 
 export async function refreshQueue() {
-  try {
-    const data = await fetchJson('/api/queue/status');
-    if (data) {
-      State.queueStatus = data;
-      renderQueueStatus();
-      return data;
-    }
-  } catch { /* ignore */ }
-  return null;
+  return runRefresh('queue', async () => {
+    try {
+      const observer = queueStatusObserver;
+      const observation = observer?.before();
+      const data = await fetchJson('/api/queue/status');
+      if (data) {
+        State.queueStatus = data;
+        renderQueueStatus();
+        observer?.after(data, observation);
+        return data;
+      }
+    } catch { /* keep the last successfully loaded status */ }
+    return null;
+  });
 }
 
 export async function refreshQueueDetailed() {
-  try {
-    const data = await fetchJson('/api/get_pending_tasks');
-    if (data) {
-      State.queueDetailed = data;
+  return runRefresh('queue-details', async () => {
+    try {
+      const pending = [];
+      const running = [];
+      const cursors = new Set();
+      let cursor = null;
+      let data;
+      do {
+        const query = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
+        data = await fetchJson('/api/get_pending_tasks' + query);
+        if (!data || !Array.isArray(data.pending) || !Array.isArray(data.running)) {
+          throw new Error('待機キューの応答が不正です');
+        }
+        pending.push(...data.pending);
+        running.push(...data.running);
+        cursor = data.next_cursor;
+        if (cursor && cursors.has(cursor)) throw new Error('待機キューのページ取得が進みません');
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      State.queueDetailed = { ...data, pending, running };
       renderQueueDetailed();
+    } catch (error) {
+      showNotification(error.message || '待機キューを取得できませんでした', 'error');
     }
-  } catch { /* ignore */ }
+  });
 }
 
-export async function refreshTags() {
+export function refreshQueueDetailedIfOpen() {
+  if (El.queueModal && !El.queueModal.classList.contains('hide')) {
+    return refreshQueueDetailed();
+  }
+}
+
+export async function refreshTags(redraw = true) {
+  ++tagListGeneration;
+  return runRefresh('tags', async () => {
+    const generation = tagListGeneration;
+    try {
+      const data = await fetchJson('/api/tag_list?format=json');
+      if (generation !== tagListGeneration) return;
+      if (data && Array.isArray(data.tags)) {
+        State.tags = data.tags;
+        State.tagColors = data.tag_colors || data.colors || {};
+        renderTagList();
+        if (redraw) renderNovelList();
+      }
+    } catch { /* keep the last successfully loaded tags */ }
+  });
+}
+
+// お気に入りタグの一覧を取得する (失敗しても操作は続けられる)。
+export async function refreshFavoriteTags() {
+  if (favoritePendingSaves) {
+    favoriteRefreshRequired = true;
+    return;
+  }
+  const generation = ++favoriteReadGeneration;
   try {
-    const data = await fetchJson('/api/tag_list?format=json');
-    if (data) {
-      State.tags = data.tags || [];
-      State.tagColors = data.tag_colors || data.colors || {};
-      renderTagList();
-      renderNovelList();
+    const data = await fetchJson('/api/favorite_tags');
+    if (generation !== favoriteReadGeneration) return;
+    if (data && data.success !== false && Array.isArray(data.tags)) {
+      State.favoriteTags = data.tags;
+      renderFavoriteTags();
+      syncFavoriteStars();
     }
-  } catch { /* ignore */ }
+  } catch { /* keep the last successfully loaded favorites */ }
 }
 
-function replaceConsoleHistory(consoleEl, history) {
+export function replaceConsoleHistory(consoleEl, history) {
   var lines = consoleEl.querySelectorAll('.console-line');
   lines.forEach(function(el) { el.remove(); });
   String(history || '').split('\n').forEach(function(line) {
-    var div = document.createElement('div');
-    div.className = 'console-line';
-    div.textContent = line;
-    consoleEl.appendChild(div);
+    if (line === '') return;
+    // ライブ出力と同じ描画経路を使う。textContent だけだと <span> などの
+    // タグがそのまま見えてしまう (issue #46)。
+    renderConsoleLine(consoleEl, line);
   });
   if (consoleEl.id === 'console-stdout2') {
     State.consolePinned.stdout2 = true;
@@ -1932,4 +3126,23 @@ function replaceConsoleHistory(consoleEl, history) {
     State.consolePinned.main = true;
   }
   consoleEl.scrollTop = consoleEl.scrollHeight;
+}
+
+// 履歴の差分をコンソールへ追記する (WebSocket が使えない環境の補完用)。
+export function appendConsoleHistory(consoleEl, history) {
+  if (!consoleEl) return;
+  var added = false;
+  String(history || '').split('\n').forEach(function(line) {
+    if (line === '') return;
+    renderConsoleLine(consoleEl, line);
+    added = true;
+  });
+  if (added) {
+    if (consoleEl.id === 'console-stdout2') {
+      State.consolePinned.stdout2 = true;
+    } else {
+      State.consolePinned.main = true;
+    }
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
 }

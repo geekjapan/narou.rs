@@ -1,0 +1,751 @@
+use std::future::Future;
+use std::pin::pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::FutureExt;
+use futures::future::{self, Either};
+use narou_rs::downloader::security::{
+    CONNECT_TIMEOUT_SECS, MAX_REDIRECTS, READ_TIMEOUT_SECS, TOTAL_TIMEOUT_SECS,
+};
+use narou_rs::error::{NarouError, Result};
+use narou_rs::platform::http::{RedirectChain, validate_http_url_syntax};
+use narou_rs::platform::http1::{Http1ResponseDecoder, SocketTarget, encode_request};
+use narou_rs::platform::relay::{
+    RelayRequest, RelayResponse, normalize_relay_base, response_wire_limit,
+};
+use narou_rs::platform::{
+    CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, PlatformFuture,
+};
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+use worker::web_sys::{ReadableStreamDefaultReader, WritableStreamDefaultWriter};
+use worker::worker_sys;
+use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, console_warn};
+
+use crate::budget::SubrequestBudget;
+
+#[path = "http_stream.rs"]
+mod streaming;
+
+/// Bound for intentionally buffered HTML/JSON and multipart request parts.
+/// `send_stream` does not impose this incidental cap on binary assets.
+pub const MAX_WORKER_HTTP_BODY: usize = 16 * 1024 * 1024;
+
+
+#[derive(Clone, Default)]
+pub struct WorkerHttpClient {
+    subrequests: SubrequestBudget,
+    /// 保存済みログイン Cookie。`Set-Cookie` の書き戻しにだけ使う。
+    cookie_store: Option<Arc<dyn CookieStore>>,
+    /// 送信する User-Agent。native の `NativeHttpClient` と同じ役割で、
+    /// リクエストが自前の UA を持たないときだけ付ける (サイト別の UA を尊重)。
+    user_agent: String,
+    /// 外部リレーの接続先と認証トークン。
+    /// `NAROU_RELAY_ENDPOINT` / `NAROU_RELAY_KEY` が揃ったときだけ Some。
+    relay: Option<RelayConfig>,
+}
+
+/// A single fallback hop; neither transport follows redirects itself.
+enum HopExchange<'a> {
+    Socket,
+    Relay(&'a RelayConfig),
+}
+
+/// 踏み台リレーの接続情報。
+#[derive(Clone)]
+struct RelayConfig {
+    /// 踏み台のベース URL (`https://<relay>`。ループバックのみ `http://` 可)。
+    /// `normalize_relay_base` でオリジンに正規化済み。
+    base_url: String,
+    /// `X-Proxy-Token` に入れる共有トークン。
+    token: String,
+    /// `download.relay-sites` の解釈結果。リレーを試す対象・常時経由の対象。
+    sites: narou_rs::platform::relay::RelaySitePolicy,
+}
+
+impl std::fmt::Debug for WorkerHttpClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerHttpClient")
+            .field("cookie_store", &self.cookie_store.is_some())
+            .finish()
+    }
+}
+
+impl WorkerHttpClient {
+    pub fn new(subrequests: SubrequestBudget) -> Self {
+        Self {
+            subrequests,
+            cookie_store: None,
+            user_agent: String::new(),
+            relay: None,
+        }
+    }
+
+    /// 送信する User-Agent を設定する (`narou_rs::downloader::resolve_user_agent`)。
+    pub fn with_user_agent(mut self, user_agent: String) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+
+    /// 外部リレー経由の取得段を有効にする。
+    ///
+    /// `base_url` は `https://<relay>` (ループバックの踏み台に限り
+    /// `http://127.0.0.1:<port>` など) を要求する。検証は
+    /// [`narou_rs::platform::relay::normalize_relay_base`] が行い、平文の公開先・
+    /// スキーム無し・資格情報入りの値は無効化する (fail closed)。以前は
+    /// スキーム無しに `http://` を補っていたが、Token と Cookie を平文で運ぶ
+    /// 経路になるためやめた。
+    pub fn with_relay(mut self, base_url: String, token: String) -> Self {
+        match normalize_relay_base(&base_url) {
+            Ok(base_url) => self.relay = Some(RelayConfig {
+                base_url,
+                token,
+                sites: narou_rs::platform::relay::RelaySitePolicy::Auto,
+            }),
+            Err(error) => console_warn!(
+                "NAROU_RELAY_ENDPOINT を無効化しました (リレーは https、またはループバックの http のみ許可): {error}"
+            ),
+        }
+        self
+    }
+
+    /// `download.relay-sites` の解釈結果を設定する。
+    /// リレーが未設定なら効果なし (フォールバックも強制も働かない)。
+    pub fn with_relay_sites(mut self, value: Option<&str>) -> Self {
+        if let Some(relay) = self.relay.as_mut() {
+            relay.sites = narou_rs::platform::relay::RelaySitePolicy::parse(value);
+        }
+        self
+    }
+
+    /// 保存済み Cookie を `Set-Cookie` で更新できるようにする (native と同じ挙動)。
+    pub fn with_cookie_store(mut self, store: Arc<dyn CookieStore>) -> Self {
+        self.cookie_store = Some(store);
+        self
+    }
+
+
+    /// Execute one hop over `exchange`: a raw socket GET, or one relay call
+    /// whose JSON response is turned back into an [`HttpResponse`].
+    async fn exchange_hop(
+        &self,
+        exchange: &HopExchange<'_>,
+        url: &str,
+        headers: &[(String, String)],
+        deadline_ms: f64,
+    ) -> Result<HttpResponse> {
+        // `connect()` もサブリクエスト枠を消費するので fetch と同じく計上する。
+        self.subrequests.record();
+        match exchange {
+            HopExchange::Socket => {
+                let target = SocketTarget::parse(url)?;
+                socket_exchange(&target, HttpMethod::Get, headers, None, deadline_ms, MAX_WORKER_HTTP_BODY).await
+            }
+            HopExchange::Relay(relay) => {
+                let mut relay_request =
+                    RelayRequest::new(&relay.base_url, &relay.token, url, headers)?.into_request();
+                // Cloudflare の同一ゾーン（Worker の custom domain と同じ
+                // `rumia-ch.uk`）へ生ソケットで送ると、エッジ側でリクエストが
+                // 中継されずリレーのログにも残らないことがある。リレー呼び出しは
+                // 通常の fetch サブリクエストにし、UA も明示する。
+                if relay_request.header("User-Agent").is_none() {
+                    let user_agent = headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_else(|| {
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0".to_string()
+                        });
+                    relay_request.headers.push(("User-Agent".to_string(), user_agent));
+                }
+                if relay_request.header("Accept").is_none() {
+                    relay_request.headers.push(("Accept".to_string(), "application/json".to_string()));
+                }
+                let wire_response = self
+                    .send_fetch_hop(&relay_request, response_wire_limit(MAX_WORKER_HTTP_BODY), deadline_ms)
+                    .await?;
+                let relay_response = RelayResponse::parse(
+                    wire_response.status, &wire_response.body, MAX_WORKER_HTTP_BODY,
+                )?;
+                let mut response_headers = Vec::new();
+                if let Some(content_type) = relay_response.content_type {
+                    response_headers.push(("content-type".to_string(), content_type));
+                }
+                if let Some(location) = relay_response.location {
+                    response_headers.push(("location".to_string(), location));
+                }
+                if let Some(action) = relay_response.waf_action {
+                    response_headers.push((
+                        narou_rs::platform::http::WAF_ACTION_HEADER.to_string(),
+                        action,
+                    ));
+                }
+                for cookie in relay_response.set_cookie {
+                    response_headers.push(("set-cookie".to_string(), cookie));
+                }
+                Ok(HttpResponse {
+                    status: relay_response.status,
+                    headers: response_headers,
+                    body: relay_response.body,
+                })
+            }
+        }
+    }
+
+    async fn send_fetch_hop(
+        &self,
+        request: &HttpRequest,
+        response_limit: usize,
+        deadline_ms: f64,
+    ) -> Result<HttpResponse> {
+        let method = match request.method {
+            HttpMethod::Get => Method::Get,
+            HttpMethod::Post => Method::Post,
+            HttpMethod::Put => Method::Put,
+            HttpMethod::Delete => Method::Delete,
+        };
+        let headers = Headers::new();
+        for (name, value) in &request.headers {
+            headers
+                .append(name, value)
+                .map_err(|error| NarouError::Platform(format!("invalid HTTP header: {error}")))?;
+        }
+        let mut init = RequestInit::new();
+        init.with_method(method);
+        init.with_redirect(RequestRedirect::Manual);
+        init.with_headers(headers);
+        if let Some(body) = request.body.as_deref() {
+            if body.len() > MAX_WORKER_HTTP_BODY {
+                return Err(NarouError::Platform(
+                    "Worker HTTP request body exceeds limit".to_string(),
+                ));
+            }
+            init.with_body(Some(JsValue::from(js_sys::Uint8Array::from(body.as_slice()))));
+        }
+        let trusted_limit = request.trusted_endpoint.then_some(request.trusted_response_body_limit).flatten();
+        let request = Request::new_with_init(&request.url, &init)
+            .map_err(|error| NarouError::Platform(format!("invalid HTTP request: {error}")))?;
+        self.subrequests.record();
+        let mut abort = streaming::FetchAbortGuard(Some(worker::AbortController::default()));
+        let signal = abort.0.as_ref().expect("new Fetch owns its controller").signal();
+        // The primary Fetch hop previously had no timeout at all: a stalled
+        // `send()` could hang the request forever. It now shares the same
+        // per-hop budget as the raw-socket fallback (deadline + per-phase cap)
+        // and aborts the underlying Workers Fetch subrequest on timeout/error
+        // so stalled upstreams are not left dangling while fallback runs.
+        let response = with_timeout(
+            async { Fetch::Request(request).send_with_signal(&signal).await.map_err(|error| NarouError::Http(error.to_string())) },
+            deadline_left(deadline_ms, "fetch", "request")?.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+            "fetch",
+            "request",
+        )
+        .await?;
+        let status = response.status_code();
+        let mut headers = response.headers().entries()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("set-cookie"))
+            .collect::<Vec<_>>();
+        for cookie in response.headers().get_all("set-cookie")
+            .map_err(|error| NarouError::Http(error.to_string()))?
+        {
+            headers.push(("set-cookie".to_string(), cookie));
+        }
+        let limit =
+            narou_rs::platform::http::response_body_limit(status, trusted_limit, response_limit);
+        if response
+            .headers()
+            .get("content-length")
+            .map_err(|error| {
+                NarouError::Platform(format!("invalid HTTP response headers: {error}"))
+            })?
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|size| size > limit)
+        {
+            if let worker::ResponseBody::Stream(stream) = response.into_parts().1 {
+                let _ = with_timeout(
+                    JsFuture::from(stream.cancel()).map(|result| result.map(|_| ()).map_err(js_error)),
+                    5_000.0, "fetch", "Fetch body cancel",
+                ).await;
+            }
+            return Err(NarouError::Platform(
+                "Worker HTTP response body exceeds limit".to_string(),
+            ));
+        }
+        let body = read_fetch_body(response.into_parts().1, limit, deadline_ms).await?;
+        abort.0 = None;
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+    fn send_inner<'a>(
+        &'a self,
+        mut request: HttpRequest,
+        pacing: Option<narou_rs::platform::http::HttpPacing<'a>>,
+    ) -> PlatformFuture<'a, Result<HttpResponse>> {
+        if !self.user_agent.is_empty() && request.header("User-Agent").is_none() {
+            request.headers.push(("User-Agent".to_string(), self.user_agent.clone()));
+        }
+        Box::pin(async move {
+            let mut chain = RedirectChain::new(request, MAX_REDIRECTS);
+            loop {
+                let request = chain.request();
+                validate_http_url_syntax(&request.url)?;
+                if !request.trusted_endpoint {
+                    self.validate_url(&request.url).await?;
+                }
+                let scope = pacing.map(|policy| policy.scope_for(&chain)).transpose()?;
+                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                    policy.limiter.acquire(scope).await?;
+                }
+                // `download.relay-sites` に `force:<ホスト>` が指定されている対象は
+                // 直接取得を試さず、最初からリレーへ送る (検証用の一時切替)。
+                let mut relay_attempted = false;
+                let forced = self
+                    .relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.sites.forced(&request.url));
+                if forced {
+                    if let Some(relay) = self.relay.as_ref() {
+                        if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                            policy.limiter.acquire(scope).await?;
+                        }
+                        let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+                        let forced_result = self.exchange_hop(
+                            &HopExchange::Relay(relay), &request.url,
+                            &request.headers, deadline_ms,
+                        ).await;
+                        if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                            policy.limiter.complete(scope).await?;
+                        }
+                        relay_attempted = true;
+                        match forced_result {
+                            Ok(response)
+                                if response.is_success() || response.is_redirection()
+                                    || response.browser_challenge().is_some() =>
+                            {
+                                if let Some(store) = self.cookie_store.as_deref() {
+                                    narou_rs::platform::cookie_store::persist_response_set_cookie(
+                                        store, &response, chain.request().header("Cookie"),
+                                    ).await;
+                                }
+                                if !chain.advance(&response)? {
+                                    return Ok(response);
+                                }
+                                continue;
+                            }
+                            Ok(response) => console_warn!(
+                                "forced relay returned {}, falling back to direct fetch", response.status
+                            ),
+                            Err(error) => console_warn!(
+                                "forced relay failed, falling back to direct fetch: {error}"
+                            ),
+                        }
+                    }
+                }
+                // Fetch is always manual. A partial/failed Fetch body returns
+                // an error; only a complete response or a transport failure
+                // reaches the fallback decision below.
+                let fetch_result = self.send_fetch_hop(
+                    request, MAX_WORKER_HTTP_BODY,
+                    js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0,
+                ).await;
+                if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                    policy.limiter.complete(scope).await?;
+                }
+                // A 403 GET — or a transport failure — can be a Cloudflare
+                // egress block, so try socket then relay on any GET failure,
+                // not only a successful 403 response.
+                let should_fallback = request.method == HttpMethod::Get && !request.trusted_endpoint;
+                let is_blocked = fetch_result.is_err()
+                    || matches!(&fetch_result, Ok(r) if r.status == 403);
+                let response = if should_fallback && is_blocked {
+                    let fetch_failed = fetch_result.is_err();
+                    if fetch_failed {
+                        console_warn!("fetch transport failed, trying socket/relay fallback");
+                    }
+                    if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                        policy.limiter.acquire(scope).await?;
+                    }
+                    let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+                    let socket_result = self.exchange_hop(
+                        &HopExchange::Socket, &request.url, &request.headers, deadline_ms,
+                    ).await;
+                    if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                        policy.limiter.complete(scope).await?;
+                    }
+                    match socket_result {
+                        Ok(response) if response.is_success() || response.is_redirection() => response,
+                        // A browser verification is the site's own answer: it
+                        // must not be replaced by the original failure.
+                        Ok(response) if response.browser_challenge().is_some() => response,
+                        socket_result => {
+                            let relay_result = match self.relay.as_ref() {
+                                Some(relay)
+                                    if !relay_attempted
+                                        && relay.sites.fallback_allowed(&request.url) =>
+                                {
+                                    if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                                        policy.limiter.acquire(scope).await?;
+                                    }
+                                    let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+                                    let result = self.exchange_hop(
+                                        &HopExchange::Relay(relay), &request.url,
+                                        &request.headers, deadline_ms,
+                                    ).await;
+                                    if let (Some(policy), Some(scope)) = (pacing, scope.as_ref()) {
+                                        policy.limiter.complete(scope).await?;
+                                    }
+                                    result.map(Some)
+                                }
+                                _ => Ok(None),
+                            };
+                            match relay_result {
+                                Ok(Some(response))
+                                    if response.is_success() || response.is_redirection() => response,
+                                // A browser verification is the site's own
+                                // answer: it must not be replaced by the
+                                // original failure.
+                                Ok(Some(response)) if response.browser_challenge().is_some() => response,
+                                relay_result => {
+                                    match socket_result {
+                                        Ok(response) => console_warn!(
+                                            "socket transport returned {}, keeping fetch result", response.status
+                                        ),
+                                        Err(error) => console_warn!(
+                                            "socket transport failed, keeping fetch result: {error}"
+                                        ),
+                                    }
+                                    match relay_result {
+                                        Ok(Some(response)) => console_warn!(
+                                            "relay transport returned {}, keeping fetch result", response.status
+                                        ),
+                                        Ok(None) => {}
+                                        Err(error) => console_warn!(
+                                            "relay transport failed, keeping fetch result: {error}"
+                                        ),
+                                    }
+                                    fetch_result?
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    fetch_result?
+                };
+                if let Some(store) = self.cookie_store.as_deref() {
+                    narou_rs::platform::cookie_store::persist_response_set_cookie(
+                        store, &response, chain.request().header("Cookie"),
+                    ).await;
+                }
+                if !chain.advance(&response)? {
+                    return Ok(response);
+                }
+            }
+        })
+    }
+}
+
+impl HttpClient for WorkerHttpClient {
+    /// wasm には DNS 解決手段が無いので、構文とアドレスリテラルの判定だけを
+    /// 行う (到達可否は Cloudflare の egress 側の制約に委ねる)。ホスト名が
+    /// 非公開アドレスに解決される場合を弾けない点が native との差。
+    fn validate_url<'a>(&'a self, url: &'a str) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            narou_rs::platform::url_policy::validate_url_syntax(url)
+                .map_err(narou_rs::error::NarouError::Http)
+        })
+    }
+
+    fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
+        self.send_inner(request, None)
+    }
+
+    fn send_stream<'a>(
+        &'a self, request: HttpRequest,
+    ) -> PlatformFuture<'a, Result<narou_rs::platform::http::HttpStreamResponse>> {
+        self.send_stream_inner(request, None)
+    }
+
+    fn send_stream_paced<'a>(
+        &'a self, request: HttpRequest, pacing: narou_rs::platform::http::HttpPacing<'a>,
+    ) -> PlatformFuture<'a, Result<narou_rs::platform::http::HttpStreamResponse>> {
+        self.send_stream_inner(request, Some(pacing))
+    }
+
+    fn send_paced<'a>(
+        &'a self,
+        request: HttpRequest,
+        pacing: narou_rs::platform::http::HttpPacing<'a>,
+    ) -> PlatformFuture<'a, Result<HttpResponse>> {
+        self.send_inner(request, Some(pacing))
+    }
+
+}
+
+/// Consume the real stream, cancelling it on size/read failure. Using the
+/// reader directly keeps an aborted partial body from becoming successful EOF.
+async fn read_fetch_body(body: worker::ResponseBody, limit: usize, deadline_ms: f64) -> Result<Vec<u8>> {
+    match body {
+        worker::ResponseBody::Empty => Ok(Vec::new()),
+        worker::ResponseBody::Body(body) if body.len() <= limit => Ok(body),
+        worker::ResponseBody::Body(_) => Err(NarouError::Platform(
+            "Worker HTTP response body exceeds limit".to_string(),
+        )),
+        worker::ResponseBody::Stream(stream) => {
+            let reader = stream.get_reader()
+                .dyn_into::<ReadableStreamDefaultReader>()
+                .map_err(|_| NarouError::Http("invalid Fetch response reader".into()))?;
+            let result = async {
+                let mut body = Vec::new();
+                loop {
+                    let value = with_timeout(
+                        JsFuture::from(reader.read()).map(|result| result
+                            .map_err(|error| NarouError::Http(format!("Fetch body read failed: {error:?}")))),
+                        deadline_left(deadline_ms, "fetch", "read")?.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+                        "fetch",
+                        "read",
+                    )
+                    .await?;
+                    if js_sys::Reflect::get(&value, &JsValue::from_str("done"))
+                        .map_err(js_error)?.is_truthy()
+                    {
+                        return Ok(body);
+                    }
+                    let chunk = js_sys::Reflect::get(&value, &JsValue::from_str("value"))
+                        .map_err(js_error)?.unchecked_into::<js_sys::Uint8Array>();
+                    let length = chunk.length() as usize;
+                    if length > limit.saturating_sub(body.len()) {
+                        return Err(NarouError::Platform(
+                            "Worker HTTP response body exceeds limit".to_string(),
+                        ));
+                    }
+                    let start = body.len();
+                    body.resize(start + length, 0);
+                    chunk.copy_to(&mut body[start..]);
+                }
+            }.await;
+            if result.is_err() {
+                let _ = with_timeout(
+                    JsFuture::from(reader.cancel()).map(|result| result.map(|_| ()).map_err(js_error)),
+                    5_000.0, "fetch", "Fetch body cancel",
+                ).await;
+            }
+            reader.release_lock();
+            result
+        }
+    }
+}
+
+/// A `connect()` TCP/TLS socket driven directly through its web streams.
+///
+/// `worker::Socket` implements tokio's AsyncRead/AsyncWrite, which this crate
+/// does not depend on, so the readable/writable streams are consumed
+/// manually. The writer is deliberately **never** closed: on Workers,
+/// closing the writable side first also tears down the readable side and the
+/// response arrives as zero bytes (measured, not documented).
+struct RawSocket {
+    inner: worker_sys::Socket,
+    writer: WritableStreamDefaultWriter,
+    reader: ReadableStreamDefaultReader,
+}
+
+/// Milliseconds remaining until `deadline_ms` (`Date.now()` clock), or an
+/// error once the total budget is spent.
+fn deadline_left(deadline_ms: f64, transport: &str, what: &str) -> Result<f64> {
+    let left = deadline_ms - js_sys::Date::now();
+    if left <= 0.0 {
+        return Err(NarouError::Http(format!("{transport} {what}: total timeout")));
+    }
+    Ok(left)
+}
+
+/// `fut` with a deadline, whichever fires first. The loser is dropped — for
+/// `read()`/`write()` that abandons the pending promise, which the socket's
+/// `close()` then settles.
+async fn with_timeout<T>(fut: impl Future<Output = Result<T>>, ms: f64, transport: &str, what: &str) -> Result<T> {
+    match future::select(
+        pin!(fut),
+        pin!(worker::Delay::from(Duration::from_millis(
+            ms.max(1.0) as u64
+        ))),
+    )
+    .await
+    {
+        Either::Left((result, _delay)) => result,
+        Either::Right(((), _pending)) => Err(NarouError::Http(format!("{transport} {what} timed out"))),
+    }
+}
+
+fn js_error(value: JsValue) -> NarouError {
+    NarouError::Http(match value.as_string() {
+        Some(message) => format!("socket I/O: {message}"),
+        None => format!("socket I/O: {value:?}"),
+    })
+}
+
+/// Open the socket: `connect()` returns synchronously, `opened()` resolves
+/// once TLS negotiation (when requested) and the TCP handshake complete.
+async fn connect_socket(target: &SocketTarget, deadline_ms: f64) -> Result<RawSocket> {
+    let address = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &address,
+        &JsValue::from_str("hostname"),
+        &JsValue::from_str(&target.host),
+    )
+    .map_err(js_error)?;
+    js_sys::Reflect::set(
+        &address,
+        &JsValue::from_str("port"),
+        &JsValue::from_f64(f64::from(target.port)),
+    )
+    .map_err(js_error)?;
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &options,
+        &JsValue::from_str("secureTransport"),
+        &JsValue::from_str(if target.tls { "on" } else { "off" }),
+    )
+    .map_err(js_error)?;
+    // We never half-close; keep the flag explicit anyway.
+    js_sys::Reflect::set(
+        &options,
+        &JsValue::from_str("allowHalfOpen"),
+        &JsValue::TRUE,
+    )
+    .map_err(js_error)?;
+
+    let inner = worker_sys::connect(address.into(), options.into()).map_err(js_error)?;
+    let left = deadline_left(deadline_ms, "socket", "connect")?;
+    with_timeout(
+        JsFuture::from(inner.opened().map_err(js_error)?)
+            .map(|result| result.map(|_| ()).map_err(js_error)),
+        left.min(CONNECT_TIMEOUT_SECS as f64 * 1_000.0),
+        "socket", "connect",
+    )
+    .await?;
+
+    let readable = inner.readable().map_err(js_error)?;
+    let reader: ReadableStreamDefaultReader = readable
+        .get_reader()
+        .dyn_into()
+        .map_err(|value| NarouError::Http(format!("socket reader unavailable: {value:?}")))?;
+    let writable = inner.writable().map_err(js_error)?;
+    let writer = WritableStreamDefaultWriter::new(&writable).map_err(js_error)?;
+    Ok(RawSocket {
+        inner,
+        writer,
+        reader,
+    })
+}
+
+impl RawSocket {
+    /// One atomic write — request heads are a few hundred bytes, far below
+    /// the stream's internal queue, so a single `write()` suffices.
+    async fn write_all(&self, bytes: &[u8], deadline_ms: f64) -> Result<()> {
+        let left = deadline_left(deadline_ms, "socket", "write")?;
+        with_timeout(
+            JsFuture::from(
+                self.writer
+                    .write_with_chunk(&JsValue::from(js_sys::Uint8Array::from(bytes))),
+            )
+            .map(|result| result.map(|_| ()).map_err(js_error)),
+            left.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+            "socket", "write",
+        )
+        .await
+    }
+
+    /// Next chunk of response bytes; `None` at EOF.
+    async fn read_chunk(&mut self, deadline_ms: f64) -> Result<Option<js_sys::Uint8Array>> {
+        let left = deadline_left(deadline_ms, "socket", "read")?;
+        let value = with_timeout(
+            JsFuture::from(self.reader.read()).map(|result| result.map_err(js_error)),
+            left.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+            "socket", "read",
+        )
+        .await?;
+        let done = js_sys::Reflect::get(&value, &JsValue::from_str("done"))
+            .map_err(js_error)?
+            .is_truthy();
+        if done {
+            return Ok(None);
+        }
+        let chunk = js_sys::Reflect::get(&value, &JsValue::from_str("value"))
+            .map_err(js_error)?
+            .unchecked_into::<js_sys::Uint8Array>();
+        Ok(Some(chunk))
+    }
+
+    /// Release stream locks and close the socket. Best-effort: a stuck close
+    /// must not hang the request (the runtime reclaims the socket anyway).
+    async fn close(self) {
+        self.reader.release_lock();
+        self.writer.release_lock();
+        if let Ok(promise) = self.inner.close() {
+            let _ = with_timeout(
+                JsFuture::from(promise).map(|result| result.map(|_| ()).map_err(js_error)),
+                5_000.0,
+                "socket",
+                "close",
+            )
+            .await;
+        }
+    }
+}
+
+/// One socket round-trip: connect → write request head → parse the response.
+async fn socket_exchange(
+    target: &SocketTarget,
+    method: HttpMethod,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    deadline_ms: f64,
+    body_limit: usize,
+) -> Result<HttpResponse> {
+    let mut socket = connect_socket(target, deadline_ms).await?;
+    let result = socket_roundtrip(&mut socket, target, method, headers, body, deadline_ms, body_limit).await;
+    socket.close().await;
+    result
+}
+
+async fn socket_roundtrip(
+    socket: &mut RawSocket,
+    target: &SocketTarget,
+    method: HttpMethod,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    deadline_ms: f64,
+    body_limit: usize,
+) -> Result<HttpResponse> {
+    let request = encode_request(target, method, headers, body.map(<[u8]>::len));
+    socket.write_all(&request, deadline_ms).await?;
+    if let Some(body) = body {
+        socket.write_all(body, deadline_ms).await?;
+    }
+    let mut decoder = Http1ResponseDecoder::new(body_limit);
+    // Stage only a bounded slice in wasm memory. A coalesced oversized JS
+    // chunk must reach the decoder's checks before a whole-chunk allocation.
+    let mut buffer = [0u8; 8192];
+    loop {
+        match socket.read_chunk(deadline_ms).await? {
+            Some(chunk) => {
+                let mut offset = 0u32;
+                let chunk_len = chunk.length();
+                while offset < chunk_len {
+                    let end = offset.saturating_add(buffer.len() as u32).min(chunk_len);
+                    let length = (end - offset) as usize;
+                    chunk.subarray(offset, end).copy_to(&mut buffer[..length]);
+                    if decoder.feed(&buffer[..length])? {
+                        return decoder.into_response();
+                    }
+                    offset = end;
+                }
+            }
+            None => return decoder.finish(),
+        }
+    }
+}
+

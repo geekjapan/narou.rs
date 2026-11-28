@@ -1,18 +1,27 @@
+mod browser_token;
 mod info_extraction;
 mod interpolate;
 mod loader;
 mod serde_helpers;
+mod update_rules;
 
 use std::collections::HashMap;
+#[cfg(feature = "native-runtime")]
+use std::collections::hash_map::DefaultHasher;
+#[cfg(feature = "native-runtime")]
+use std::hash::{Hash, Hasher};
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+pub use browser_token::BrowserTokenSetting;
 pub use serde_helpers::deserialize_yes_no_bool;
+pub use update_rules::{UpdateRule, allows_automatic_update};
 
 fn looks_like_pattern(s: &str) -> bool {
     s.contains("(?<") || s.contains("(?P<")
@@ -22,6 +31,11 @@ fn looks_like_pattern(s: &str) -> bool {
 pub struct SiteSetting {
     pub name: String,
     pub domain: String,
+    /// 並列ダウンロードを直列化するサイト系列。未指定ならドメインから
+    /// `platform::site_family` で自動判定する。なろう系のように複数ドメインを
+    /// 同じ系列として扱うサイトは YAML で明示する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_family: Option<String>,
     #[serde(default)]
     pub scheme: String,
     pub top_url: String,
@@ -31,6 +45,93 @@ pub struct SiteSetting {
     pub url: Option<SiteSettingValue>,
     #[serde(default)]
     pub series_url: Option<SiteSettingValue>,
+    /// Pattern recognising an author page (作者ページ), e.g.
+    /// `https://mypage.syosetu.com/(?<author_id>\d+)/`.
+    ///
+    /// `narou author add <url>` uses it to decide which definition owns the
+    /// page; the tracked entry keeps only the site and the URL.
+    #[serde(default)]
+    pub author_url: Option<SiteSettingValue>,
+    /// Pattern over an author page (or its API response) that yields the works
+    /// it lists.
+    ///
+    /// Every match captures either `novel_url` (an absolute work URL) or the
+    /// pieces `author_work_url` needs (`ncode`, `novel_id`, …). The result is
+    /// downloaded exactly like a URL typed on the command line; works already
+    /// in the library are skipped.
+    #[serde(default)]
+    pub author_novel_pattern: Option<String>,
+    /// API endpoint that lists an author's works, when the site offers one
+    /// (なろう: `https://api.syosetu.com/novelapi/api/?out=json&userid=\k<author_id>&lim=500`).
+    ///
+    /// Fetched instead of the author page itself; captures from `author_url`
+    /// are available as `\k<...>`.
+    #[serde(default)]
+    pub author_api_url: Option<String>,
+    /// Template that turns the captures of `author_novel_pattern` into a work
+    /// URL, for sites whose listing carries ids rather than links
+    /// (`\k<top_url>/\k<ncode>/`).
+    #[serde(default)]
+    pub author_work_url: Option<String>,
+    /// URL of one series' episode list, for author listings that mix the
+    /// episodes of a series in with standalone works (Pixiv).
+    ///
+    /// `\k<series_id>` plus whatever `author_url` captured can be used.
+    #[serde(default)]
+    pub author_series_episodes_url: Option<String>,
+    /// Pattern over that episode list yielding `novel_id` (or `ncode`), so the
+    /// episodes can be kept out of the author's work list.
+    #[serde(default)]
+    pub author_series_episodes_pattern: Option<String>,
+    /// Template that turns episode-list captures into an absolute work URL
+    /// when the pattern does not capture `novel_url` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_series_episode_work_url: Option<String>,
+    /// URL of one page of a comic series' page list (Pixiv pages `?p=N`).
+    ///
+    /// `\k<series_id>` and `\k<page>` are available, plus whatever `author_url`
+    /// captured.
+    #[serde(default)]
+    pub author_comic_series_pages_url: Option<String>,
+    /// Pattern over that page list yielding `novel_id`, so a comic series'
+    /// pages can be kept out of the author's single-artwork list.
+    #[serde(default)]
+    pub author_comic_series_pages_pattern: Option<String>,
+    /// Template that turns comic page-list captures into an absolute work URL
+    /// when the pattern does not capture `novel_url` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_comic_series_page_work_url: Option<String>,
+    /// Pattern whose `author_next` capture is the next page of an author
+    /// listing (ハーメルン pages its works). Followed until a page has no next
+    /// link or points at one already visited — the visited set is what keeps a
+    /// pager that links back from looping, so there is no page limit to hit.
+    #[serde(default)]
+    pub author_next_pattern: Option<String>,
+    /// Template of one *continued* page of an offset-paged author listing
+    /// (なろう小説API の `st` のような開始位置)。`\k<st>` には「ここまでに
+    /// 読んだ作品数 + 1」が入り、`author_url` の capture も使える。1 ページ目は
+    /// `author_api_url`、続きはこのテンプレートで辿る。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_page_url: Option<String>,
+    /// その 1 ページが列挙する作品数。総件数パターンが無い定義では、これに
+    /// 満たないページを終端と見なす。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_page_size: Option<usize>,
+    /// 応答が示す総作品数を `count` capture で読むパターン。総数に達するまで
+    /// ページを進め、達せずに尽きたらエラーにする (欠けた一覧を成功にしない)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_page_total_pattern: Option<String>,
+    /// 受け付ける開始位置の上限 (なろう小説API の `st` は 1〜2000)。超える
+    /// 続きが残っている場合は、途中までの一覧を返さずエラーにする。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_page_max_start: Option<usize>,
+    /// 作者一覧の取得時に保存済みログインを必ず試し、匿名の一覧と統合する。
+    ///
+    /// 匿名の応答が「完全な一覧」に見えても、ログインしないと出てこない作品
+    /// (Pixiv の R-18 など) があるサイト用。定義側で `author_login_merge: yes`
+    /// とすると、匿名で読めた分に各ログインで読めた分を足し合わせる。
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
+    pub author_login_merge: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series_item_url: Option<String>,
     #[serde(default)]
@@ -41,6 +142,63 @@ pub struct SiteSetting {
     pub confirm_over18: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
+    /// Additional trusted hosts (and their subdomains) allowed to receive the
+    /// site's Cookie header, e.g. an author page hosted separately from novels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cookie_hosts: Vec<String>,
+    /// Reuse response cookies within a single fetch policy (e.g. CSRF forms).
+    /// Anonymous session cookies are never persisted as saved logins.
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
+    pub cookie_session: bool,
+    /// Runtime-only credential destinations; never written into site YAML.
+    #[serde(skip)]
+    pub(super) login_cookie_hosts: Vec<String>,
+    /// Extra request headers sent with every fetch for this site (e.g. the
+    /// `Referer` some image hosts require). Names/values that could inject a
+    /// second header are dropped when the policy is built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// Login page the `narou_rs_login` executable opens for this site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_url: Option<String>,
+    /// Page content that marks a login wall (a page served with HTTP 200 that
+    /// asks for authentication). Matching it retries with the stored cookie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_pattern: Option<SiteSettingValue>,
+    /// Marker a definition emits when an anonymous fetch returned only part of
+    /// the list (a retry with the stored cookie may see more).
+    #[serde(default)]
+    pub login_partial_pattern: Option<SiteSettingValue>,
+    /// What a still-matching login/challenge wall means after every stored
+    /// credential has been tried.
+    ///
+    /// `not_found` (the default) keeps narou.rb's behavior: the novel is
+    /// treated as private/deleted and frozen. `login` reports an
+    /// authentication error instead, so a site whose browser-verification
+    /// token expired can be refreshed and retried without freezing the
+    /// record.
+    #[serde(default)]
+    pub login_wall_error: LoginWallError,
+    /// Browser-side token preparation for a site whose content sits behind a
+    /// browser check.
+    ///
+    /// The definition names the script to load, the function that issues the
+    /// token and the cookie that carries it; the values are site data, so no
+    /// site is special-cased in Rust. An unusable configuration is rejected
+    /// while the definition is compiled.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "browser_token::deserialize_browser_token"
+    )]
+    pub browser_token: Option<BrowserTokenSetting>,
+    /// Retain cached omitted sections on a nonempty partial TOC; indices must be stable numeric positions.
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
+    pub preserve_missing_sections: bool,
+    /// Minimum seconds between requests to this site. Sites that rate-limit
+    /// aggressively (Pixiv) declare a floor; `None` uses `download.interval`.
+    #[serde(default)]
+    pub min_interval: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub over18_pattern: Option<SiteSettingValue>,
     pub sitename: String,
@@ -50,7 +208,7 @@ pub struct SiteSetting {
     pub append_title_to_folder_name: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_strip_pattern: Option<String>,
-    pub toc_url: String,
+    pub toc_url: SiteUrlTemplate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitles: Option<SiteSettingValue>,
 
@@ -70,9 +228,14 @@ pub struct SiteSetting {
     pub postscript_pattern: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub novel_info_url: Option<String>,
+    /// Pattern that yields the record's `ncode` from the fetched page. Used by
+    /// sites whose URL carries no site-specific prefix (e.g. pixiv, where the
+    /// numeric work id alone would collide between novels and series).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ncode: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub is_narou: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narou_api_url: Option<String>,
@@ -80,6 +243,13 @@ pub struct SiteSetting {
     pub illust_current_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub illust_grep_pattern: Option<String>,
+    /// Search fetched page markup as well as parsed content (default: true).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "serde_helpers::deserialize_yes_no_opt_bool"
+    )]
+    pub illust_from_raw: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +278,12 @@ pub struct SiteSetting {
     pub novel_type_string: Option<HashMap<String, u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<SiteSettingValue>,
+    /// 作品の属性を決める条件。最初に一致した規則を使い、未一致なら小説。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_type_rules: Vec<WorkTypeRule>,
+    /// Scheduled-update policy; missing or unmatched rules allow automatic updates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub update_rules: Vec<UpdateRule>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preprocess: Option<String>,
@@ -119,6 +295,18 @@ pub struct SiteSetting {
     pub(super) compiled_url: Vec<Regex>,
     #[serde(skip)]
     pub(super) compiled_series_url: Vec<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_url: Vec<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_novel: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_next: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_page_total: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_series_episodes: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_comic_pages: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_subtitles: Option<Regex>,
     #[serde(skip)]
@@ -132,9 +320,150 @@ pub struct SiteSetting {
     #[serde(skip)]
     pub(super) compiled_over18_pattern: Option<Regex>,
     #[serde(skip)]
+    pub(super) compiled_login_pattern: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_login_partial_pattern: Option<Regex>,
+    #[serde(skip)]
     pub(super) compiled_next_toc: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_toc_page_max: Option<Regex>,
+    /// コンパイル済みの作品属性規則。
+    #[serde(skip)]
+    pub(super) compiled_work_type_rules: Vec<(WorkTypeField, Regex, WorkType)>,
+}
+
+/// Meaning of a login/challenge wall that remains after every stored login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginWallError {
+    /// narou.rb-compatible behavior: the novel is private/deleted (freeze).
+    #[default]
+    NotFound,
+    /// The site needs a browser check or a fresh session; do not freeze.
+    Login,
+}
+
+/// サイトが作品属性の判定に使う値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkTypeField {
+    /// 作品 ID (サイトによっては種別を含む)。
+    Ncode,
+    /// 題名。
+    Title,
+    /// 作者名。
+    Author,
+    /// 作品 URL (レコードの `toc_url`)。
+    Url,
+    /// 種別コード (1 = 連載, 2 = 短編)。完結は別の `end` で管理する。
+    NovelType,
+    /// 話数。
+    EpisodeCount,
+    /// 前処理済みの目次ページ。
+    Source,
+}
+
+impl WorkTypeField {
+    /// 規則が照合する値の取り出し口。
+    fn value<'a>(&self, subjects: &'a WorkTypeSubjects<'a>) -> &'a str {
+        match self {
+            WorkTypeField::Ncode => subjects.ncode,
+            WorkTypeField::Title => subjects.title,
+            WorkTypeField::Author => subjects.author,
+            WorkTypeField::Url => subjects.url,
+            WorkTypeField::NovelType => subjects.novel_type,
+            WorkTypeField::EpisodeCount => subjects.episode_count,
+            WorkTypeField::Source => subjects.source,
+        }
+    }
+}
+
+/// 分類規則が照合する作品情報。
+///
+/// 取得パイプラインが組み立て、規則の `field` で選んだ値を照合する。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorkTypeSubjects<'a> {
+    /// 作品 ID (ncode)。
+    pub ncode: &'a str,
+    /// 題名。
+    pub title: &'a str,
+    /// 作者名。
+    pub author: &'a str,
+    /// 作品 URL。
+    pub url: &'a str,
+    /// 種別コード (1 = 連載, 2 = 短編)。
+    pub novel_type: &'a str,
+    /// 話数。
+    pub episode_count: &'a str,
+    /// 前処理済みの目次ページ。
+    pub source: &'a str,
+}
+
+/// 一致した作品の属性。未指定・未一致時は小説。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkType {
+    Novel,
+    Manga,
+}
+
+impl WorkType {
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Novel => crate::application::attribute_tags::NOVEL_TAG,
+            Self::Manga => crate::application::attribute_tags::MANGA_TAG,
+        }
+    }
+}
+
+/// `field` に選んだ値が `match` に一致すれば `type` を採用する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkTypeRule {
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub field: WorkTypeField,
+    #[serde(rename = "type")]
+    pub work_type: WorkType,
+}
+
+/// A URL template that may depend on the shape of the target URL.
+///
+/// Sites that expose several kinds of target under one domain (Pixiv has
+/// novels, novel series, artworks and manga series) need a different API URL
+/// for each. The list form picks the first entry whose `match` regex applies
+/// to the target URL; the plain string form is the single-template case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SiteUrlTemplate {
+    Single(String),
+    ByTarget {
+        by_target: Vec<SiteUrlTemplateEntry>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteUrlTemplateEntry {
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub url: String,
+}
+
+impl SiteUrlTemplate {
+    fn selected(&self, target_url: Option<&str>) -> Option<&str> {
+        match self {
+            SiteUrlTemplate::Single(url) => Some(url.as_str()),
+            SiteUrlTemplate::ByTarget { by_target } => by_target
+                .iter()
+                .find(|entry| {
+                    target_url.is_some_and(|target| {
+                        Regex::new(&entry.pattern)
+                            .map(|re| re.is_match(target))
+                            .unwrap_or(false)
+                    })
+                })
+                .map(|entry| entry.url.as_str()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +480,148 @@ pub enum SiteSettingEntry {
     Eval { eval: String },
 }
 
+/// プロセス内で有効なサイト定義。
+///
+/// `install_effective_site_settings` で確定させる。`PUT /api/sites` や定期的な
+/// 再読込で差し替えられるので、書き換え後は同じプロセスでも新しい定義を使う。
+/// 未設定のときは従来どおりファイルから読む ([`SiteSetting::load_all`]) ので、
+/// テストや単発のツールでも動く。
+///
+/// `fingerprint` は実効定義の YAML 内容から計算したハッシュで、差し替え元が
+/// 「同じ内容を再コンパイルする」無駄を省くために使う
+/// (`install_effective_site_settings_fingerprinted` 参照)。
+struct EffectiveSiteSettings {
+    settings: Arc<Vec<SiteSetting>>,
+    /// native のホットリロード専用 (`PUT /api/sites` 後の再コンパイル抑制)。
+    /// worker ビルドには差し替え元が無いので、フィールドごと落とす。
+    #[cfg(feature = "native-runtime")]
+    fingerprint: Option<u64>,
+}
+
+static EFFECTIVE_SITE_SETTINGS: RwLock<Option<EffectiveSiteSettings>> = RwLock::new(None);
+
+/// 有効なサイト定義を確定・差し替えする。
+pub fn install_effective_site_settings(settings: Vec<SiteSetting>) {
+    if let Ok(mut state) = EFFECTIVE_SITE_SETTINGS.write() {
+        *state = Some(EffectiveSiteSettings {
+            settings: Arc::new(settings),
+            #[cfg(feature = "native-runtime")]
+            fingerprint: None,
+        });
+    }
+}
+
+/// `fingerprint` 付きで差し替える。`fingerprint` は実効定義の並びから
+/// [`site_settings_fingerprint`] で計算した値を想定している。
+#[cfg(feature = "native-runtime")]
+pub(crate) fn install_effective_site_settings_fingerprinted(
+    settings: Vec<SiteSetting>,
+    fingerprint: u64,
+) {
+    if let Ok(mut state) = EFFECTIVE_SITE_SETTINGS.write() {
+        *state = Some(EffectiveSiteSettings {
+            settings: Arc::new(settings),
+            fingerprint: Some(fingerprint),
+        });
+    }
+}
+
+/// 実効定義が `fingerprint` と一致するか。未確定・ハッシュ不明なら `false`。
+#[cfg(feature = "native-runtime")]
+pub(crate) fn effective_site_settings_fingerprint_matches(fingerprint: u64) -> bool {
+    EFFECTIVE_SITE_SETTINGS
+        .read()
+        .ok()
+        .and_then(|state| state.as_ref().map(|s| s.fingerprint == Some(fingerprint)))
+        .unwrap_or(false)
+}
+
+/// 実効定義の並び `(name, yaml)` から差分検知用のハッシュを計算する。
+#[cfg(feature = "native-runtime")]
+pub(crate) fn site_settings_fingerprint(effective: &[(String, String)]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    effective.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 有効なサイト定義を `Arc` 共有で返す。未設定ならファイルから読む（失敗時は空）。
+pub(crate) fn effective_site_settings_shared() -> Arc<Vec<SiteSetting>> {
+    if let Ok(state) = EFFECTIVE_SITE_SETTINGS.read()
+        && let Some(state) = state.as_ref()
+    {
+        return state.settings.clone();
+    }
+    Arc::new(SiteSetting::load_all().unwrap_or_default())
+}
+
+/// 有効なサイト定義。未設定ならファイルから読む（失敗時は空）。
+pub fn effective_site_settings() -> Vec<SiteSetting> {
+    effective_site_settings_shared().as_ref().clone()
+}
+/// Preprocess marker carrying one work URL of an author listing.
+const AUTHOR_NOVEL_MARKER: &str = "author_novel::";
+/// Preprocess marker carrying a series whose pages must be left out.
+const AUTHOR_SERIES_MARKER: &str = "author_series::";
+/// Preprocess marker carrying a comic series whose pages must be left out.
+const AUTHOR_COMIC_SERIES_MARKER: &str = "author_comic_series::";
+
+/// bundle 定義とユーザー定義を 1 件マージした実効 YAML を返す。
+///
+/// native のフォルダ読み込み (`loader::load_all_from_dirs`) と core の
+/// `SiteDefinitions::effective_runtime()` が**共有する唯一の規則**で、
+/// どちらからでも同じ結果になる:
+///
+/// - ユーザー側に `version` が無ければマージする。
+/// - 有るときは bundle 側より低ければ「bundle 勝ち」の YAML をそのまま返す
+///   (同版 `>=` 以上ならマージ)。
+/// - `name` / `version` は bundle 定義の値を常に保つ (ユーザー側では上書き不可)。
+/// - どちらかの YAML が parse できなければ bundle の YAML をそのまま返す。
+pub fn merge_user_definition_yaml(bundled_yaml: &str, user_yaml: &str) -> String {
+    let Ok(mut bundled) = serde_yaml::from_str::<serde_yaml::Value>(bundled_yaml) else {
+        return bundled_yaml.to_string();
+    };
+    let Ok(user) = serde_yaml::from_str::<serde_yaml::Value>(user_yaml) else {
+        return bundled_yaml.to_string();
+    };
+    // `version` 無しの bundle は構造体の `#[serde(default)]` と同じ 0.0 扱い。
+    let bundled_version = bundled
+        .get("version")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    let user_version = user.get("version").and_then(|value| value.as_f64());
+    if user_version.is_some_and(|version| version < bundled_version) {
+        return bundled_yaml.to_string();
+    }
+    let (Some(base), Some(incoming)) = (bundled.as_mapping_mut(), user.as_mapping()) else {
+        return bundled_yaml.to_string();
+    };
+    for (key, value) in incoming {
+        if matches!(key.as_str(), Some("name" | "version")) {
+            continue;
+        }
+        base.insert(key.clone(), value.clone());
+    }
+    serde_yaml::to_string(&bundled).unwrap_or_else(|_| bundled_yaml.to_string())
+}
+
 impl SiteSetting {
+    /// Evaluate metadata rules without fetching the work. Manual updates bypass this policy.
+    pub fn allows_automatic_update(&self, record: &crate::db::NovelRecord) -> bool {
+        self.update_rules.iter().find_map(|rule| rule.decision(record)).unwrap_or(true)
+    }
+
+    /// この定義の並列DL系列。YAML の `site_family` を優先し、無ければ
+    /// ドメインから自動判定する。
+    pub fn download_site_family(&self) -> String {
+        if let Some(family) = self.site_family.as_deref() {
+            let family = family.trim().to_ascii_lowercase();
+            if !family.is_empty() {
+                return family;
+            }
+        }
+        crate::platform::site_family(&self.domain)
+    }
+
     pub fn load_all() -> Result<Vec<Self>> {
         let mut load_dirs = Vec::new();
 
@@ -173,6 +643,49 @@ impl SiteSetting {
         Ok(loader::load_all_from_dirs(load_dirs))
     }
 
+    /// Parse and compile bundled site definitions from YAML strings.
+    ///
+    /// Worker callers embed the `webnovel/*.yaml` files as static strings
+    /// (e.g. from `build.rs`) and supply them here; no filesystem access is
+    /// involved. User/bundled merge semantics are not applied — the caller
+    /// supplies the effective list. Fails loudly on any malformed definition
+    /// so a Worker never silently shrinks the supported site set.
+    pub fn load_bundled(contents: &[&str]) -> Result<Vec<Self>> {
+        let mut settings = Vec::new();
+        for content in contents {
+            let raw_yaml: serde_yaml::Value = serde_yaml::from_str(content)?;
+            settings.push(serde_yaml::from_value::<SiteSetting>(raw_yaml)?);
+        }
+        for setting in &mut settings {
+            setting.compile();
+        }
+        Ok(settings)
+    }
+
+    /// Bundle と、ストア等から読んだユーザー定義を**名前でマージ**して読み込む。
+    ///
+    /// 名前は `webnovel/<name>.yaml` の `<name>`。同じ名前はユーザー側が勝つ
+    /// (native の初期化フォルダではユーザーの `webnovel/` がそのまま使われる
+    /// ため、その関係を保存先が別でも再現する)。YAML が壊れていれば
+    /// [`Self::load_bundled`] と同じく失敗させる。
+    pub fn load_bundled_with_user(
+        bundled: &[(&str, &str)],
+        user: &[(String, String)],
+    ) -> Result<Vec<Self>> {
+        let mut merged: Vec<(String, String)> = bundled
+            .iter()
+            .map(|(name, content)| ((*name).to_string(), (*content).to_string()))
+            .collect();
+        for (name, content) in user {
+            match merged.iter_mut().find(|(existing, _)| existing == name) {
+                Some(entry) => entry.1 = content.clone(),
+                None => merged.push((name.clone(), content.clone())),
+            }
+        }
+        let contents: Vec<&str> = merged.iter().map(|(_, content)| content.as_str()).collect();
+        Self::load_bundled(&contents)
+    }
+
     pub(super) fn compile(&mut self) {
         if looks_like_pattern(&self.sitename) && self.sitename_pattern.is_none() {
             self.sitename_pattern = Some(SiteSettingValue::Single(self.sitename.clone()));
@@ -182,34 +695,60 @@ impl SiteSetting {
             match crate::downloader::preprocess::PreprocessPipeline::compile(src) {
                 Ok(pipeline) => self.compiled_preprocess = Some(pipeline),
                 Err(err) => {
-                    tracing::warn!(
-                        "preprocess compile failed for {}: {err}",
-                        self.name
-                    );
+                    tracing::warn!("preprocess compile failed for {}: {err}", self.name);
                 }
             }
         }
         self.compiled_url = self.compile_url_patterns();
         self.compiled_series_url = self.compile_url_patterns_for(self.series_url.as_ref());
+        self.compiled_author_url = self.compile_url_patterns_for(self.author_url.as_ref());
+        self.compiled_author_novel = self
+            .author_novel_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
+        self.compiled_author_next = self
+            .author_next_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
+        self.compiled_author_page_total = self
+            .author_page_total_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
+        self.compiled_author_series_episodes = self
+            .author_series_episodes_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
+        self.compiled_author_comic_pages = self
+            .author_comic_series_pages_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
         self.compiled_subtitles = self.subtitles.as_ref().and_then(|v| self.compile_value(v));
         self.compiled_body = self
             .body_pattern
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_introduction = self
             .introduction_pattern
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_postscript = self
             .postscript_pattern
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_error_message = self
             .error_message
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_over18_pattern = self
             .over18_pattern
+            .as_ref()
+            .and_then(|v| self.compile_value(v));
+        self.compiled_login_pattern = self
+            .login_pattern
+            .as_ref()
+            .and_then(|v| self.compile_value(v));
+        self.compiled_login_partial_pattern = self
+            .login_partial_pattern
             .as_ref()
             .and_then(|v| self.compile_value(v));
         self.compiled_next_toc = self.next_toc.as_deref().and_then(|s| Regex::new(s).ok());
@@ -217,6 +756,41 @@ impl SiteSetting {
             .toc_page_max
             .as_deref()
             .and_then(|s| Regex::new(s).ok());
+        self.compiled_work_type_rules = self.compile_work_type_rules();
+    }
+
+    fn compile_work_type_rules(&self) -> Vec<(WorkTypeField, Regex, WorkType)> {
+        let mut compiled = Vec::new();
+        for rule in &self.work_type_rules {
+            let pattern = rule.pattern.trim();
+            if pattern.is_empty() || pattern.len() > crate::downloader::security::MAX_YAML_REGEX_PATTERN_LEN {
+                tracing::warn!("invalid work_type_rules pattern for {}: {}", self.name, rule.pattern);
+                continue;
+            }
+            match RegexBuilder::new(pattern)
+                .dot_matches_new_line(true)
+                .multi_line(true)
+                .size_limit(crate::downloader::util::DEFAULT_REGEX_SIZE_LIMIT)
+                .build()
+            {
+                Ok(regex) => compiled.push((rule.field, regex, rule.work_type)),
+                Err(error) => tracing::warn!(
+                    "work_type_rules pattern failed to compile for {}: {} ({error})",
+                    self.name, rule.pattern
+                ),
+            }
+        }
+        compiled
+    }
+
+    /// 最初に一致する分類を使い、定義なし・未一致の場合は小説とする。
+    pub fn work_type_for(&self, subjects: &WorkTypeSubjects<'_>) -> WorkType {
+        self.compiled_work_type_rules.iter()
+            .find_map(|(field, pattern, work_type)| {
+                let value = field.value(subjects);
+                (!value.is_empty() && pattern.is_match(value)).then_some(*work_type)
+            })
+            .unwrap_or(WorkType::Novel)
     }
 
     pub(crate) fn site_timezone(&self) -> super::SiteTimezone {
@@ -295,6 +869,253 @@ impl SiteSetting {
         self.compiled_series_url.iter().any(|re| re.is_match(url))
     }
 
+    /// Whether `url` is this site's author page.
+    pub fn matches_author_url(&self, url: &str) -> bool {
+        self.compiled_author_url.iter().any(|re| re.is_match(url))
+    }
+
+    /// Fetch target for `page_url`: the author API when the definition has
+    /// one, otherwise the page itself.
+    pub fn author_fetch_url(&self, page_url: &str) -> String {
+        let Some(template) = self.author_api_url.as_deref() else {
+            return page_url.to_string();
+        };
+        let captures = self.extract_author_url_captures(page_url).unwrap_or_default();
+        self.interpolate_with_captures(template, &captures)
+    }
+
+    /// Next page of an author listing, when the definition pages it.
+    /// Series the listing asked to check (`author_series::<id>` lines).
+    ///
+    /// Pixiv mixes the episodes of a series into the author's novel list; the
+    /// definition emits the series so those episodes can be left out.
+    pub fn author_series_ids(&self, source: &str) -> Vec<String> {
+        Self::marked_ids(source, AUTHOR_SERIES_MARKER)
+    }
+
+    /// Ids carried by `<marker><id>` lines of a preprocessed source.
+    fn marked_ids(source: &str, marker: &str) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for line in source.lines() {
+            if let Some(id) = line.trim().strip_prefix(marker) {
+                let id = id.trim().to_string();
+                if !id.is_empty() && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// URL of one series' episode list, for keeping its episodes out of the
+    /// author listing. `captures` come from `author_url`.
+    pub fn author_series_episodes_fetch_url(
+        &self,
+        captures: &HashMap<String, String>,
+        series_id: &str,
+    ) -> Option<String> {
+        let template = self.author_series_episodes_url.as_deref()?;
+        let mut named = captures.clone();
+        named.insert("series_id".to_string(), series_id.to_string());
+        Some(self.interpolate_with_captures(template, &named))
+    }
+
+    /// Full work URLs found in a series' episode list.
+    pub fn author_series_episode_urls(&self, source: &str) -> Vec<String> {
+        self.extract_author_member_urls(
+            source,
+            self.compiled_author_series_episodes.as_ref(),
+            self.author_series_episode_work_url.as_deref(),
+        )
+    }
+
+    /// Comic series the listing asked to check (`author_comic_series::<id>`).
+    pub fn author_comic_series_ids(&self, source: &str) -> Vec<String> {
+        Self::marked_ids(source, AUTHOR_COMIC_SERIES_MARKER)
+    }
+
+    /// URL of one page of a comic series' page list.
+    pub fn author_comic_series_pages_fetch_url(
+        &self,
+        captures: &HashMap<String, String>,
+        series_id: &str,
+        page: usize,
+    ) -> Option<String> {
+        let template = self.author_comic_series_pages_url.as_deref()?;
+        let mut named = captures.clone();
+        named.insert("series_id".to_string(), series_id.to_string());
+        named.insert("page".to_string(), page.to_string());
+        Some(self.interpolate_with_captures(template, &named))
+    }
+
+    /// Full artwork URLs found in one page of a comic series' page list.
+    pub fn author_comic_series_page_urls(&self, source: &str) -> Vec<String> {
+        self.extract_author_member_urls(
+            source,
+            self.compiled_author_comic_pages.as_ref(),
+            self.author_comic_series_page_work_url.as_deref(),
+        )
+    }
+
+    fn extract_author_member_urls(
+        &self,
+        source: &str,
+        pattern: Option<&Regex>,
+        template: Option<&str>,
+    ) -> Vec<String> {
+        let Some(pattern) = pattern else {
+            return Vec::new();
+        };
+        pattern
+            .captures_iter(source)
+            .filter_map(|captures| {
+                if let Some(url) = captures.name("novel_url") {
+                    return Some(crate::downloader::util::decode_html_text(url.as_str()));
+                }
+                let template = template?;
+                let named: HashMap<String, String> = pattern
+                    .capture_names()
+                    .flatten()
+                    .filter_map(|name| {
+                        captures
+                            .name(name)
+                            .map(|value| (name.to_string(), value.as_str().to_string()))
+                    })
+                    .collect();
+                Some(self.interpolate_with_captures(template, &named))
+            })
+            .filter(|url| !url.is_empty())
+            .collect()
+    }
+
+    pub fn author_next_url(&self, source: &str) -> Option<String> {
+        let pattern = self.compiled_author_next.as_ref()?;
+        let captures = pattern.captures(source)?;
+        captures
+            .name("author_next")
+            .map(|matched| crate::downloader::util::decode_html_text(matched.as_str()))
+            .filter(|url| !url.is_empty())
+            .map(|url| self.resolve_author_page_url(&url))
+    }
+
+    /// Pager captures are page hrefs and may be site-relative (`/users/x?page=2`,
+    /// `//host/...`). The listing fetcher needs an absolute URL; resolve the
+    /// same way `build_section_url` does for TOC links. Bare relative paths join
+    /// `top_url` (site-root-relative, like the site's own links are written).
+    fn resolve_author_page_url(&self, url: &str) -> String {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            url.to_string()
+        } else if let Some(host_and_path) = url.strip_prefix("//") {
+            format!("{}://{}", self.top_url().split("://").next().unwrap_or("https"), host_and_path)
+        } else if let Some(path) = url.strip_prefix('/') {
+            format!("{}/{}", self.top_url().trim_end_matches('/'), path)
+        } else {
+            format!("{}/{}", self.top_url().trim_end_matches('/'), url)
+        }
+    }
+
+    /// Fetch URL of one continued page of an offset-paged author listing.
+    ///
+    /// `st` is the 1-based start offset: the number of works already read
+    /// plus one, so a listing that pages every 500 works asks for 501 next.
+    pub fn author_page_fetch_url(
+        &self,
+        captures: &HashMap<String, String>,
+        st: usize,
+    ) -> Option<String> {
+        let template = self.author_page_url.as_deref()?;
+        let mut named = captures.clone();
+        named.insert("st".to_string(), st.to_string());
+        Some(self.interpolate_with_captures(template, &named))
+    }
+
+    /// Total number of works the listing says it has (`count` capture).
+    ///
+    /// Sites group thousands with commas (`8,597作品`), so the captured digits
+    /// are read with the separators removed; a count that still does not parse
+    /// means "unknown", not zero.
+    pub fn author_page_total(&self, source: &str) -> Option<usize> {
+        let pattern = self.compiled_author_page_total.as_ref()?;
+        let captures = pattern.captures(source)?;
+        let count = captures.name("count")?.as_str();
+        count.replace(',', "").parse().ok()
+    }
+
+    /// Captures of `author_url` for a concrete author page.
+    pub fn extract_author_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
+        extract_captures_from_patterns(&self.compiled_author_url, url)
+    }
+
+    /// 作者ページ（またはその API 応答）から作品 URL を抜く。
+    ///
+    /// 定義が無ければ None。`novel_url` を capture しない定義では
+    /// `author_work_url` に capture を流し込んで URL を作る。
+    pub fn author_novel_urls(&self, source: &str) -> Option<Vec<String>> {
+        // `preprocess:` の DSL が `author_novel::<url>` を出すサイト (Pixiv) は
+        // パターン無しでも作品を列挙できる。列挙する口 (API + DSL) が
+        // 定義されていなければ「対応していない」と答える。
+        let declared = self.compiled_author_novel.is_some()
+            || (self.author_api_url.is_some() && self.preprocess_pipeline().is_some());
+        if !declared {
+            return None;
+        }
+        let mut urls: Vec<String> = Vec::new();
+        for line in source.lines() {
+            if let Some(url) = line.trim().strip_prefix(AUTHOR_NOVEL_MARKER) {
+                let url = crate::downloader::util::decode_html_text(url.trim());
+                if !url.is_empty() && !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+        }
+        let Some(pattern) = self.compiled_author_novel.as_ref() else {
+            return Some(urls);
+        };
+        for captures in pattern.captures_iter(source) {
+            let named: HashMap<String, String> = pattern
+                .capture_names()
+                .flatten()
+                .filter_map(|name| {
+                    captures
+                        .name(name)
+                        .map(|value| (name.to_string(), value.as_str().to_string()))
+                })
+                .collect();
+            let url = match named.get("novel_url") {
+                // href は `&amp;` のまま取れることがある (実ページの書き方次第)。
+                Some(url) => crate::downloader::util::decode_html_text(url),
+                None => {
+                    let Some(template) = self.author_work_url.as_deref() else {
+                        continue;
+                    };
+                    self.interpolate_with_captures(template, &named)
+                }
+            };
+            if !url.is_empty() && !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        Some(urls)
+    }
+
+    /// The number of work entries the listing shows (`author_novel_urls` is
+    /// unique-per-page; this counts every entry, including duplicates).
+    /// The declared total counts listed entries, so the total check uses this.
+    pub fn author_novel_entry_count(&self, source: &str) -> usize {
+        let mut entries = 0;
+        for line in source.lines() {
+            if let Some(url) = line.trim().strip_prefix(AUTHOR_NOVEL_MARKER)
+                && !crate::downloader::util::decode_html_text(url.trim()).is_empty()
+            {
+                entries += 1;
+            }
+        }
+        if let Some(pattern) = self.compiled_author_novel.as_ref() {
+            entries += pattern.captures_iter(source).count();
+        }
+        entries
+    }
+
     pub fn debug_url_pattern(&self) -> Option<String> {
         self.compiled_url.first().map(|r| r.as_str().to_string())
     }
@@ -315,7 +1136,20 @@ impl SiteSetting {
     }
 
     pub fn toc_url(&self) -> String {
-        self.interpolate(&self.toc_url)
+        match self.toc_url.selected(None) {
+            Some(template) => self.interpolate(template),
+            None => String::new(),
+        }
+    }
+
+    /// Resolve `toc_url` for a concrete target URL, so definitions with several
+    /// target shapes pick the right API endpoint. The selected template is also
+    /// exposed as `\k<toc_url>` so `novel_info_url: \k<toc_url>` keeps working.
+    pub fn toc_url_with_url_captures(&self, url: &str) -> Option<String> {
+        let mut captures = self.extract_url_captures(url)?;
+        let template = self.toc_url.selected(Some(url))?.to_string();
+        captures.insert("toc_url".to_string(), template.clone());
+        Some(self.interpolate_with_captures(&template, &captures))
     }
 
     pub fn extract_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
@@ -324,11 +1158,6 @@ impl SiteSetting {
 
     pub fn extract_series_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
         extract_captures_from_patterns(&self.compiled_series_url, url)
-    }
-
-    pub fn toc_url_with_url_captures(&self, url: &str) -> Option<String> {
-        let captures = self.extract_url_captures(url)?;
-        Some(self.interpolate_with_captures(&self.toc_url, &captures))
     }
 
     pub fn compile_series_item_pattern(&self) -> Option<Regex> {
@@ -365,16 +1194,30 @@ impl SiteSetting {
                 captures.insert(name.to_string(), m.as_str().to_string());
             }
         }
-        (!captures.is_empty()).then(|| self.interpolate_with_captures(&self.toc_url, &captures))
+        (!captures.is_empty()).then(|| {
+            let template = self.toc_url.selected(None).unwrap_or_default();
+            self.interpolate_with_captures(template, &captures)
+        })
     }
 
+    /// Resolve `novel_info_url`. `\k<toc_url>` inside it means "the same page as
+    /// the table of contents", so the template for the current target is
+    /// substituted first — a definition with several target shapes must not
+    /// resolve it to another shape's endpoint.
     pub fn novel_info_url_with_captures(
         &self,
         url_captures: &HashMap<String, String>,
     ) -> Option<String> {
+        let mut captures = url_captures.clone();
+        if let Some(template) = self
+            .toc_url
+            .selected(captures.get("__target_url").map(String::as_str))
+        {
+            captures.insert("toc_url".to_string(), template.to_string());
+        }
         self.novel_info_url
             .as_ref()
-            .map(|u| self.interpolate_with_captures(u, url_captures))
+            .map(|u| self.interpolate_with_captures(u, &captures))
     }
 
     pub fn top_url(&self) -> String {
@@ -391,6 +1234,60 @@ impl SiteSetting {
 
     pub fn cookie(&self) -> Option<&str> {
         self.cookie.as_deref()
+    }
+
+    /// Site-declared request headers, in a stable order, with `\k<...>`
+    /// placeholders resolved (the values usually embed `top_url`).
+    pub fn header_list(&self) -> Vec<(String, String)> {
+        self.headers
+            .iter()
+            .flat_map(|map| map.iter())
+            .map(|(name, value)| (name.clone(), self.interpolate(value)))
+            .collect()
+    }
+
+    /// Login page for this site, with `\k<...>` placeholders resolved.
+    pub fn login_url(&self) -> Option<String> {
+        self.login_url.as_ref().map(|url| self.interpolate(url))
+    }
+
+    pub fn compiled_login_pattern(&self) -> Option<&Regex> {
+        self.compiled_login_pattern.as_ref()
+    }
+
+    /// Whether `source` is the site's login wall: a page that was served
+    /// successfully but asks for authentication.
+    pub fn is_login_wall(&self, source: &str) -> bool {
+        self.compiled_login_pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(source))
+    }
+
+    /// Error produced when a login/challenge wall remains after every stored
+    /// credential was tried.
+    ///
+    /// The site's `login_wall_error` decides what the wall means: the
+    /// narou.rb-compatible `not_found` (the default) treats the novel as
+    /// private/deleted, while `login` reports an authentication problem so
+    /// the record is neither deleted nor frozen.
+    pub fn login_wall_failure(&self) -> crate::error::NarouError {
+        match self.login_wall_error {
+            LoginWallError::Login => crate::error::NarouError::Login(format!(
+                "{} はブラウザ確認またはログインが必要です。narou_rs_login で Cookie を更新してください",
+                self.sitename
+            )),
+            LoginWallError::NotFound => crate::error::NarouError::NotFound(
+                "Novel deleted or private".into(),
+            ),
+        }
+    }
+
+    /// Whether `source` shows only part of the list because the request was
+    /// anonymous.
+    pub fn is_partial_login_view(&self, source: &str) -> bool {
+        self.compiled_login_partial_pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(source))
     }
 
     pub fn error_message(&self) -> Option<&str> {
@@ -413,6 +1310,25 @@ impl SiteSetting {
         self.postscript_pattern.as_deref()
     }
 
+    /// Section-extraction patterns compiled once at load with the same flags
+    /// `compile_html_pattern` applies (dot-matches-newline + size limit).
+    /// These replace per-section `compile_html_pattern` calls.
+    pub fn compiled_body_pattern(&self) -> Option<&Regex> {
+        self.compiled_body.as_ref()
+    }
+
+    pub fn compiled_introduction_pattern(&self) -> Option<&Regex> {
+        self.compiled_introduction.as_ref()
+    }
+
+    pub fn compiled_postscript_pattern(&self) -> Option<&Regex> {
+        self.compiled_postscript.as_ref()
+    }
+
+    pub fn compiled_error_message_pattern(&self) -> Option<&Regex> {
+        self.compiled_error_message.as_ref()
+    }
+
     pub fn subtitles_pattern(&self) -> Option<&Regex> {
         self.compiled_subtitles.as_ref()
     }
@@ -432,7 +1348,11 @@ impl SiteSetting {
     }
 
     pub fn get_toc_url_with_captures(&self, captures: &HashMap<String, String>) -> String {
-        self.interpolate_with_captures(&self.toc_url, captures)
+        let target = captures.get("__target_url").map(String::as_str);
+        match self.toc_url.selected(target) {
+            Some(template) => self.interpolate_with_captures(template, captures),
+            None => String::new(),
+        }
     }
 
     pub fn get_next_url_with_captures(
@@ -465,6 +1385,176 @@ fn extract_captures_from_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn author_page_works_are_extracted_from_the_page_or_its_api() {
+        // API を持たないサイト向け: 作者ページの HTML から作品 URL を拾う。
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            "name: Example\nsitename: Example\ndomain: example.com\ntop_url: https://example.com\ntoc_url: \\k<top_url>/\\k<ncode>/\n\
+             author_url: ^https?://example\\.com/user/(?<author_id>\\d+)/\n\
+             author_novel_pattern: (?<novel_url>https?://example\\.com/n\\d+[a-z]+/)\n",
+        )
+        .expect("synthetic definition");
+        setting.compile();
+        assert!(setting.matches_author_url("https://example.com/user/2842627/"));
+        assert!(!setting.matches_author_url("https://example.com/n0915mt/"));
+
+        let html = r#"
+            <a href="https://example.com/n0915mt/">作品1</a>
+            <a href="https://example.com/n1261ku/">作品2</a>
+            <a href="https://example.com/n0915mt/">作品1 (再掲)</a>
+        "#;
+        assert_eq!(
+            setting.author_novel_urls(html).expect("pattern"),
+            vec![
+                "https://example.com/n0915mt/".to_string(),
+                "https://example.com/n1261ku/".to_string()
+            ]
+        );
+
+        // API 向け: capture から `author_work_url` で URL を組み立てる。
+        let mut api: SiteSetting = serde_yaml::from_str(
+            "name: Api\nsitename: Api\ndomain: api.example.com\ntop_url: https://example.com\ntoc_url: \\k<top_url>/\\k<ncode>/\n\
+             author_url: ^https?://example\\.com/user/(?<author_id>\\d+)/\n\
+             author_novel_pattern: '\"ncode\":\"(?<ncode>[nN]\\d+[A-Za-z]+)\"'\n\
+             author_work_url: \\k<top_url>/\\k<lower:ncode>/\n",
+        )
+        .expect("synthetic api definition");
+        api.compile();
+        assert_eq!(
+            api.author_fetch_url("https://example.com/user/2842627/"),
+            "https://example.com/user/2842627/",
+            "author_api_url が無ければ作者ページをそのまま取得する"
+        );
+        assert_eq!(
+            api.author_novel_urls(r#"[{"ncode":"N5181MT"},{"ncode":"N6275MR"}]"#)
+                .expect("pattern"),
+            vec![
+                "https://example.com/n5181mt/".to_string(),
+                "https://example.com/n6275mr/".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_login_pattern_detects_an_incomplete_listing() {
+        let yaml = r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<url>
+login_partial_pattern: ^login_partial::1$
+"#;
+        let mut setting: SiteSetting = serde_yaml::from_str(yaml).unwrap();
+        setting.compile();
+
+        assert!(setting.is_partial_login_view("login_partial::1\nEpisode;1;..."));
+        assert!(!setting.is_partial_login_view("Episode;1;..."));
+
+        // Definitions without the key never report a partial view.
+        let mut plain: SiteSetting = serde_yaml::from_str(
+            "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: x\\k<url>\n",
+        )
+        .unwrap();
+        plain.compile();
+        assert!(!plain.is_partial_login_view("login_partial::1"));
+    }
+
+    #[test]
+    fn login_wall_error_parses_and_defaults_to_not_found() {
+        let login = SiteSetting::load_bundled(&[r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<ncode>
+login_wall_error: login
+"#])
+        .unwrap()
+        .remove(0);
+        assert_eq!(login.login_wall_error, LoginWallError::Login);
+        assert!(matches!(
+            login.login_wall_failure(),
+            crate::error::NarouError::Login(_)
+        ));
+
+        let default = SiteSetting::load_bundled(&[r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<ncode>
+"#])
+        .unwrap()
+        .remove(0);
+        assert_eq!(default.login_wall_error, LoginWallError::NotFound);
+        assert!(matches!(
+            default.login_wall_failure(),
+            crate::error::NarouError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn a_login_pattern_marks_the_login_wall() {
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: x\\k<url>\nlogin_pattern: ログインが必要です\n",
+        )
+        .unwrap();
+        setting.compile();
+
+        assert!(setting.is_login_wall("<h1>ログインが必要です</h1>"));
+        assert!(!setting.is_login_wall("<h1>本文</h1>"));
+    }
+
+    #[test]
+    fn a_user_definition_below_the_bundled_version_is_ignored() {
+        // 同梱定義を更新したら version を上げる必要がある理由を固定する:
+        // ユーザー側が古い (<) ときは無視され、同版以上 (>=) のときだけ
+        // キー単位で上書きマージされる。
+        let root = std::env::temp_dir().join(format!(
+            "narou_rs_site_setting_version_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundled = root.join("bundled").join("webnovel");
+        let user = root.join("user").join("webnovel");
+        std::fs::create_dir_all(&bundled).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+
+        let definition = |version: &str, author_url: &str| {
+            format!(
+                "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: https://example.com/\\k<ncode>/\nversion: {version}\nauthor_url: {author_url}\n"
+            )
+        };
+        std::fs::write(
+            bundled.join("example.yaml"),
+            definition("2.4", "^https?://example\\.com/bundled/"),
+        )
+        .unwrap();
+        // 古いユーザー定義: 同梱版より低いので無視される。
+        std::fs::write(
+            user.join("example.yaml"),
+            definition("2.3", "^https?://example\\.com/user/old/"),
+        )
+        .unwrap();
+        let settings = loader::load_all_from_dirs(vec![bundled.clone(), user.clone()]);
+        let setting = settings.iter().find(|s| s.name == "Example").unwrap();
+        assert!(setting.matches_author_url("https://example.com/bundled/"));
+        assert!(!setting.matches_author_url("https://example.com/user/old/"));
+
+        // 同じ版のユーザー定義: そのキーが優先される。
+        std::fs::write(
+            user.join("example.yaml"),
+            definition("2.4", "^https?://example\\.com/user/new/"),
+        )
+        .unwrap();
+        let settings = loader::load_all_from_dirs(vec![bundled, user]);
+        let setting = settings.iter().find(|s| s.name == "Example").unwrap();
+        assert!(setting.matches_author_url("https://example.com/user/new/"));
+        assert!(!setting.matches_author_url("https://example.com/bundled/"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn user_webnovel_yaml_merges_over_bundled_yaml_by_name() {
@@ -575,9 +1665,7 @@ toc_url: https://example.com/works/\\k<ncode>
         .unwrap();
         setting.compile();
 
-        assert!(setting.matches_series_url(
-            "https://example.com/users/author/collections/12345"
-        ));
+        assert!(setting.matches_series_url("https://example.com/users/author/collections/12345"));
         let pattern = setting.compile_series_item_pattern().unwrap();
         let caps = pattern
             .captures(r#"<a class="item" href="/works/67890">title</a>"#)
@@ -617,14 +1705,175 @@ toc_url: https://example.com/works/\\k<ncode>
 
         let narou_pattern = narou.compile_series_item_pattern().unwrap();
         assert!(
-            narou_pattern
-                .is_match(r#"<a href="https://ncode.syosetu.com/n7826bd/">title</a>"#)
+            narou_pattern.is_match(r#"<a href="https://ncode.syosetu.com/n7826bd/">title</a>"#)
         );
         let novel18_pattern = novel18.compile_series_item_pattern().unwrap();
         assert!(
-            novel18_pattern
-                .is_match(r#"<a href="https://novel18.syosetu.com/n0001aa/">title</a>"#)
+            novel18_pattern.is_match(r#"<a href="https://novel18.syosetu.com/n0001aa/">title</a>"#)
         );
         assert!(novel18_pattern.is_match(r#"<a href="/n3412lp/">title</a>"#));
+    }
+
+    /// Bundle とユーザー定義のマージ: 同名はユーザーが勝ち、新規名は追加される。
+    #[test]
+    fn bundled_and_user_definitions_merge_by_name() {
+        let bundled = [
+            (
+                "example.com",
+                "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Bundled\ntoc_url: https://example.com/\\k<url>\n",
+            ),
+            (
+                "other.com",
+                "name: Other\ndomain: other.com\ntop_url: https://other.com\nsitename: Other\ntoc_url: https://other.com/\\k<url>\n",
+            ),
+        ];
+        let user = vec![
+            (
+                "example.com".to_string(),
+                "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: User\ntoc_url: https://example.com/\\k<url>\n"
+                    .to_string(),
+            ),
+            (
+                "new.com".to_string(),
+                "name: New\ndomain: new.com\ntop_url: https://new.com\nsitename: New\ntoc_url: https://new.com/\\k<url>\n"
+                    .to_string(),
+            ),
+        ];
+
+        let settings = SiteSetting::load_bundled_with_user(&bundled, &user).unwrap();
+        assert_eq!(settings.len(), 3);
+        let example = settings
+            .iter()
+            .find(|setting| setting.domain == "example.com")
+            .expect("bundled site stays");
+        assert_eq!(example.sitename, "User", "the user definition must win");
+        assert!(settings.iter().any(|setting| setting.domain == "other.com"));
+        assert!(settings.iter().any(|setting| setting.domain == "new.com"));
+    }
+
+    /// 壊れたユーザー定義は黙って落とさず失敗させる (Worker は readiness で気付ける)。
+    #[test]
+    fn broken_user_definitions_fail_loudly() {
+        let bundled = [(
+            "example.com",
+            "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: https://example.com/\\k<url>\n",
+        )];
+        let user = vec![("broken.com".to_string(), "name: Broken\n".to_string())];
+        assert!(SiteSetting::load_bundled_with_user(&bundled, &user).is_err());
+    }
+
+    #[test]
+    fn site_family_prefers_the_yaml_override_and_falls_back_to_domain() {
+        let settings = SiteSetting::load_all().unwrap();
+        let narou = settings
+            .iter()
+            .find(|setting| setting.domain == "ncode.syosetu.com")
+            .expect("narou definition");
+        assert_eq!(narou.download_site_family(), "syosetu.com");
+        let pixiv = settings
+            .iter()
+            .find(|setting| setting.domain == "www.pixiv.net")
+            .expect("pixiv definition");
+        assert_eq!(pixiv.download_site_family(), "pixiv.net");
+        let kakuyomu = settings
+            .iter()
+            .find(|setting| setting.domain == "kakuyomu.jp")
+            .expect("kakuyomu definition");
+        assert_eq!(kakuyomu.download_site_family(), "kakuyomu.jp");
+
+        let custom: SiteSetting = serde_yaml::from_str(
+            "name: Custom\ndomain: novel.custom.example\ntop_url: https://novel.custom.example\nsitename: Custom\ntoc_url: https://novel.custom.example/\\k<url>\nsite_family: custom.example\n",
+        )
+        .unwrap();
+        assert_eq!(custom.download_site_family(), "custom.example");
+    }
+
+    #[test]
+    fn work_type_rules_use_first_match_and_default_to_novel() {
+        let yaml = r#"
+name: Tagged
+domain: tagged.example
+top_url: https://tagged.example
+sitename: Tagged
+toc_url: https://tagged.example/\k<url>
+work_type_rules:
+  - field: ncode
+    match: '^special'
+    type: novel
+  - field: ncode
+    match: '^[acs]'
+    type: manga
+"#;
+        let settings = SiteSetting::load_bundled(&[yaml]).unwrap();
+        let setting = &settings[0];
+        let classify = |ncode: &str| setting.work_type_for(&WorkTypeSubjects { ncode, ..Default::default() });
+        assert_eq!(classify("a123"), WorkType::Manga);
+        assert_eq!(classify("c456"), WorkType::Manga);
+        assert_eq!(classify("special"), WorkType::Novel);
+        assert_eq!(classify("n123"), WorkType::Novel);
+        assert_eq!(classify(""), WorkType::Novel);
+    }
+
+    #[test]
+    fn work_type_rules_can_use_other_fields_and_preprocessed_source() {
+        for (field, value) in [
+            ("url", "/comic/"), ("novel_type", "2"), ("episode_count", "1"),
+            ("title", "題名"), ("author", "作者"), ("source", "category::comic"),
+        ] {
+            let yaml = format!(
+                "name: Test\ndomain: test.example\ntop_url: https://test.example\nsitename: Test\ntoc_url: https://test.example/\\k<url>\nwork_type_rules:\n  - field: {field}\n    match: '{value}'\n    type: manga\n"
+            );
+            let settings = SiteSetting::load_bundled(&[&yaml]).unwrap();
+            let subjects = WorkTypeSubjects {
+                ncode: "n123", url: "/comic/", novel_type: "2", episode_count: "1",
+                title: "題名", author: "作者", source: "category::comic",
+            };
+            assert_eq!(settings[0].work_type_for(&subjects), WorkType::Manga, "{field}");
+            assert_eq!(settings[0].work_type_for(&WorkTypeSubjects::default()), WorkType::Novel);
+        }
+    }
+
+    #[test]
+    fn the_bundled_pixiv_definition_classifies_all_work_shapes() {
+        let settings = SiteSetting::load_all().unwrap();
+        let pixiv = settings.iter().find(|setting| setting.domain == "www.pixiv.net").unwrap();
+        let classify = |ncode: &str| pixiv.work_type_for(&WorkTypeSubjects { ncode, ..Default::default() });
+        assert_eq!(classify("a140668719"), WorkType::Manga);
+        assert_eq!(classify("c311834"), WorkType::Manga);
+        assert_eq!(classify("n26352975"), WorkType::Novel);
+        assert_eq!(classify("s16299140"), WorkType::Novel);
+    }
+
+    #[test]
+    fn bool_fields_accept_narou_dialect_yes_no() {
+        // narou.rb の YAML 方言では真偽値に yes/no/on/off を書く。ユーザー定義が
+        // cookie_session: yes と書いても定義全体が読めなくならないこと。
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\ncookie_session: yes\npreserve_missing_sections: on\n",
+        ])
+        .expect("yes/no bools must parse");
+        assert!(settings[0].cookie_session);
+        assert!(settings[0].preserve_missing_sections);
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\ncookie_session: no\npreserve_missing_sections: off\n",
+        ])
+        .expect("no/off bools must parse");
+        assert!(!settings[0].cookie_session);
+        assert!(!settings[0].preserve_missing_sections);
+        // is_narou / illust_from_raw も同じ方言を受け付ける (以前は yes/no で
+        // 定義全体が読めなくなっていた)。
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\nis_narou: yes\nillust_from_raw: no\n",
+        ])
+        .expect("is_narou/illust_from_raw yes/no must parse");
+        assert!(settings[0].is_narou);
+        assert_eq!(settings[0].illust_from_raw, Some(false));
+        // 整数と null も Psych の真理値判定に合わせる (整数は真、null は偽)。
+        let settings = SiteSetting::load_bundled(&[
+            "name: T\nsitename: T\ndomain: t.example\ntop_url: https://t.example\ntoc_url: x\\k<url>\nis_narou: 1\nillust_from_raw: null\n",
+        ])
+        .expect("integer/null bools must parse");
+        assert!(settings[0].is_narou);
+        assert_eq!(settings[0].illust_from_raw, None);
     }
 }

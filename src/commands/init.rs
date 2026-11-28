@@ -2,6 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use narou_rs::error::Result;
+use narou_rs::setting_core::SettingScope;
 
 pub fn cmd_init(aozora_path: Option<&str>, line_height: Option<f64>) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -30,7 +31,7 @@ pub fn cmd_init(aozora_path: Option<&str>, line_height: Option<f64>) -> Result<(
 
     ensure_dot_narou_files(&root)?;
 
-    init_aozoraepub3_settings(aozora_path, line_height, already_root.is_some())?;
+    init_aozoraepub3_settings(&root, aozora_path, line_height, already_root.is_some())?;
 
     if already_root.is_none() {
         println!("初期化が完了しました！");
@@ -89,10 +90,10 @@ fn copy_bundled_webnovel_files(destination: &Path) -> Result<usize> {
 
 fn bundled_webnovel_dir() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("webnovel"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("webnovel"));
     }
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("webnovel"));
 
@@ -100,20 +101,12 @@ fn bundled_webnovel_dir() -> Option<PathBuf> {
 }
 
 fn init_aozoraepub3_settings(
+    root: &Path,
     aozora_path: Option<&str>,
     line_height: Option<f64>,
     force: bool,
 ) -> Result<()> {
-    let global_dir = home_dir().join(".narousetting");
-    let global_path = global_dir.join("global_setting.yaml");
-
-    let mut settings = if global_path.exists() {
-        let raw = std::fs::read_to_string(&global_path)?;
-        serde_yaml::from_str::<std::collections::BTreeMap<String, serde_yaml::Value>>(&raw)
-            .unwrap_or_default()
-    } else {
-        std::collections::BTreeMap::new()
-    };
+    let mut settings = narou_rs::db::settings::load_for_root(root, SettingScope::Global)?;
 
     if !force
         && aozora_path.is_none()
@@ -160,9 +153,7 @@ fn init_aozoraepub3_settings(
 
     rewrite_aozoraepub3_files(&resolved_aozora_path, height)?;
 
-    let content = serde_yaml::to_string(&settings)?;
-    std::fs::create_dir_all(&global_dir)?;
-    std::fs::write(global_path, content)?;
+    narou_rs::db::settings::save_for_root(root, SettingScope::Global, &settings)?;
     println!("グローバル設定を保存しました");
 
     Ok(())
@@ -170,7 +161,7 @@ fn init_aozoraepub3_settings(
 
 fn resolve_init_aozora_path(
     aozora_path: Option<&str>,
-    settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    settings: &std::collections::HashMap<String, serde_yaml::Value>,
 ) -> Result<Option<String>> {
     match aozora_path {
         Some(":keep") => Ok(settings
@@ -187,7 +178,7 @@ fn resolve_init_aozora_path(
 }
 
 fn ask_aozoraepub3_path(
-    settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    settings: &std::collections::HashMap<String, serde_yaml::Value>,
 ) -> Result<Option<String>> {
     let current_path = settings
         .get("aozoraepub3dir")
@@ -223,9 +214,7 @@ fn ask_aozoraepub3_path(
     }
 }
 
-fn ask_line_height(
-    settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
-) -> Result<f64> {
+fn ask_line_height(settings: &std::collections::HashMap<String, serde_yaml::Value>) -> Result<f64> {
     let default = settings
         .get("line-height")
         .and_then(|value| value.as_f64())
@@ -236,7 +225,10 @@ fn ask_line_height(
     println!("1em = 1文字分の高さ");
     println!("行の高さ＝1文字分の高さ＋行間の高さ");
     println!("オススメは 1.8");
-    println!("(未入力で {} を採用)", format_line_height(default));
+    println!(
+        "(未入力で {} を採用)",
+        narou_rs::converter::settings::format_line_height(default)
+    );
 
     loop {
         print!(">");
@@ -268,22 +260,38 @@ fn validate_aozoraepub3_path(path: &str) -> Option<String> {
         std::env::current_dir().ok()?.join(candidate)
     };
     let canonical = std::fs::canonicalize(&candidate).ok()?;
-    let jar_path = canonical.join("AozoraEpub3.jar");
-    if !jar_path.is_file() {
-        return None;
+    for dir_candidate in [canonical.clone(), canonical.join("app")] {
+        let Ok(canonical_target) = std::fs::canonicalize(&dir_candidate) else {
+            continue;
+        };
+        if !canonical_target.starts_with(&canonical) {
+            continue;
+        }
+        let jar_path = canonical_target.join("AozoraEpub3.jar");
+        if !jar_path.is_file() {
+            continue;
+        }
+        if let Some(parent) = jar_path.parent()
+            && let Ok(jar_parent) = std::fs::canonicalize(parent)
+            && jar_parent == canonical_target
+        {
+            return Some(canonical_target.display().to_string());
+        }
     }
-    let jar_parent = std::fs::canonicalize(jar_path.parent()?).ok()?;
-    if jar_parent != canonical {
-        return None;
-    }
-    Some(canonical.display().to_string())
+    None
 }
 
 fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> {
     let preset_dir = preset_dir()?;
-    let aozora_dir = PathBuf::from(aozora_path);
+    let aozora_dir = narou_rs::compat::resolve_aozora_assets_dir(Path::new(aozora_path))
+        .unwrap_or_else(|| PathBuf::from(aozora_path));
 
-    let custom_chuki_tag = std::fs::read_to_string(preset_dir.join("custom_chuki_tag.txt"))?;
+    let custom_chuki_tag = narou_rs::preset::read_chuki_tag(&preset_dir).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "narou custom chuki tag not found",
+        )
+    })?;
     let chuki_tag_path = aozora_dir.join("chuki_tag.txt");
     let mut chuki_tag = std::fs::read_to_string(&chuki_tag_path)?;
     let embedded_mark = "### Narou.rb embedded custom chuki ###";
@@ -304,22 +312,26 @@ fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> 
     }
     std::fs::write(&chuki_tag_path, chuki_tag)?;
 
-    std::fs::copy(
-        preset_dir.join("AozoraEpub3.ini"),
-        aozora_dir.join("AozoraEpub3.ini"),
-    )?;
-
-    let vertical_font = std::fs::read_to_string(preset_dir.join("vertical_font.css"))?
-        .replace("<%= line_height %>", &format_line_height(line_height));
-    let vertical_font_path = aozora_dir
-        .join("template")
-        .join("OPS")
-        .join("css_custom")
-        .join("vertical_font.css");
-    if let Some(parent) = vertical_font_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    // インストール先の INI は「利用者設定 → 同梱の既定値 → 埋め込みの既定値」
+    // の順で決める。利用者設定 (`preset/AozoraEpub3.ini`) は配布物に含まれない
+    // ので、セルフアップデートで編集内容が消えない (issue #45)。
+    let ini_target = aozora_dir.join("AozoraEpub3.ini");
+    match narou_rs::preset::ini_candidates(&preset_dir).first() {
+        Some(source) => {
+            std::fs::copy(source, &ini_target)?;
+        }
+        None => {
+            std::fs::write(&ini_target, narou_rs::preset::DEFAULT_INI)?;
+        }
     }
-    std::fs::write(vertical_font_path, vertical_font)?;
+
+    // AozoraEpub3 はテンプレート配置によってカスタム CSS の書き込み先が変わる。
+    // 1.1.1 以降の改造版 (電書協レイアウト) は `template/item/style_custom/font.css`
+    // でないと CSS (行高・二分アキなど) が EPUB に反映されないため、配置を
+    // 判定して正しいファイルへ書く (issue #42)。
+    let template_kind = narou_rs::converter::dakuten_font::detect_template_kind(&aozora_dir)
+        .unwrap_or(narou_rs::converter::dakuten_font::AozoraTemplateKind::Legacy);
+    narou_rs::converter::dakuten_font::install_normal_css(&aozora_dir, template_kind, line_height)?;
 
     println!("AozoraEpub3 の構成ファイルを書き換えました");
     Ok(())
@@ -327,10 +339,10 @@ fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> 
 
 fn preset_dir() -> Result<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("preset"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("preset"));
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     candidates.push(manifest_dir.join("preset"));
@@ -348,17 +360,26 @@ fn preset_dir() -> Result<PathBuf> {
         })
 }
 
-fn format_line_height(line_height: f64) -> String {
-    let mut text = line_height.to_string();
-    if text.contains('.') {
-        while text.ends_with('0') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.pop();
-        }
+fn normalize_path_string(path: &str) -> String {
+    path.trim().trim_matches('"').to_string()
+}
+
+fn is_disallowed_aozora_path(path: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
     }
-    text
+    path.starts_with("\\\\?\\")
+        || path.starts_with("\\\\")
+        || path
+            .as_bytes()
+            .get(1)
+            .copied()
+            .filter(|byte| *byte == b':')
+            .map(|_| {
+                let rest = &path[2..];
+                rest.is_empty() || !(rest.starts_with('\\') || rest.starts_with('/'))
+            })
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -394,6 +415,10 @@ mod tests {
         let aozora_dir = temp.path();
         std::fs::write(aozora_dir.join("AozoraEpub3.jar"), "").unwrap();
         std::fs::write(aozora_dir.join("chuki_tag.txt"), "base\n").unwrap();
+        // 元祖レイアウト (template/OPS/css/) の判定マーカー。
+        let legacy_css = aozora_dir.join("template/OPS/css/vertical_font.css");
+        std::fs::create_dir_all(legacy_css.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_css, "base\n").unwrap();
 
         rewrite_aozoraepub3_files(aozora_dir.to_str().unwrap(), 1.8).unwrap();
 
@@ -412,6 +437,38 @@ mod tests {
         )
         .unwrap();
         assert!(vertical.contains("line-height: 1.8em !important;"));
+        assert!(vertical.contains(".half_em_space"));
+    }
+
+    /// 1.1.1 以降の改造版 (電書協レイアウト) ではカスタム CSS を
+    /// `template/item/style_custom/font.css` に置かないと EPUB に反映されない。
+    /// 古い OPS パスへ書くと二分アキが効かないままになる (issue #42)。
+    #[test]
+    fn rewrite_aozoraepub3_files_uses_denshokyo_custom_css_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let aozora_dir = temp.path();
+        std::fs::write(aozora_dir.join("AozoraEpub3.jar"), "").unwrap();
+        std::fs::write(aozora_dir.join("chuki_tag.txt"), "base\n").unwrap();
+        let denshokyo_css = aozora_dir.join("template/item/style/font.css");
+        std::fs::create_dir_all(denshokyo_css.parent().unwrap()).unwrap();
+        std::fs::write(&denshokyo_css, "base\n").unwrap();
+
+        rewrite_aozoraepub3_files(aozora_dir.to_str().unwrap(), 1.7).unwrap();
+
+        let custom =
+            std::fs::read_to_string(aozora_dir.join("template/item/style_custom/font.css"))
+                .unwrap();
+        assert!(custom.contains("line-height: 1.7em !important;"));
+        assert!(
+            custom.contains(".vrtl .half_em_space"),
+            "電書協レイアウト用の二分アキ CSS が無い"
+        );
+        assert!(
+            !aozora_dir
+                .join("template/OPS/css_custom/vertical_font.css")
+                .exists(),
+            "電書協レイアウトで旧 OPS パスへ書いてしまっている"
+        );
     }
 
     #[test]
@@ -430,7 +487,9 @@ mod tests {
         let chuki = std::fs::read_to_string(aozora_dir.join("chuki_tag.txt")).unwrap();
         assert!(!chuki.contains("\nold\n"));
         assert_eq!(
-            chuki.matches("### Narou.rb embedded custom chuki ###").count(),
+            chuki
+                .matches("### Narou.rb embedded custom chuki ###")
+                .count(),
             2
         );
         assert!(chuki.contains("before\n"));
@@ -442,9 +501,11 @@ mod tests {
         let path = super::preset_dir().unwrap();
         let expected = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preset");
         assert_eq!(path, expected);
-        assert!(path.join("AozoraEpub3.ini").exists());
-        assert!(path.join("custom_chuki_tag.txt").exists());
+        assert!(path.join("AozoraEpub3.ini.default").exists());
+        assert!(path.join("custom_chuki_tag.txt.default").exists());
         assert!(path.join("vertical_font.css").exists());
+        assert!(path.join("denshokyo_font.css").exists());
+        assert!(path.join("denshokyo_font_with_dakuten.css").exists());
     }
 
     #[test]
@@ -456,7 +517,10 @@ mod tests {
 
         let validated = validate_aozoraepub3_path(aozora_dir.to_str().unwrap()).unwrap();
 
-        assert_eq!(std::path::PathBuf::from(validated), std::fs::canonicalize(aozora_dir).unwrap());
+        assert_eq!(
+            std::path::PathBuf::from(validated),
+            std::fs::canonicalize(aozora_dir).unwrap()
+        );
     }
 
     #[test]
@@ -469,7 +533,26 @@ mod tests {
 
         let validated = validate_aozoraepub3_path("Aozora").unwrap();
 
-        assert_eq!(std::path::PathBuf::from(validated), std::fs::canonicalize(aozora_dir).unwrap());
+        assert_eq!(
+            std::path::PathBuf::from(validated),
+            std::fs::canonicalize(aozora_dir).unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_aozoraepub3_path_accepts_jpackage_app_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("AozoraEpub3");
+        let app_dir = install_dir.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(install_dir.join("AozoraEpub3.exe"), "").unwrap();
+        std::fs::write(app_dir.join("AozoraEpub3.jar"), "").unwrap();
+
+        let validated = validate_aozoraepub3_path(install_dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(validated),
+            std::fs::canonicalize(&app_dir).unwrap()
+        );
     }
 
     #[cfg(windows)]
@@ -480,36 +563,4 @@ mod tests {
         assert!(validate_aozoraepub3_path(r"C:relative\Aozora").is_none());
         assert!(validate_aozoraepub3_path("C:").is_none());
     }
-}
-
-fn normalize_path_string(path: &str) -> String {
-    path.trim().trim_matches('"').to_string()
-}
-
-fn is_disallowed_aozora_path(path: &str) -> bool {
-    if !cfg!(windows) {
-        return false;
-    }
-    path.starts_with("\\\\?\\")
-        || path.starts_with("\\\\")
-        || path
-            .as_bytes()
-            .get(1)
-            .copied()
-            .filter(|byte| *byte == b':')
-            .map(|_| {
-                let rest = &path[2..];
-                rest.is_empty() || !(rest.starts_with('\\') || rest.starts_with('/'))
-            })
-            .unwrap_or(false)
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-        })
 }

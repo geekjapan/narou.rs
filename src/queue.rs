@@ -12,7 +12,6 @@ use crate::error::{NarouError, Result};
 
 const MAX_PENDING_JOBS: usize = 10_000;
 const MAX_JOB_TARGET_CHARS: usize = 16 * 1024;
-const DEFAULT_MAX_RETRIES: u32 = 3;
 pub const WEBUI_MESSAGE_TYPE_META_KEY: &str = "webui_message_type";
 pub const WEBUI_MESSAGE_TEXT_META_KEY: &str = "webui_message_text";
 pub const WEBUI_UPDATE_START_MESSAGE_TYPE: &str = "update_start";
@@ -193,10 +192,39 @@ impl PersistentQueue {
         Self::new(&path)
     }
 
-    fn load(&mut self) -> Result<()> {
+
+    /// P2: when the queue file lives in the active library root and the
+    /// SQLite state backend owns that root, persist the serialized payload
+    /// through `app_state('inv','queue')` instead of the file.
+    fn sqlite_state(&self) -> Option<crate::native::sqlite::state::StateDb> {
+        #[cfg(feature = "native-runtime")]
+        {
+            if crate::native::sqlite::state::legacy_yaml_active() {
+                return None;
+            }
+            let dir = self.path.parent()?;
+            crate::native::sqlite::state::active_for(dir)
+        }
+        #[cfg(not(feature = "native-runtime"))]
+        {
+            None
+        }
+    }
+
+    fn read_payload(&self) -> Result<Option<String>> {
+        if let Some(state) = self.sqlite_state() {
+            return state.get_raw("inv", "queue");
+        }
         if self.path.exists() {
             ensure_yaml_size_limit(&self.path)?;
-            let content = fs::read_to_string(&self.path)?;
+            Ok(Some(fs::read_to_string(&self.path)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn load(&mut self) -> Result<()> {
+        if let Some(content) = self.read_payload()? {
             let state = load_queue_state(&content)?;
             validate_queue_state(&state)?;
             *self.state.lock() = state;
@@ -205,11 +233,9 @@ impl PersistentQueue {
     }
 
     fn merge_external_pending_jobs(&self) -> Result<()> {
-        if !self.path.exists() {
+        let Some(content) = self.read_payload()? else {
             return Ok(());
-        }
-        ensure_yaml_size_limit(&self.path)?;
-        let content = fs::read_to_string(&self.path)?;
+        };
         let disk_state = load_queue_state(&content)?;
         validate_queue_state(&disk_state)?;
         let mut state = self.state.lock();
@@ -222,12 +248,22 @@ impl PersistentQueue {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let content =
             crate::db::inventory::serialize_yaml_content(&queue_state_to_legacy_file(&self.state.lock()))?;
-        atomic_write(&self.path, &content)?;
+        if (content.len() as u64) > crate::db::inventory::MAX_YAML_SIZE_BYTES {
+            return Err(NarouError::Database(format!(
+                "queue state exceeds maximum supported size ({} bytes)",
+                crate::db::inventory::MAX_YAML_SIZE_BYTES
+            )));
+        }
+        if let Some(state) = self.sqlite_state() {
+            state.set_raw("inv", "queue", &content)?;
+        } else {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(&self.path, &content)?;
+        }
         self.notify_changed();
         Ok(())
     }
@@ -256,7 +292,7 @@ impl PersistentQueue {
             .iter()
             .any(|job| {
                 job.job.job_type.lane() == lane
-                    && job.job.available_at.map_or(true, |at| at <= now)
+                    && job.job.available_at.is_none_or(|at| at <= now)
             })
     }
 
@@ -356,7 +392,7 @@ impl PersistentQueue {
             let index = state
                 .active_pending
                 .iter()
-                .position(|job| job.job.available_at.map_or(true, |at| at <= now))?;
+                .position(|job| job.job.available_at.is_none_or(|at| at <= now))?;
             let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
             let job = stored.job.clone();
@@ -388,7 +424,7 @@ impl PersistentQueue {
                 .position(|job| {
                     job.job.job_type.lane() == lane
                         && !is_blocked(&job.job)
-                        && job.job.available_at.map_or(true, |at| at <= now)
+                        && job.job.available_at.is_none_or(|at| at <= now)
                 })?;
             let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
@@ -1161,20 +1197,9 @@ fn build_stored_job(
 }
 
 fn configured_max_retries() -> u32 {
-    crate::compat::load_local_setting_value("queue.max-retries")
-        .and_then(parse_max_retries_value)
-        .unwrap_or(DEFAULT_MAX_RETRIES)
-}
-
-fn parse_max_retries_value(value: Value) -> Option<u32> {
-    let parsed = match value {
-        Value::Number(number) => number
-            .as_i64()
-            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
-        Value::String(raw) => raw.trim().parse::<i64>().ok(),
-        _ => None,
-    }?;
-    Some(parsed.clamp(0, u32::MAX as i64) as u32)
+    crate::application::retry_policy::max_retries(
+        crate::compat::load_local_setting_value("queue.max-retries").as_ref(),
+    )
 }
 
 fn build_legacy_task(
@@ -1233,7 +1258,7 @@ fn queue_job_to_legacy_parts(job_type: JobType, target: &str) -> (String, Vec<Va
     let parts = split_job_target(target);
     let (cmd, args) = match job_type {
         JobType::Download => {
-            if parts.first() == Some(&"--force") && !parts.iter().any(|part| *part == "--mail") {
+            if parts.first() == Some(&"--force") && !parts.contains(&"--mail") {
                 (
                     "download_force".to_string(),
                     parts[1..]
@@ -1297,17 +1322,17 @@ fn split_job_target(target: &str) -> Vec<&str> {
 
 /// Extract the set of numeric novel IDs from a queue job target string.
 ///
-/// Targets are tab-separated lists of arguments (see [`split_job_target`])
+/// Targets are tab-separated lists of arguments (see `split_job_target`)
 /// and may include non-numeric tokens such as `--force` or `tag:modified`.
 /// Only tokens that parse as `i64` are returned, so callers can use the
 /// resulting set to compare novel identities without worrying about flag
 /// or tag prefixes. An empty result means the job is not tied to any
 /// specific novel ID (e.g. `AutoUpdate` jobs that broadcast to the queue).
 pub fn extract_novel_ids(target: &str) -> HashSet<i64> {
-    target
-        .split('\t')
-        .filter_map(|part| part.parse::<i64>().ok())
-        .collect()
+    // Shared implementation lives with the job contract
+    // (`crate::application::jobs::extract_novel_ids`) so the Worker ledger
+    // applies the identical per-novel exclusion rule.
+    crate::application::jobs::extract_novel_ids(target)
 }
 
 fn flatten_values(values: &[Value]) -> Vec<String> {
@@ -1522,6 +1547,7 @@ mod tests {
 
     #[test]
     fn push_uses_queue_max_retries_local_setting() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let narou_dir = temp.path().join(".narou");
         std::fs::create_dir_all(&narou_dir).unwrap();
@@ -1739,7 +1765,7 @@ mod tests {
         assert_eq!(spec.cmd, "update_by_tag");
         assert_eq!(spec.args, vec!["tag:modified".to_string()]);
         assert_eq!(
-            spec.meta.get(&Value::String("source".to_string())),
+            spec.meta.get(Value::String("source".to_string())),
             Some(&Value::String("web".to_string()))
         );
     }
@@ -1852,6 +1878,7 @@ mod tests {
     #[test]
     fn queue_yaml_backward_compatible_when_available_at_missing() {
         let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         let queue_path = temp.path().join("queue.yaml");
 
         // Hand-written YAML mimicking a queue produced before the retry field

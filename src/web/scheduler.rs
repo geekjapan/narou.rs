@@ -5,53 +5,67 @@ use std::process::{ChildStderr, ChildStdout, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use serde_yaml::{Number, Value};
 use tokio::task::JoinHandle;
-
+use crate::application::messages::jobs as job_msgs;
+use crate::application::scheduler::{
+    CatchUp, DstGap, WallClockZone, parse_auto_update_schedule,
+};
+use crate::application::{JobKind, JobRequest, JobService, SchedulerService};
 use crate::compat::{
-    configure_web_subprocess_command, load_frozen_ids_from_inventory, load_local_setting_bool,
-    load_local_setting_string, load_local_setting_value, record_is_frozen,
+    configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
+    load_local_setting_value, record_is_frozen,
 };
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
-use crate::downloader::site_setting::SiteSetting;
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{JobType, PersistentQueue, QueueJob};
-use crate::termcolor::colored;
 
 use super::push::PushServer;
 use super::sort_state::{current_sort_from_server_setting, normalize_sort_key, sort_column_key};
 
 const AUTO_UPDATE_LAST_RUN_KEY: &str = "update.auto-schedule.last-run";
+
+/// native は DST ギャップを +1 分ずつ繰り上げる (共有既定の `Skip` は使わない)。
+const DST_GAP: DstGap = DstGap::RollForwardMinutes(1);
+
 pub fn start_auto_update_scheduler(
+    scheduler: Arc<SchedulerService>,
     queue: Arc<PersistentQueue>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     push_server: Arc<PushServer>,
 ) -> Option<JoinHandle<()>> {
     let enabled = load_local_setting_bool("update.auto-schedule.enable");
     let schedule_string = load_local_setting_string("update.auto-schedule")?;
-    if !enabled || schedule_string.trim().is_empty() {
-        return None;
-    }
+    let schedule = match parse_auto_update_schedule(enabled, &schedule_string) {
+        Ok(Some(schedule)) => schedule,
+        Ok(None) => return None,
+        Err(message) => {
+            // eprintln 経由でも同じ文言を出す (headless 実行時に stderr へ残す)。
+            eprintln!("{message}");
+            push_server.broadcast_echo(&message, "stdout");
+            return None;
+        }
+    };
 
-    let times = parse_schedule_times(&schedule_string);
-    if times.is_empty() {
-        eprintln!(
-            "自動アップデートスケジューラーの時刻指定が不正です: {}",
-            schedule_string
-        );
-        push_server.broadcast_echo(
-            &format!(
-                "自動アップデートスケジューラーの時刻指定が不正です: {}",
-                schedule_string
-            ),
-            "stdout",
-        );
-        return None;
-    }
-
-    let catch_up_run = missed_run_time(&times, load_last_auto_update_run(), Local::now());
+    let zone = match load_schedule_timezone(&push_server) {
+        Some(timezone) => WallClockZone::Iana(timezone),
+        None => WallClockZone::Local,
+    };
+    // native の判断材料だけをここに残す: last-run は epoch 秒、DST ギャップは
+    // +1 分丸め、last-run 未記録は catch-up しない (モードで共有層へ渡す)。
+    let policy = scheduler.policy(enabled, schedule, Vec::new());
+    let decision = scheduler.decide_with_modes(
+        &policy,
+        load_last_auto_update_run(),
+        zone,
+        DST_GAP,
+        CatchUp::SingleMissed,
+    );
+    let catch_up_run = decision
+        .missed_run
+        .map(|missed| missed.with_timezone(&Local));
     Some(tokio::spawn(async move {
         if let Some(missed_run) = catch_up_run {
             run_scheduled_auto_update(
@@ -64,7 +78,10 @@ pub fn start_auto_update_scheduler(
         }
 
         loop {
-            let Some(next_run) = calculate_next_run_time(&times) else {
+            let Some(next_run) = scheduler
+                .next_run(&policy, zone, DST_GAP)
+                .map(|next| next.with_timezone(&Local))
+            else {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 continue;
             };
@@ -81,7 +98,28 @@ pub fn start_auto_update_scheduler(
     }))
 }
 
+/// `update.auto-schedule.timezone` を IANA 名で解決する。
+/// 未設定・空・不正値はローカルタイムゾーン (`None`) にフォールバックする。
+fn load_schedule_timezone(push_server: &PushServer) -> Option<chrono_tz::Tz> {
+    let name = load_local_setting_string("update.auto-schedule.timezone")?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    match name.parse::<chrono_tz::Tz>() {
+        Ok(timezone) => Some(timezone),
+        Err(_) => {
+            let message =
+                crate::application::messages::jobs::auto_update_timezone_invalid(name);
+            eprintln!("{message}");
+            push_server.broadcast_echo(&message, "stdout");
+            None
+        }
+    }
+}
+
 pub fn start_or_restart_auto_update_scheduler(
+    scheduler: Arc<SchedulerService>,
     queue: Arc<PersistentQueue>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     push_server: Arc<PushServer>,
@@ -91,19 +129,10 @@ pub fn start_or_restart_auto_update_scheduler(
         task.abort();
     }
 
-    let task = start_auto_update_scheduler(queue, running_jobs, push_server);
+    let task = start_auto_update_scheduler(scheduler, queue, running_jobs, push_server);
     let started = task.is_some();
     *scheduler_task.lock() = task;
     started
-}
-
-pub fn restart_auto_update_scheduler(
-    queue: Arc<PersistentQueue>,
-    running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
-    push_server: Arc<PushServer>,
-    scheduler_task: &parking_lot::Mutex<Option<JoinHandle<()>>>,
-) -> bool {
-    start_or_restart_auto_update_scheduler(queue, running_jobs, push_server, scheduler_task)
 }
 
 fn run_scheduled_auto_update(
@@ -116,41 +145,30 @@ fn run_scheduled_auto_update(
     let now = Local::now();
     if let Err(message) = persist_last_auto_update_run(now) {
         push_server.broadcast_echo(
-            &format!("自動アップデート最終実行時刻の保存に失敗しました: {}", message),
+            &job_msgs::auto_update_last_run_save_failed(message),
             "stdout",
         );
     }
 
+    let scheduled_at = scheduled_time.format("%Y/%m/%d %H:%M:%S");
     let heading = if catch_up {
-        format!(
-            "自動アップデートを catch-up 実行します: {}",
-            scheduled_time.format("%Y/%m/%d %H:%M:%S")
-        )
+        job_msgs::auto_update_catch_up(scheduled_at)
     } else {
-        format!(
-            "自動アップデートが予定されています: {}",
-            scheduled_time.format("%Y/%m/%d %H:%M:%S")
-        )
+        job_msgs::auto_update_scheduled(scheduled_at)
     };
     push_server.broadcast_echo(&heading, "stdout");
 
     match queue_auto_update_job_if_needed(queue, running_jobs) {
         Ok((job_id, true)) => {
-            push_server.broadcast_echo(
-                &format!("自動アップデートをキューに追加しました ({})", job_id),
-                "stdout",
-            );
+            push_server.broadcast_echo(&job_msgs::auto_update_queued(job_id), "stdout");
             push_server.broadcast_event("notification.queue", "");
         }
         Ok((_, false)) => {
-            push_server.broadcast_echo(
-                "自動アップデートは既にキューまたは実行中に存在します",
-                "stdout",
-            );
+            push_server.broadcast_echo(job_msgs::auto_update_already_queued(), "stdout");
         }
         Err(message) => {
             push_server.broadcast_echo(
-                &format!("自動アップデートのキュー追加に失敗しました: {}", message),
+                &job_msgs::auto_update_enqueue_failed(message),
                 "stdout",
             );
         }
@@ -163,130 +181,24 @@ pub fn stop_auto_update_scheduler(scheduler_task: &parking_lot::Mutex<Option<Joi
     }
 }
 
-fn parse_schedule_times(schedule_string: &str) -> Vec<(u32, u32)> {
-    let mut times: Vec<(u32, u32)> = schedule_string
-        .split(',')
-        .filter_map(|value| {
-            let trimmed = value.trim();
-            if trimmed.len() != 4 || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-                return None;
-            }
-
-            let hour = trimmed[0..2].parse::<u32>().ok()?;
-            let minute = trimmed[2..4].parse::<u32>().ok()?;
-            (hour < 24 && minute < 60).then_some((hour, minute))
-        })
-        .collect();
-    times.sort_unstable();
-    times.dedup();
-    times
-}
-
-fn calculate_next_run_time(times: &[(u32, u32)]) -> Option<chrono::DateTime<Local>> {
-    calculate_next_run_time_after(times, Local::now())
-}
-
-fn calculate_next_run_time_after<Tz>(
-    times: &[(u32, u32)],
-    after: DateTime<Tz>,
-) -> Option<DateTime<Tz>>
-where
-    Tz: TimeZone,
-    Tz::Offset: Copy,
-{
-    for &(hour, minute) in times {
-        let candidate = local_datetime_in_timezone(
-            &after.timezone(),
-            after.year(),
-            after.month(),
-            after.day(),
-            hour,
-            minute,
-        )?;
-        if candidate > after {
-            return Some(candidate);
-        }
-    }
-
-    let tomorrow = after.date_naive().succ_opt()?;
-    let (hour, minute) = *times.first()?;
-    local_datetime_in_timezone(
-        &after.timezone(),
-        tomorrow.year(),
-        tomorrow.month(),
-        tomorrow.day(),
-        hour,
-        minute,
-    )
-}
-
-fn local_datetime_in_timezone<Tz>(
-    timezone: &Tz,
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-) -> Option<DateTime<Tz>>
-where
-    Tz: TimeZone,
-    Tz::Offset: Copy,
-{
-    let mut candidate = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, 0)?;
-    let start_date = candidate.date();
-    let max_date = start_date.succ_opt()?;
-
-    loop {
-        match timezone.from_local_datetime(&candidate) {
-            LocalResult::Single(value) => return Some(value),
-            LocalResult::Ambiguous(first, _) => return Some(first),
-            LocalResult::None => {
-                candidate = candidate.checked_add_signed(ChronoDuration::minutes(1))?;
-                if candidate.date() > max_date {
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-fn missed_run_time(
-    times: &[(u32, u32)],
-    last_run: Option<DateTime<Local>>,
-    now: DateTime<Local>,
-) -> Option<DateTime<Local>> {
-    let last_run = last_run?;
-    if last_run >= now {
-        return None;
-    }
-    let missed = calculate_next_run_time_after(times, last_run)?;
-    (missed < now).then_some(missed)
-}
-
-fn load_last_auto_update_run() -> Option<DateTime<Local>> {
+fn load_last_auto_update_run() -> Option<DateTime<Utc>> {
     let timestamp = match load_local_setting_value(AUTO_UPDATE_LAST_RUN_KEY)? {
         Value::Number(value) => value.as_i64()?,
         Value::String(text) => text.parse::<i64>().ok()?,
         _ => return None,
     };
-    Utc.timestamp_opt(timestamp, 0).single().map(|value| value.with_timezone(&Local))
+    Utc.timestamp_opt(timestamp, 0).single()
 }
 
 fn persist_last_auto_update_run(timestamp: DateTime<Local>) -> Result<(), String> {
-    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    inventory
-        .update_yaml::<(), HashMap<String, Value>, _>(
-            "local_setting",
-            InventoryScope::Local,
-            |mut settings| {
-                settings.insert(
-                    AUTO_UPDATE_LAST_RUN_KEY.to_string(),
-                    Value::Number(Number::from(timestamp.timestamp())),
-                );
-                Ok((settings, ()))
-            },
-        )
-        .map_err(|e| e.to_string())
+    crate::db::settings::update(crate::setting_core::SettingScope::Local, |settings| {
+        settings.insert(
+            AUTO_UPDATE_LAST_RUN_KEY.to_string(),
+            Value::Number(Number::from(timestamp.timestamp())),
+        );
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
 }
 
 async fn sleep_until(target_time: chrono::DateTime<Local>) {
@@ -306,13 +218,12 @@ pub fn execute_auto_update(
     push_server: Arc<PushServer>,
     job_id: &str,
     running_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    library: &crate::application::LibraryService,
+    site_updates: &dyn crate::application::SiteUpdateCapabilityProvider,
 ) -> bool {
     auto_update_echo(
         push_server.as_ref(),
-        &format!(
-            "自動アップデートを実行中... ({})",
-            Local::now().format("%Y/%m/%d %H:%M:%S")
-        ),
+        &job_msgs::auto_update_running(Local::now().format("%Y/%m/%d %H:%M:%S")),
     );
 
     let sort_args = build_auto_update_sort_args(push_server.as_ref());
@@ -326,29 +237,19 @@ pub fn execute_auto_update(
     ) {
         auto_update_echo(
             push_server.as_ref(),
-            "自動アップデート失敗: なろうAPI更新確認",
+            &job_msgs::auto_update_failed("なろうAPI更新確認"),
         );
         return false;
     }
 
-    let (modified_ids, other_ids) = collect_auto_update_target_ids();
-
+    let (modified_ids, other_ids) = collect_auto_update_target_ids(library, site_updates);
     if modified_ids.is_empty() {
-        auto_update_echo(
-            push_server.as_ref(),
-            "自動アップデート: modified タグの付いた小説はありません",
-        );
+        auto_update_echo(push_server.as_ref(), job_msgs::auto_update_no_modified());
     } else {
+        auto_update_echo(push_server.as_ref(), &job_msgs::auto_update_modified_note());
         auto_update_echo(
             push_server.as_ref(),
-            &colored("modified タグの付いた小説を更新します", "yellow"),
-        );
-        auto_update_echo(
-            push_server.as_ref(),
-            &format!(
-                "自動アップデート: modified タグの付いた小説を更新します ({}件)",
-                modified_ids.len()
-            ),
+            &job_msgs::auto_update_modified(modified_ids.len()),
         );
         let mut args = sort_args.clone();
         args.extend(modified_ids.iter().map(String::as_str));
@@ -362,24 +263,18 @@ pub fn execute_auto_update(
         ) {
             auto_update_echo(
                 push_server.as_ref(),
-                "自動アップデート失敗: modified タグ更新",
+                &job_msgs::auto_update_failed("modified タグ更新"),
             );
             return false;
         }
     }
 
     if other_ids.is_empty() {
-        auto_update_echo(
-            push_server.as_ref(),
-            "自動アップデート: 通常更新の対象となるその他小説はありません",
-        );
+        auto_update_echo(push_server.as_ref(), job_msgs::auto_update_no_others());
     } else {
         auto_update_echo(
             push_server.as_ref(),
-            &format!(
-                "自動アップデート: その他小説を通常更新します ({}件)",
-                other_ids.len()
-            ),
+            &job_msgs::auto_update_others(other_ids.len()),
         );
         let mut args = sort_args;
         args.extend(other_ids.iter().map(String::as_str));
@@ -391,12 +286,15 @@ pub fn execute_auto_update(
             job_id,
             &running_pids,
         ) {
-            auto_update_echo(push_server.as_ref(), "自動アップデート失敗: その他小説更新");
+            auto_update_echo(
+                push_server.as_ref(),
+                &job_msgs::auto_update_failed("その他小説更新"),
+            );
             return false;
         }
     }
 
-    auto_update_echo(push_server.as_ref(), "自動アップデートが正常に完了しました");
+    auto_update_echo(push_server.as_ref(), job_msgs::auto_update_completed());
     push_server.broadcast_event("table.reload", "");
     push_server.broadcast_event("tag.updateCanvas", "");
     true
@@ -404,17 +302,16 @@ pub fn execute_auto_update(
 
 fn build_auto_update_sort_args(push_server: &PushServer) -> Vec<&'static str> {
     let Some(sort_key) = read_auto_update_sort_key() else {
-        auto_update_echo(push_server, "自動アップデート: デフォルトソート順序で実行");
+        auto_update_echo(push_server, job_msgs::auto_update_default_sort());
         return Vec::new();
     };
 
     auto_update_echo(
         push_server,
-        &format!("自動アップデート: WebUIソート設定を適用 ({})", sort_key),
+        &job_msgs::auto_update_sort_applied(sort_key),
     );
     vec!["--sort-by", sort_key]
 }
-
 fn read_auto_update_sort_key() -> Option<&'static str> {
     let inventory = Inventory::with_default_root().ok()?;
     let server_setting: Value = inventory
@@ -429,46 +326,42 @@ fn auto_update_sort_key_from_value(server_setting: &Value) -> Option<&'static st
     normalize_sort_key(key)
 }
 
-fn collect_auto_update_target_ids() -> (Vec<String>, Vec<String>) {
-    let site_settings = SiteSetting::load_all().unwrap_or_default();
-    db::with_database(|db| {
-        let frozen_ids = load_frozen_ids_from_inventory(db.inventory()).unwrap_or_default();
-        let modified_ids = db
-            .tag_index()
-            .get("modified")
-            .into_iter()
-            .flat_map(|ids| ids.iter().copied())
-            .collect::<std::collections::BTreeSet<_>>();
-        Ok::<_, crate::error::NarouError>(split_auto_update_target_ids(
-            db.all_records().values(),
-            &modified_ids,
-            &frozen_ids,
-            |record| {
-                site_settings
-                    .iter()
-                    .find(|setting| setting.matches_url(&record.toc_url))
-                    .and_then(|setting| setting.narou_api_url.as_ref())
-                    .is_some()
-            },
-        ))
-    })
-    .unwrap_or_default()
+fn collect_auto_update_target_ids(
+    library: &crate::application::LibraryService,
+    site_updates: &dyn crate::application::SiteUpdateCapabilityProvider,
+) -> (Vec<String>, Vec<String>) {
+    let records = futures::executor::block_on(library.records()).unwrap_or_default();
+    let frozen_ids = futures::executor::block_on(library.frozen_ids()).unwrap_or_default();
+    let modified_ids = records
+        .iter()
+        .filter(|record| record.tags.iter().any(|tag| tag == "modified"))
+        .map(|record| record.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    split_auto_update_target_ids(
+        records.iter(),
+        &modified_ids,
+        &frozen_ids,
+        |record| site_updates.supports_narou_api(&record.toc_url),
+        |record| site_updates.allows_automatic_update(record),
+    )
 }
 
-fn split_auto_update_target_ids<'a, I, F>(
+fn split_auto_update_target_ids<'a, I, F, G>(
     records: I,
     modified_ids: &std::collections::BTreeSet<i64>,
     frozen_ids: &std::collections::HashSet<i64>,
     mut api_supported: F,
+    mut automatic_allowed: G,
 ) -> (Vec<String>, Vec<String>)
 where
     I: IntoIterator<Item = &'a crate::db::NovelRecord>,
     F: FnMut(&crate::db::NovelRecord) -> bool,
+    G: FnMut(&crate::db::NovelRecord) -> bool,
 {
     let mut modified = Vec::new();
     let mut other = Vec::new();
     for record in records {
-        if record_is_frozen(record, frozen_ids) {
+        if record_is_frozen(record, frozen_ids) || !automatic_allowed(record) {
             continue;
         }
         if modified_ids.contains(&record.id) {
@@ -487,6 +380,15 @@ fn queue_auto_update_job_if_needed(
     queue: &PersistentQueue,
     running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
 ) -> std::result::Result<(String, bool), String> {
+    let plan = JobService.plan(&JobRequest {
+        kind: JobKind::AutoUpdate,
+        targets: Vec::new(),
+        options: Vec::new(),
+    });
+    if !plan.invalid.is_empty() || plan.plans.len() != 1 {
+        return Err("自動アップデートジョブの計画に失敗しました".to_string());
+    }
+
     if let Some(existing_id) = running_jobs
         .lock()
         .iter()
@@ -522,10 +424,7 @@ fn run_update_phase(
     let Ok(exe) = std::env::current_exe() else {
         auto_update_echo(
             push_server.as_ref(),
-            &format!(
-                "{} で重大なエラーが発生しました（実行ファイルを取得できません）",
-                label
-            ),
+            &job_msgs::auto_update_fatal(label, job_msgs::auto_update_fatal_no_exe()),
         );
         return false;
     };
@@ -540,16 +439,14 @@ fn run_update_phase(
         .args(args);
     configure_web_subprocess_command(&mut command);
     command.env(WEB_PROGRESS_SCOPE_ENV, job_id);
+    command.env(crate::application::site_definitions::AUTOMATIC_UPDATE_ENV, "1");
 
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             auto_update_echo(
                 push_server.as_ref(),
-                &format!(
-                    "{} で重大なエラーが発生しました（update を起動できません: {}）",
-                    label, e
-                ),
+                &job_msgs::auto_update_fatal(label, job_msgs::auto_update_fatal_spawn(e)),
             );
             return false;
         }
@@ -567,10 +464,7 @@ fn run_update_phase(
     let Ok(status) = status else {
         auto_update_echo(
             push_server.as_ref(),
-            &format!(
-                "{} で重大なエラーが発生しました（update の終了待機に失敗しました）",
-                label
-            ),
+            &job_msgs::auto_update_fatal(label, job_msgs::auto_update_fatal_wait()),
         );
         return false;
     };
@@ -578,33 +472,30 @@ fn run_update_phase(
     let Some(code) = status.code() else {
         auto_update_echo(
             push_server.as_ref(),
-            &format!("{} で重大なエラーが発生しました（終了コード不明）", label),
+            &job_msgs::auto_update_fatal(
+                label,
+                job_msgs::auto_update_fatal_no_exit_code(),
+            ),
         );
         return false;
     };
 
     match code {
         0 => {
-            auto_update_echo(push_server.as_ref(), &format!("{} が完了しました", label));
+            auto_update_echo(push_server.as_ref(), &job_msgs::auto_update_phase_done(label));
             refresh_database_after_phase(label, push_server.as_ref())
         }
         1..=127 => {
             auto_update_echo(
                 push_server.as_ref(),
-                &format!(
-                    "{} が完了しました（{}件の小説でエラーがありました）",
-                    label, code
-                ),
+                &job_msgs::auto_update_phase_done_with_errors(label, code),
             );
             refresh_database_after_phase(label, push_server.as_ref())
         }
         _ => {
             auto_update_echo(
                 push_server.as_ref(),
-                &format!(
-                    "{} で重大なエラーが発生しました（終了コード: {}）",
-                    label, code
-                ),
+                &job_msgs::auto_update_fatal(label, job_msgs::auto_update_fatal_exit_code(code)),
             );
             false
         }
@@ -617,7 +508,7 @@ fn refresh_database_after_phase(label: &str, push_server: &PushServer) -> bool {
         Err(e) => {
             auto_update_echo(
                 push_server,
-                &format!("{} 後のDB再読み込みに失敗しました: {}", label, e),
+                &job_msgs::auto_update_db_refresh_failed(label, e),
             );
             false
         }
@@ -674,7 +565,7 @@ fn relay_stdout_line(push_server: &PushServer, text: &str) {
                 super::worker::refresh_db_and_broadcast_table_reload(push_server);
                 return;
             }
-            push_server.broadcast_raw(&message)
+            push_server.broadcast_raw(message)
         }
         Err(_) => auto_update_echo(push_server, text),
     }
@@ -687,15 +578,13 @@ fn auto_update_echo(push_server: &PushServer, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_update_sort_key_from_value, calculate_next_run_time, calculate_next_run_time_after,
-        local_datetime_in_timezone, missed_run_time, parse_schedule_times,
-        queue_auto_update_job_if_needed, split_auto_update_target_ids,
+        auto_update_sort_key_from_value, queue_auto_update_job_if_needed,
+        split_auto_update_target_ids,
     };
     use crate::web::sort_state::SORT_COLUMN_KEYS;
     use crate::db::NovelRecord;
     use crate::queue::{JobType, PersistentQueue, QueueJob};
-    use chrono::{Local, TimeZone, Timelike, Utc};
-    use chrono_tz::America::New_York;
+    use chrono::Utc;
     use parking_lot::Mutex;
     use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -725,20 +614,10 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: BTreeMap::new(),
         }
-    }
-
-    #[test]
-    fn parse_schedule_times_accepts_four_digit_times() {
-        assert_eq!(parse_schedule_times("0930, 2215"), vec![(9, 30), (22, 15)]);
-        assert!(parse_schedule_times("9999").is_empty());
-    }
-
-    #[test]
-    fn calculate_next_run_time_returns_future_time() {
-        let next = calculate_next_run_time(&[(0, 0)]).unwrap();
-        assert!(next > chrono::Local::now());
     }
 
     #[test]
@@ -751,36 +630,6 @@ mod tests {
             .unwrap();
             assert_eq!(auto_update_sort_key_from_value(&server_setting), Some(*key));
         }
-    }
-
-    #[test]
-    fn missed_run_time_triggers_single_catch_up_after_downtime() {
-        let last_run = Local.with_ymd_and_hms(2026, 4, 20, 8, 0, 0).single().unwrap();
-        let now = Local.with_ymd_and_hms(2026, 4, 20, 12, 0, 0).single().unwrap();
-        let missed = missed_run_time(&[(9, 0), (18, 0)], Some(last_run), now).unwrap();
-
-        assert_eq!(missed.hour(), 9);
-        assert_eq!(missed.minute(), 0);
-    }
-
-    #[test]
-    fn local_datetime_in_timezone_rounds_dst_gap_forward() {
-        let rounded = local_datetime_in_timezone(&New_York, 2024, 3, 10, 2, 30).unwrap();
-
-        assert_eq!(rounded.hour(), 3);
-        assert_eq!(rounded.minute(), 0);
-    }
-
-    #[test]
-    fn calculate_next_run_time_after_uses_rounded_dst_gap() {
-        let before_gap = New_York
-            .with_ymd_and_hms(2024, 3, 10, 1, 45, 0)
-            .single()
-            .unwrap();
-        let next = calculate_next_run_time_after(&[(2, 30)], before_gap).unwrap();
-
-        assert_eq!(next.hour(), 3);
-        assert_eq!(next.minute(), 0);
     }
 
     #[test]
@@ -823,12 +672,14 @@ mod tests {
 
     #[test]
     fn auto_update_target_split_skips_frozen_records() {
-        let records = vec![
+        let records = [
             sample_record(1, "https://example.com/1", &[]),
             sample_record(2, "https://example.com/2", &[]),
+            // タグだけでは凍結にならない (凍結判定は freeze.yaml のみ)。
             sample_record(3, "https://example.com/3", &["frozen"]),
             sample_record(4, "https://example.com/4", &[]),
             sample_record(5, "https://example.com/5", &[]),
+            sample_record(6, "https://example.com/6", &["frozen"]),
         ];
         let modified_ids = BTreeSet::from([1, 3]);
         let frozen_ids = HashSet::from([4]);
@@ -836,9 +687,35 @@ mod tests {
         let (modified, other) =
             split_auto_update_target_ids(records.iter(), &modified_ids, &frozen_ids, |record| {
                 record.id == 2
-            });
+            }, |_| true);
 
-        assert_eq!(modified, vec!["1".to_string()]);
-        assert_eq!(other, vec!["5".to_string()]);
+        assert_eq!(modified, vec!["1".to_string(), "3".to_string()]);
+        assert_eq!(other, vec!["5".to_string(), "6".to_string()]);
+    }
+
+    #[test]
+    fn automatic_rules_filter_modified_and_normal_targets_before_update() {
+        let sites = crate::downloader::site_setting::SiteSetting::load_bundled(&[
+            include_str!("../../webnovel/www.pixiv.net.yaml"),
+        ]).unwrap();
+        let mut records = Vec::new();
+        for (id, ncode) in [(1, "a1"), (2, "c2"), (3, "a3"), (4, "n4"), (5, "c5")] {
+            let mut record = sample_record(id, "https://www.pixiv.net/ajax/illust/1", &[]);
+            record.ncode = Some(ncode.into());
+            records.push(record);
+        }
+        let (modified, other) = split_auto_update_target_ids(
+            records.iter(), &BTreeSet::from([1, 2]), &HashSet::from([5]),
+            |_| false,
+            |record| crate::downloader::site_setting::allows_automatic_update(&sites, record),
+        );
+        assert_eq!(modified, ["2"]);
+        assert_eq!(other, ["4"]);
+        let (modified, other) = split_auto_update_target_ids(
+            records.iter().filter(|record| record.ncode.as_deref().unwrap().starts_with('a')),
+            &BTreeSet::from([1]), &HashSet::new(), |_| false,
+            |record| crate::downloader::site_setting::allows_automatic_update(&sites, record),
+        );
+        assert!(modified.is_empty() && other.is_empty());
     }
 }

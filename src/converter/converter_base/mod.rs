@@ -4,9 +4,9 @@ mod ruby;
 mod stash_rebuild;
 mod text_normalization;
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, LazyLock};
 
+use parking_lot::Mutex;
 use regex::Regex;
 
 use super::device::Device;
@@ -14,10 +14,12 @@ use super::inspector::Inspector;
 use super::settings::NovelSettings;
 use super::user_converter::UserConverter;
 
+static RE_BLANK_LINE_PACK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^\n){3}").unwrap());
+
 pub struct ConverterBase {
     pub settings: NovelSettings,
     pub user_converter: Option<UserConverter>,
-    pub inspector: Option<Rc<RefCell<Inspector>>>,
+    pub inspector: Option<Arc<Mutex<Inspector>>>,
     pub url_stash: Vec<String>,
     pub english_stash: Vec<String>,
     pub illust_stash: Vec<String>,
@@ -78,7 +80,7 @@ impl ConverterBase {
         }
     }
 
-    pub fn with_inspector(settings: NovelSettings, inspector: Rc<RefCell<Inspector>>) -> Self {
+    pub fn with_inspector(settings: NovelSettings, inspector: Arc<Mutex<Inspector>>) -> Self {
         Self {
             settings,
             user_converter: None,
@@ -99,7 +101,7 @@ impl ConverterBase {
     pub fn with_user_converter_and_inspector(
         settings: NovelSettings,
         user_converter: UserConverter,
-        inspector: Rc<RefCell<Inspector>>,
+        inspector: Arc<Mutex<Inspector>>,
     ) -> Self {
         Self {
             settings,
@@ -170,18 +172,15 @@ impl ConverterBase {
         let mut result = text.to_string();
 
         match self.text_type {
-            TextType::Body | TextType::TextFile => {
-                if self.settings.enable_convert_page_break {
-                    result = self.convert_page_break(&result);
-                }
+            TextType::Body | TextType::TextFile if self.settings.enable_convert_page_break => {
+                result = self.convert_page_break(&result);
             }
             _ => {}
         }
 
         if self.text_type != TextType::Story && self.settings.enable_pack_blank_line {
             result = result.replace("\n\n", "\n");
-            let re = Regex::new(r"(^\n){3}").unwrap();
-            result = re.replace_all(&result, "\n\n").to_string();
+            result = RE_BLANK_LINE_PACK.replace_all(&result, "\n\n").to_string();
         }
 
         result
@@ -199,7 +198,7 @@ impl ConverterBase {
         self.replace_illust_tag(&mut result);
         result = self.replace_url(&result);
         result = self.replace_narou_tag(&result);
-        result = self.convert_numbers(&mut result);
+        result = self.convert_numbers(&result);
         result = self.exception_reconvert_kanji_to_num(&result);
         if self.settings.enable_convert_num_to_kanji
             && self.text_type != TextType::Subtitle
@@ -242,31 +241,30 @@ impl ConverterBase {
 
         let lines: Vec<&str> = text.lines().collect();
         let mut result = Vec::new();
-        let mut before_line = String::new();
+        let mut before_line_blank = true;
         let mut request_insert_blank = false;
 
         for line in &lines {
-            let mut line = line.to_string();
-            line = zenkaku_rstrip(&line);
+            let mut line = zenkaku_rstrip(line).into_owned();
 
             if request_insert_blank {
                 if !is_blank_line(&line) {
                     result.push(String::new());
                 }
                 request_insert_blank = false;
-                before_line.clear();
+                before_line_blank = true;
             }
 
             if matches!(text_type, TextType::Body | TextType::TextFile) {
                 let mut prefix = String::new();
                 if line.contains("\u{FF3B}\u{FF03}\u{7AE0}\u{898B}\u{51FA}\u{3057}\u{3063}\u{307D}\u{3044}\u{6587}\u{FF1D}") {
-                    if !is_blank_line(&before_line) {
+                    if !before_line_blank {
                         prefix.push('\n');
                     }
                     request_insert_blank = true;
                 }
                 if is_border_symbol(&line) {
-                    if !is_blank_line(&before_line) {
+                    if !before_line_blank {
                         prefix.push('\n');
                     }
                     request_insert_blank = true;
@@ -275,19 +273,10 @@ impl ConverterBase {
                 if !prefix.is_empty() {
                     line = format!("{}{}", prefix, line);
                 }
-                if !line.is_empty()
-                    && !line.starts_with(' ')
-                    && !line.starts_with('\u{3000}')
-                    && !line.starts_with('\t')
-                    && !is_border_symbol(&line)
-                {
-                    let marker_pos = line.bytes().take_while(|&byte| byte == b'\n').count();
-                    line.insert(marker_pos, '\u{E000}');
-                }
             }
 
-            result.push(line.clone());
-            before_line = line;
+            before_line_blank = is_blank_line(&line);
+            result.push(line);
         }
 
         let mut data = result.join("\n");
@@ -305,7 +294,6 @@ impl ConverterBase {
         if matches!(text_type, TextType::Body | TextType::TextFile) {
             self.half_indent_bracket(&mut data);
             self.auto_indent(&mut data);
-            data = data.replace('\u{E000}', "");
         }
 
         if self.settings.enable_ruby {

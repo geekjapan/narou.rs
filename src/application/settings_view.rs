@@ -1,0 +1,531 @@
+//! Web UI の設定ページが読む JSON の組み立て。
+//!
+//! native の Web サーバー (`src/web/global_settings.rs`) と Worker
+//! (`worker_entry/src/global_settings.rs`) が同じ JSON を返すために、ページが
+//! 必要とする形（タブ・設定項目のメタデータ・置換設定）をここに集約する。
+//! 依存は `SettingsService`（`SettingsStore` port の上）と `setting_core` /
+//! `setting_info` の純関数だけで、Web フレームワークもファイルシステムも
+//! 持ち込まない。
+
+use crate::application::settings::{SettingEntry, SettingsService};
+use crate::converter::device::Device;
+use crate::setting_core::SettingScope;
+use crate::setting_info::{
+    original_setting_var_infos, setting_variables, tab_for_setting, webui_help_override, VarInfo,
+    VarType,
+};
+
+/// 置換設定など、Web から受け取るテキスト入力の上限。
+pub const MAX_WEB_TEXT_INPUT_BYTES: usize = 1024 * 1024;
+
+/// 大きすぎる入力は拒否する（`replace.txt` など）。
+pub fn validate_web_text_size(content: &str, limit: usize, label: &str) -> Result<(), String> {
+    if content.len() > limit {
+        return Err(format!("{label} is too large"));
+    }
+    Ok(())
+}
+
+/// Tab metadata matching narou.rb SETTING_TAB_NAMES / SETTING_TAB_INFO.
+pub const TABS: &[(&str, &str, &str)] = &[
+    ("general", "一般", ""),
+    ("detail", "詳細", ""),
+    ("webui", "WEB UI", "WEB UI 専用の設定です"),
+    (
+        "global",
+        "Global",
+        "Global な設定はユーザープロファイルに保存され、OSに関わらず適用されます",
+    ),
+    (
+        "default",
+        "default.*",
+        "default.* 系の設定は個別の変換設定で未設定の項目の挙動を決めます",
+    ),
+    (
+        "force",
+        "force.*",
+        "force.* 系の設定は個別設定、default.* 等の設定を無視して強制適用されます",
+    ),
+    (
+        "command",
+        "コマンド",
+        "default_args.* 系の設定はコマンド実行時のオプションを省略した場合のデフォルト値を指定します",
+    ),
+    ("replace", "置換設定", ""),
+    (
+        "login",
+        "ログイン",
+        "ブラウザのある端末で取得したログイン情報を取り込みます",
+    ),
+    ("authors", "作者", "作者の継続追跡と追跡対象の管理"),
+    (
+        "external_api",
+        "外部API",
+        "外部公開 API (/api/v1) の Bearer トークンと接続情報",
+    ),
+];
+
+/// Web UI の並び順カラムの表示ラベル。`crate::db::sort_keys()` と長さを揃え、
+/// 同じインデックスで日本語ラベルを参照できるようにする。
+pub const SORT_COLUMN_LABELS: &[&str] = &[
+    "ID",             // 0  id
+    "最終更新日",     // 1  last_update
+    "最新話掲載日",   // 2  general_lastup
+    "最終確認日",     // 3  last_check_date
+    "タイトル",       // 4  title
+    "作者",           // 5  author
+    "サイト名",       // 6  sitename
+    "小説種別",       // 7  novel_type
+    "タグ",           // 8  tags
+    "話数",           // 9  general_all_no
+    "文字数",         // 10 length
+    "状態",           // 11 status
+    "URL",            // 12 toc_url
+    "新着日",         // 13 new_arrivals_date
+    "平均文字数",     // 14 average_length
+];
+
+/// ソートキーの日本語ラベル。
+pub fn sort_column_label_for_key(key: &str) -> Option<&'static str> {
+    let index = crate::db::sort_keys()
+        .iter()
+        .position(|candidate| *candidate == key)?;
+    SORT_COLUMN_LABELS.get(index).copied()
+}
+
+/// 設定ページのタブ一覧。
+pub fn tabs_json() -> Vec<serde_json::Value> {
+    TABS.iter()
+        .map(|(id, label, info)| {
+            serde_json::json!({
+                "id": id,
+                "label": label,
+                "info": info,
+            })
+        })
+        .collect()
+}
+
+/// 設定一覧の読み込みに失敗したときの応答（ページは `error` を表示する）。
+pub fn error_view(message: String) -> serde_json::Value {
+    serde_json::json!({
+        "tabs": [],
+        "settings": [],
+        "replace_content": "",
+        "error": message,
+    })
+}
+
+/// `GET /api/global_setting` の応答を組み立てる。
+pub async fn load_view(settings: &SettingsService) -> serde_json::Value {
+    let (entries, replace_content) = match futures::try_join!(settings.list(), settings.load_replace_content()) {
+        Ok(values) => values,
+        Err(error) => return error_view(error.to_string()),
+    };
+    let mut items = Vec::with_capacity(entries.len());
+    let variables = setting_variables();
+    let novel_vars = original_setting_var_infos();
+
+    for entry in entries {
+        let dynamic_prefix = entry
+            .name
+            .strip_prefix("default.")
+            .map(|_| "default")
+            .or_else(|| entry.name.strip_prefix("force.").map(|_| "force"));
+        let tab = if let Some(prefix) = dynamic_prefix {
+            Some(prefix)
+        } else if entry.name.starts_with("default_args.") {
+            Some("command")
+        } else {
+            tab_for_setting(&entry.name)
+        };
+        let Some(tab) = tab else {
+            continue;
+        };
+        let scope = match entry.scope {
+            SettingScope::Local => "local",
+            SettingScope::Global => "global",
+        };
+        let info = if let Some(prefix) = dynamic_prefix {
+            let base_name = entry
+                .name
+                .strip_prefix(&format!("{prefix}."))
+                .unwrap_or(&entry.name);
+            novel_vars
+                .iter()
+                .find(|(name, _)| *name == base_name)
+                .map(|(_, info)| info.clone())
+        } else {
+            variables
+                .local
+                .iter()
+                .find(|(name, _)| *name == entry.name)
+                .or_else(|| {
+                    variables
+                        .global
+                        .iter()
+                        .find(|(name, _)| *name == entry.name)
+                })
+                .map(|(_, info)| info.clone())
+        };
+        let mut item = if let Some(info) = info {
+            build_setting_entry(&entry.name, &info, scope, tab, entry.value.clone())
+        } else {
+            unknown_setting_entry(&entry, scope, tab)
+        };
+        if matches!(entry.var_type, VarType::Boolean) {
+            item["three_way"] = serde_json::json!(true);
+        }
+        item["default_value"] = yaml_to_json(entry.default_value);
+        item["requires_restart"] = serde_json::json!(
+            entry.scope == SettingScope::Local
+                && crate::application::settings::storage_setting_requires_restart(&entry.name)
+        );
+        items.push(item);
+    }
+
+    append_missing_indent_toggles(&mut items, &novel_vars);
+
+    serde_json::json!({
+        "tabs": tabs_json(),
+        "settings": items,
+        "replace_content": replace_content,
+    })
+}
+
+/// issue #42: 未設定でも既定値が効く設定を、設定ファイルに無くても
+/// 「default.*」タブの 3-way トグルとして出す。
+fn append_missing_indent_toggles(
+    items: &mut Vec<serde_json::Value>,
+    novel_vars: &[(&'static str, VarInfo)],
+) {
+    for (name, help) in [
+        (
+            "default.enable_half_indent_bracket",
+            "行頭のかぎ括弧・丸括弧に二分アキを挿入します。未設定時は narou.rb と同じく有効 (true) です。",
+        ),
+        (
+            "default.enable_auto_indent",
+            "行頭字下げを自動で行います。未設定時は narou.rb と同じく有効 (true) です。",
+        ),
+        (
+            "default.enable_force_indent",
+            "行頭字下げを必ず行います (enable_auto_indent より優先)。未設定時は narou.rb と同じく無効 (false) です。",
+        ),
+    ] {
+        if items
+            .iter()
+            .any(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))
+        {
+            continue;
+        }
+        let base_name = name.strip_prefix("default.").unwrap_or(name);
+        let Some((_, info)) = novel_vars.iter().find(|(key, _)| *key == base_name) else {
+            continue;
+        };
+        let mut item = build_setting_entry(name, info, "local", "default", None);
+        item["three_way"] = serde_json::json!(true);
+        item["help"] = serde_json::json!(help);
+        item["requires_restart"] = serde_json::json!(false);
+        item["default_value"] = serde_json::json!(base_name != "enable_force_indent");
+        items.push(item);
+    }
+}
+
+/// メタデータが見つからない設定項目（`setting_info` に無い動的な名前）。
+fn unknown_setting_entry(entry: &SettingEntry, scope: &str, tab: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": entry.name,
+        "scope": scope,
+        "tab": tab,
+        "var_type": entry.var_type,
+        "help": entry.help,
+        "value": yaml_to_json(entry.value.clone()),
+        "select_keys": entry.select_keys,
+        "invisible": false,
+    })
+}
+
+/// `POST /api/global_setting` の本文から保存対象を取り出す。
+pub fn parse_changes(body: &serde_json::Value) -> Option<Vec<(String, serde_json::Value)>> {
+    let entries = body["settings"].as_object()?;
+    Some(
+        entries
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// 保存を適用し、呼び出し側が処理すべき副作用を返す。
+///
+/// 失敗時は表示用のメッセージを返す（呼び出し側はそのまま応答に載せる）。
+pub async fn apply_save(
+    settings: &SettingsService,
+    body: &serde_json::Value,
+) -> Result<crate::application::settings::SettingsSaveResult, crate::application::ApplicationError> {
+    use crate::application::ApplicationError;
+    let changes = parse_changes(body)
+        .ok_or_else(|| ApplicationError::InvalidRequest("settings object required".to_string()))?;
+    let expected = match body.get("expected_settings") {
+        Some(value) => Some(value.as_object().ok_or_else(|| {
+            ApplicationError::InvalidRequest("expected_settings object required".to_string())
+        })?),
+        None => None,
+    };
+    let replacement = if let Some(content) = body["replace_content"].as_str() {
+        validate_web_text_size(content, MAX_WEB_TEXT_INPUT_BYTES, "replace.txt")
+            .map_err(ApplicationError::InvalidRequest)?;
+        let current = settings.load_replace_content().await?;
+        if let Some(expected) = body.get("expected_replace_content") {
+            let expected = expected.as_str().ok_or_else(|| {
+                ApplicationError::InvalidRequest("expected_replace_content string required".to_string())
+            })?;
+            if expected != current {
+                return Err(ApplicationError::Conflict(
+                    "他の画面で置換設定が更新されました。変更内容を確認してから再読み込みしてください".to_string(),
+                ));
+            }
+        }
+        Some((current, content))
+    } else {
+        None
+    };
+    let mut result = settings.apply_json_checked(&changes, expected).await?;
+    if result.failure.is_none()
+        && let Some((expected, content)) = replacement
+    {
+        match settings.save_replace_content_checked(&expected, content).await {
+            Ok(()) => result.replace_content = Some(content.to_string()),
+            Err(error) => result.failure = Some(error),
+        }
+    }
+    Ok(result)
+}
+
+/// 保存成功時のメッセージ（native / Worker で同じ文言）。
+pub const SAVE_MESSAGE: &str = "設定を保存しました";
+
+/// Acknowledge this save's values, not a subsequent read of mutable settings.
+pub fn save_response(result: &crate::application::settings::SettingsSaveResult) -> serde_json::Value {
+    let conflict = matches!(&result.failure, Some(crate::application::ApplicationError::Conflict(_)));
+    let mut response = serde_json::json!({
+        "success": result.failure.is_none(),
+        "partial": result.failure.is_some() && !result.settings.is_empty(),
+        "conflict": conflict,
+        "message": result.failure.as_ref().map(ToString::to_string).unwrap_or_else(|| SAVE_MESSAGE.to_string()),
+        "settings": result.settings,
+    });
+    if let Some(content) = &result.replace_content {
+        response["replace_content"] = serde_json::json!(content);
+    }
+    response
+}
+
+fn build_setting_entry(
+    name: &str,
+    info: &VarInfo,
+    scope: &str,
+    tab: &str,
+    value: Option<serde_yaml::Value>,
+) -> serde_json::Value {
+    let help = webui_help_override(name, info.help).unwrap_or_else(|| info.help.to_string());
+    serde_json::json!({
+        "name": name,
+        "scope": scope,
+        "tab": tab,
+        "var_type": info.var_type,
+        "help": help,
+        "value": yaml_to_json(value),
+        "select_keys": info.select_keys,
+        "select_summaries": select_summaries_for_setting(name, info),
+        "invisible": false,
+    })
+}
+
+fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String>> {
+    let keys = info.select_keys.as_ref()?;
+    let base_name = name
+        .strip_prefix("default.")
+        .or_else(|| name.strip_prefix("force."))
+        .unwrap_or(name);
+    Some(match base_name {
+        "device" | "convert.multi-device" => keys
+            .iter()
+            .map(|key| key.parse::<Device>().unwrap_or(Device::Text).display_name().to_string())
+            .collect(),
+        "update.sort-by" => keys
+            .iter()
+            .map(|key| {
+                sort_column_label_for_key(key)
+                    .map(str::to_string)
+                    .or_else(|| (key == "new_arrivals_date").then(|| "新着日".to_string()))
+                    .unwrap_or_else(|| key.clone())
+            })
+            .collect(),
+        "convert.copy-to-grouping" => vec![
+            "端末毎にまとめる".to_string(),
+            "掲載サイト毎にまとめる".to_string(),
+        ],
+        "economy" => vec![
+            "変換後に作業ファイルを削除".to_string(),
+            "送信後に書籍ファイルを削除".to_string(),
+            "差分ファイルを保存しない".to_string(),
+            "rawデータを保存しない".to_string(),
+        ],
+        "webui.table.reload-timing" => {
+            vec!["１作品ごとに更新".to_string(), "キューごとに更新".to_string()]
+        }
+        "webui.performance-mode" => vec![
+            "自動判定".to_string(),
+            "常に有効".to_string(),
+            "常に無効".to_string(),
+        ],
+        "convert.epub-font" => vec![
+            "自動 (濁点注記のある小説だけ)".to_string(),
+            "常に埋め込む".to_string(),
+        ],
+        "convert.epub-engine" => vec![
+            "自動 (epub / reader / ibooks はネイティブ)".to_string(),
+            "組み込み (AozoraEpub3_Lite)".to_string(),
+            "外部 AozoraEpub3".to_string(),
+            "ネイティブ (epub / reader / ibooks)".to_string(),
+        ],
+        "convert.rotate-image" => vec![
+            "自動 (AozoraEpub3.ini の RotateImage に従う)".to_string(),
+            "回転しない".to_string(),
+            "右へ90° (RotateImage=1)".to_string(),
+            "左へ90° (RotateImage=2)".to_string(),
+        ],
+        "self-update.variant" => vec![
+            "GPL版（AozoraEpub3_Lite 組込み）".to_string(),
+            "通常版（外部 AozoraEpub3）".to_string(),
+        ],
+        "webui.new-tag-color" => vec![
+            "自動 (巡回)".to_string(),
+            "緑".to_string(),
+            "黄".to_string(),
+            "青".to_string(),
+            "紫".to_string(),
+            "水色".to_string(),
+            "赤".to_string(),
+            "白".to_string(),
+        ],
+        _ => keys.clone(),
+    })
+}
+
+fn yaml_to_json(value: Option<serde_yaml::Value>) -> serde_json::Value {
+    match value {
+        None => serde_json::Value::Null,
+        Some(v) => match v {
+            serde_yaml::Value::Null => serde_json::Value::Null,
+            serde_yaml::Value::Bool(b) => serde_json::Value::Bool(b),
+            serde_yaml::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    serde_json::json!(i)
+                } else if let Some(f) = n.as_f64() {
+                    serde_json::json!(f)
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            serde_yaml::Value::String(s) => serde_json::Value::String(s),
+            serde_yaml::Value::Sequence(seq) => {
+                // 各要素をそのまま JSON 化する。数値・bool・null を文字列以外と
+                // して捨てると設定画面で選択が消える (例: `[1, 2]` → `[]`)。
+                serde_json::Value::Array(
+                    seq.into_iter().map(|v| yaml_to_json(Some(v))).collect(),
+                )
+            }
+            _ => serde_json::Value::Null,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::setting_core::{apply_device_related_settings, coerce_json_setting_value};
+    use std::collections::HashMap;
+
+    #[test]
+    fn coerce_float_setting_from_string() {
+        let value =
+            coerce_json_setting_value("update.interval", &serde_json::json!("1.5")).unwrap();
+        assert_eq!(value, serde_yaml::Value::Number(serde_yaml::Number::from(1.5)));
+    }
+
+    #[test]
+    fn coerce_select_setting_rejects_unknown_value() {
+        assert!(
+            coerce_json_setting_value("webui.table.reload-timing", &serde_json::json!("invalid"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn apply_device_related_settings_updates_half_indent() {
+        let mut settings = HashMap::from([(
+            "device".to_string(),
+            serde_yaml::Value::String("kobo".to_string()),
+        )]);
+        let _ = apply_device_related_settings(&mut settings);
+        assert_eq!(
+            settings.get("default.enable_half_indent_bracket"),
+            Some(&serde_yaml::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn indent_toggles_are_always_available_in_default_tab() {
+        let novel_vars = original_setting_var_infos();
+        let mut items = Vec::new();
+        append_missing_indent_toggles(&mut items, &novel_vars);
+        assert_eq!(items.len(), 3, "the three indent toggles must be shown");
+        for item in &items {
+            assert_eq!(item["tab"], "default");
+            assert_eq!(item["three_way"], true);
+            assert_eq!(item["scope"], "local");
+        }
+        // 既に設定ファイルにある項目は重複追加しない。
+        append_missing_indent_toggles(&mut items, &novel_vars);
+        assert_eq!(items.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn load_view_exposes_unset_indent_toggles_with_three_way_state() {
+        use crate::application::settings::{MemorySettingsStore, SettingsService};
+        use std::sync::Arc;
+
+        let service = SettingsService::new(Arc::new(MemorySettingsStore::new()));
+        let view = load_view(&service).await;
+        let settings = view["settings"].as_array().expect("settings array");
+        for name in [
+            "default.enable_half_indent_bracket",
+            "default.enable_auto_indent",
+            "default.enable_force_indent",
+        ] {
+            let item = settings
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap_or_else(|| panic!("{name} must be shown even when unset"));
+            assert_eq!(item["tab"], "default");
+            assert_eq!(item["three_way"], true);
+            assert!(item["value"].is_null(), "unset value must stay null");
+        }
+    }
+
+    #[test]
+    fn yaml_to_json_keeps_non_string_sequence_elements() {
+        // シーケンス内の数値・bool・null を捨てると設定画面の選択が消える。
+        let yaml: serde_yaml::Value = serde_yaml::from_str("[kindle, 1, true, ~]").unwrap();
+        assert_eq!(
+            yaml_to_json(Some(yaml)),
+            serde_json::json!(["kindle", 1, true, null])
+        );
+        let numbers: serde_yaml::Value = serde_yaml::from_str("[1, 2]").unwrap();
+        assert_eq!(yaml_to_json(Some(numbers)), serde_json::json!([1, 2]));
+    }
+}

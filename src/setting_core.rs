@@ -37,6 +37,59 @@ pub fn setting_scope(name: &str) -> Option<SettingScope> {
     None
 }
 
+/// 保存済み設定値を bool として解釈する。
+///
+/// `Bool` と `Number` (非 0) のほか、`String` は前後の空白と大文字小文字を
+/// 無視して `true`/`yes`/`on`/`1` を真、`false`/`no`/`off`/`0` を偽とする。
+/// 未設定や解釈できない値 (`Null`・配列・Map・それ以外の文字列) は `None`。
+pub fn setting_bool_value(value: &serde_yaml::Value) -> Option<bool> {
+    match value {
+        serde_yaml::Value::Bool(value) => Some(*value),
+        serde_yaml::Value::Number(value) => value.as_i64().map(|value| value != 0),
+        serde_yaml::Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => Some(true),
+            "false" | "no" | "off" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 設定 map の `key` を bool として読む。未設定・解釈不能は `default`。
+pub fn bool_or(map: &HashMap<String, serde_yaml::Value>, key: &str, default: bool) -> bool {
+    map.get(key).and_then(setting_bool_value).unwrap_or(default)
+}
+
+/// 環境変数スイッチの解釈 (既定 ON の機能を `0`/`false`/`no`/`off` で切る形)。
+/// 前後の空白と大文字小文字を無視し、それ以外の値は有効のままにする。
+pub fn flag_enabled(raw: &str) -> bool {
+    !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// 変換済みテキストを保存するか (`convert.keep-txt`)。
+///
+/// `env_override` (`NAROU_RS_KEEP_TXT`) が最優先、次に設定 map、未設定は
+/// `default`。文字列は [`flag_enabled`] と同じ「切る値の列挙」で解釈する
+/// (空文字や解釈できない文字列は保存する側)。既定は呼び出し側が明示する
+/// (native のファイル経路と `ConvertService` は `true`、Worker は `false`)。
+pub fn keep_converted_text(
+    map: &HashMap<String, serde_yaml::Value>,
+    env_override: Option<&str>,
+    default: bool,
+) -> bool {
+    if let Some(raw) = env_override {
+        return flag_enabled(raw);
+    }
+    match map.get("convert.keep-txt") {
+        Some(serde_yaml::Value::String(value)) => flag_enabled(value),
+        Some(value) => setting_bool_value(value).unwrap_or(default),
+        None => default,
+    }
+}
+
 pub fn cast_setting_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> {
     if let Some(info) = setting_info::setting_variables().get(name) {
         return cast_value_for_type(info.var_type, value_str, info.select_keys.as_deref());
@@ -45,11 +98,9 @@ pub fn cast_setting_value(name: &str, value_str: &str) -> Result<serde_yaml::Val
     if let Some(rest) = name
         .strip_prefix("default.")
         .or_else(|| name.strip_prefix("force."))
-    {
-        if let Some(info) = original_setting_var_info(rest) {
+        && let Some(info) = original_setting_var_info(rest) {
             return cast_value_for_type(info.var_type, value_str, info.select_keys.as_deref());
         }
-    }
 
     if setting_info::is_known_default_arg_name(name) {
         return Ok(serde_yaml::Value::String(value_str.to_string()));
@@ -68,11 +119,9 @@ pub fn coerce_json_setting_value(
     if let Some(base_name) = name
         .strip_prefix("default.")
         .or_else(|| name.strip_prefix("force."))
-    {
-        if let Some(info) = original_setting_var_info(base_name) {
+        && let Some(info) = original_setting_var_info(base_name) {
             return coerce_value_for_type(&info, value);
         }
-    }
     if setting_info::is_known_default_arg_name(name) {
         return coerce_string_value(value);
     }
@@ -152,14 +201,13 @@ fn cast_value_for_type(
 ) -> Result<serde_yaml::Value, String> {
     match var_type {
         VarType::Select => {
-            if let Some(keys) = select_keys {
-                if !keys.iter().any(|k| k == value_str) {
+            if let Some(keys) = select_keys
+                && !keys.iter().any(|k| k == value_str) {
                     return Err(format!(
                         "不明な値です。{} の中から指定して下さい",
                         keys.join(", ")
                     ));
                 }
-            }
             Ok(serde_yaml::Value::String(value_str.to_string()))
         }
         VarType::Multiple => {
@@ -186,19 +234,17 @@ fn cast_value_for_type(
                 )),
             }
         }
-        VarType::Integer => value_str
-            .parse::<i64>()
-            .map(|i| serde_yaml::Value::Number(i.into()))
-            .map_err(|_| {
+        VarType::Integer => parse_ruby_integer(value_str)
+            .map(serde_yaml::Value::Number)
+            .ok_or_else(|| {
                 format!(
                     "値が {} ではありません",
                     var_type_description(VarType::Integer).trim_end()
                 )
             }),
-        VarType::Float => value_str
-            .parse::<f64>()
+        VarType::Float => parse_ruby_float(value_str)
             .map(|f| serde_yaml::Value::Number(serde_yaml::Number::from(f)))
-            .map_err(|_| {
+            .ok_or_else(|| {
                 format!(
                     "値が {} ではありません",
                     var_type_description(VarType::Float).trim_end()
@@ -226,6 +272,84 @@ fn cast_value_for_type(
             ))
         }
     }
+}
+
+/// Ruby の `Integer()` 相当のパース。前後の空白除去、符号、`0x`/`0o`/`0b`/`0d`
+/// プレフィックス、先頭 `0` の8進数、桁の間の `_` を受理する。
+fn parse_ruby_integer(value_str: &str) -> Option<serde_yaml::Number> {
+    let trimmed = value_str.trim();
+    let (negative, digits_str) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let (radix, digits): (u32, &str) = if let Some(rest) = digits_str.strip_prefix("0x") {
+        (16, rest)
+    } else if let Some(rest) = digits_str.strip_prefix("0o") {
+        (8, rest)
+    } else if let Some(rest) = digits_str.strip_prefix("0b") {
+        (2, rest)
+    } else if let Some(rest) = digits_str.strip_prefix("0d") {
+        (10, rest)
+    } else if digits_str.len() > 1 && digits_str.starts_with('0') {
+        // Ruby の Integer() は先頭が 0 の数字列を8進数として解釈する
+        (8, &digits_str[1..])
+    } else {
+        (10, digits_str)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: i128 = 0;
+    let mut prev_digit = false;
+    let mut chars = digits.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '_' {
+            // `_` は桁と桁の間だけ許可される
+            if !prev_digit || !chars.peek().is_some_and(|c| c.is_digit(radix)) {
+                return None;
+            }
+            continue;
+        }
+        let d = ch.to_digit(radix)? as i128;
+        value = value.checked_mul(radix as i128)?.checked_add(d)?;
+        prev_digit = true;
+    }
+    if !prev_digit {
+        return None;
+    }
+    let signed = if negative { -value } else { value };
+    if let Ok(v) = i64::try_from(signed) {
+        return Some(serde_yaml::Number::from(v));
+    }
+    if negative {
+        return None;
+    }
+    // YAML の整数は u64 まで表せるので、正の値は i64 を超えても受理する
+    u64::try_from(signed).ok().map(serde_yaml::Number::from)
+}
+
+/// Ruby の `Float()` 相当のパース。`Integer()` と同じく桁の間の `_` を許し、
+/// `NaN` / `Infinity` (大小無視) を受理する。`0x` などの基数指定は受理しない。
+fn parse_ruby_float(value_str: &str) -> Option<f64> {
+    let trimmed = value_str.trim();
+    // `_` は数字と数字の間だけ許可される
+    let mut cleaned = String::with_capacity(trimmed.len());
+    let mut prev_digit = false;
+    let mut chars = trimmed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '_' {
+            if !prev_digit || !chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            continue;
+        }
+        prev_digit = ch.is_ascii_digit();
+        cleaned.push(ch);
+    }
+    if cleaned.is_empty() {
+        return None;
+    }
+    cleaned.parse::<f64>().ok()
 }
 
 fn coerce_value_for_type(
@@ -259,14 +383,13 @@ fn coerce_integer_value(value: &serde_json::Value) -> Result<serde_yaml::Value, 
     let number = match value {
         serde_json::Value::Number(raw) => raw
             .as_i64()
+            .map(serde_yaml::Number::from)
             .ok_or_else(|| "整数を指定して下さい".to_string())?,
-        serde_json::Value::String(raw) => raw
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| "整数を指定して下さい".to_string())?,
+        serde_json::Value::String(raw) => parse_ruby_integer(raw)
+            .ok_or_else(|| "整数を指定して下さい".to_string())?,
         _ => return Err("整数を指定して下さい".to_string()),
     };
-    Ok(serde_yaml::Value::Number(serde_yaml::Number::from(number)))
+    Ok(serde_yaml::Value::Number(number))
 }
 
 fn coerce_float_value(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
@@ -274,10 +397,8 @@ fn coerce_float_value(value: &serde_json::Value) -> Result<serde_yaml::Value, St
         serde_json::Value::Number(raw) => raw
             .as_f64()
             .ok_or_else(|| "数値を指定して下さい".to_string())?,
-        serde_json::Value::String(raw) => raw
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| "数値を指定して下さい".to_string())?,
+        serde_json::Value::String(raw) => parse_ruby_float(raw)
+            .ok_or_else(|| "数値を指定して下さい".to_string())?,
         _ => return Err("数値を指定して下さい".to_string()),
     };
     Ok(serde_yaml::Value::Number(serde_yaml::Number::from(number)))
@@ -300,14 +421,13 @@ fn coerce_select_value(
         serde_json::Value::String(raw) => raw.clone(),
         _ => return Err("選択肢の中から指定して下さい".to_string()),
     };
-    if let Some(keys) = select_keys {
-        if !keys.iter().any(|key| key == &selected) {
+    if let Some(keys) = select_keys
+        && !keys.iter().any(|key| key == &selected) {
             return Err(format!(
                 "不明な値です。{} の中から指定して下さい",
                 keys.join(", ")
             ));
         }
-    }
     Ok(serde_yaml::Value::String(selected))
 }
 
@@ -485,5 +605,103 @@ mod tests {
             settings.get("default.enable_half_indent_bracket"),
             Some(&serde_yaml::Value::Bool(false))
         );
+    }
+
+    #[test]
+    fn setting_bool_value_accepts_ruby_style_values() {
+        for (value, expected) in [
+            (serde_yaml::Value::Bool(true), Some(true)),
+            (serde_yaml::Value::Bool(false), Some(false)),
+            (serde_yaml::Value::Number(1.into()), Some(true)),
+            (serde_yaml::Value::Number(0.into()), Some(false)),
+            (serde_yaml::Value::String("true".into()), Some(true)),
+            (serde_yaml::Value::String("TRUE".into()), Some(true)),
+            (serde_yaml::Value::String(" yes ".into()), Some(true)),
+            (serde_yaml::Value::String("On".into()), Some(true)),
+            (serde_yaml::Value::String("1".into()), Some(true)),
+            (serde_yaml::Value::String("false".into()), Some(false)),
+            (serde_yaml::Value::String("NO".into()), Some(false)),
+            (serde_yaml::Value::String("off".into()), Some(false)),
+            (serde_yaml::Value::String("0".into()), Some(false)),
+            (serde_yaml::Value::String("maybe".into()), None),
+            (serde_yaml::Value::Null, None),
+            (serde_yaml::Value::Sequence(Vec::new()), None),
+        ] {
+            assert_eq!(setting_bool_value(&value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn bool_or_uses_the_explicit_default() {
+        let map = HashMap::from([
+            (
+                "enabled".to_string(),
+                serde_yaml::Value::String(" on ".into()),
+            ),
+            (
+                "broken".to_string(),
+                serde_yaml::Value::String("maybe".into()),
+            ),
+        ]);
+        assert!(bool_or(&map, "enabled", false));
+        assert!(!bool_or(&map, "broken", false));
+        assert!(bool_or(&map, "broken", true));
+        assert!(bool_or(&map, "missing", true));
+        assert!(!bool_or(&map, "missing", false));
+    }
+
+    #[test]
+    fn flag_enabled_only_treats_off_values_as_disabled() {
+        for disabled in ["0", "false", "FALSE", " no ", "off"] {
+            assert!(!flag_enabled(disabled), "{disabled:?}");
+        }
+        for enabled in ["1", "true", "", "yes", "on", "other"] {
+            assert!(flag_enabled(enabled), "{enabled:?}");
+        }
+    }
+
+    #[test]
+    fn keep_converted_text_prefers_env_then_setting_then_default() {
+        let setting = |value: serde_yaml::Value| {
+            HashMap::from([("convert.keep-txt".to_string(), value)])
+        };
+        let enabled = setting(serde_yaml::Value::Bool(true));
+        let disabled = setting(serde_yaml::Value::Bool(false));
+        // env が最優先 (設定が true でも env の 0/off で切れる)。
+        assert!(!keep_converted_text(&enabled, Some(" 0 "), true));
+        assert!(!keep_converted_text(&enabled, Some("off"), true));
+        assert!(keep_converted_text(&disabled, Some("1"), false));
+        // 設定は Bool と Number (非 0) を解釈する。
+        assert!(!keep_converted_text(&disabled, None, true));
+        assert!(keep_converted_text(&enabled, None, false));
+        assert!(!keep_converted_text(
+            &setting(serde_yaml::Value::Number(0.into())),
+            None,
+            true
+        ));
+        assert!(keep_converted_text(
+            &setting(serde_yaml::Value::Number(1.into())),
+            None,
+            false
+        ));
+        // 文字列は「切る値の列挙」だけで解釈する (解釈できない文字列は保存する側)。
+        assert!(keep_converted_text(
+            &setting(serde_yaml::Value::String("maybe".into())),
+            None,
+            false
+        ));
+        assert!(!keep_converted_text(
+            &setting(serde_yaml::Value::String("0".into())),
+            None,
+            true
+        ));
+        // 未設定・解釈不能は呼び出し側の既定 (native true / Worker false)。
+        assert!(keep_converted_text(&HashMap::new(), None, true));
+        assert!(!keep_converted_text(&HashMap::new(), None, false));
+        assert!(keep_converted_text(
+            &setting(serde_yaml::Value::Null),
+            None,
+            true
+        ));
     }
 }

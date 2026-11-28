@@ -1,0 +1,43 @@
+[package]
+name = "narou_worker"
+version = "0.6.13"
+edition = "2024"
+publish = false
+# The Worker always enables `narou_rs/worker-runtime`, which implies `lite` and
+# therefore embeds AozoraEpub3_Lite (GPL-3.0-only). Deployed workers are
+# distributed under GPL-3.0-only; see assets/aozora_lite/LICENSE.md.
+license = "GPL-3.0-only"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+
+# Like the Worker entrypoint, these runtime dependencies are only used on wasm.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+base64 = "0.23"
+brotli = "9.0"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["case-insensitive"] }
+crc32fast = "1.5"
+futures = "0.3"
+hex = "0.4"
+js-sys = "0.3"
+miniz_oxide = "0.9"
+narou_rs = { package = "narou_rs", path = "..", default-features = false, features = ["worker-runtime"] }
+parking_lot = "0.13"
+send_wrapper = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.11"
+subtle = "2.6"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+worker = { version = "0.8", features = ["d1", "queue"] }
+
+[build-dependencies]
+serde_json = "1"
+sha2 = "0.11"
+

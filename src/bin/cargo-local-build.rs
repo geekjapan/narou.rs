@@ -27,12 +27,29 @@ fn run() -> Result<(), String> {
     let exe_suffix = env::consts::EXE_SUFFIX;
     let app_binary = target_release_dir.join(format!("narou_rs{exe_suffix}"));
     let updater_binary = target_release_dir.join(format!("narou_rs_updater{exe_suffix}"));
+    let backup_binary = target_release_dir.join(format!("narou_rs_backup{exe_suffix}"));
+    let login_binary = target_release_dir.join(format!("narou_rs_login{exe_suffix}"));
+    let mcp_binary = target_release_dir.join(format!("narou_rs_mcp{exe_suffix}"));
+    // A local package must ship with the real browser transfer codec; building
+    // it is part of the package, not an optional extra (no fallback path).
+    build_transfer_wasm_artifacts(&root)?;
 
     build_release_binary(&options, "narou_rs_updater")?;
+    build_release_binary(&options, "narou_rs_backup")?;
+    build_release_binary(&options, "narou_rs_login")?;
+    build_release_binary(&options, "narou_rs_mcp")?;
     let updater_hash = sha256_file(&updater_binary)
         .map_err(|err| format!("failed to hash {}: {err}", updater_binary.display()))?;
     build_app_binary(&options, &updater_hash)?;
-    create_local_package(&root, &app_binary, &updater_binary)?;
+    create_local_package(
+        &root,
+        &app_binary,
+        &updater_binary,
+        &backup_binary,
+        &login_binary,
+        &mcp_binary,
+        options.gpl,
+    )?;
 
     println!("Created {}", root.join("narou").display());
     Ok(())
@@ -40,12 +57,14 @@ fn run() -> Result<(), String> {
 
 struct Options {
     locked: bool,
+    gpl: bool,
     target: Option<String>,
 }
 
 impl Options {
     fn parse(args: impl Iterator<Item = OsString>) -> Result<Self, String> {
         let mut locked = false;
+        let mut gpl = false;
         let mut target = None;
         let mut iter = args.peekable();
         while let Some(arg) = iter.next() {
@@ -54,6 +73,7 @@ impl Options {
                 .map_err(|_| "arguments must be valid UTF-8".to_string())?;
             match arg.as_str() {
                 "--locked" => locked = true,
+                "--gpl" => gpl = true,
                 "--release" => {}
                 "--target" => {
                     let value = iter
@@ -70,13 +90,14 @@ impl Options {
                 other => return Err(format!("unsupported argument: {other}\n\n{}", help_text())),
             }
         }
-        Ok(Self { locked, target })
+        Ok(Self { locked, gpl, target })
     }
 }
 
 fn help_text() -> String {
-    "usage: cargo local-build [--locked] [--target <triple>]\n\
-     Builds release binaries and creates a local narou/ package directory."
+    "usage: cargo local-build [--gpl] [--locked] [--target <triple>]\n\
+     Builds release binaries and creates a local narou/ package directory.\n\
+     --gpl embeds AozoraEpub3_Lite and includes the GPL license notice."
         .to_string()
 }
 
@@ -89,10 +110,25 @@ fn build_release_binary(options: &Options, bin: &str) -> Result<(), String> {
 fn build_app_binary(options: &Options, updater_hash: &str) -> Result<(), String> {
     let mut command = cargo_build_command(options);
     command.args(["--bin", "narou_rs"]);
+    if options.gpl {
+        command.args(["--features", "lite"]);
+    }
     command.env("NAROU_RS_RELEASE_BUILD", "1");
     command.env("NAROU_RS_LOCAL_BUILD", "1");
     command.env("NAROU_RS_UPDATER_SHA256", updater_hash);
+    command.env("NAROU_RS_REQUIRE_TRANSFER_ARTIFACTS", "1");
     run_command(&mut command, "failed to build narou_rs")
+}
+
+/// Runs `scripts/build-transfer-wasm.mjs` so `build.rs` can embed the real
+/// browser codec (glue/wasm/worker). Fails closed like the rest of the
+/// package: a distributable build without the artifacts must not silently
+/// degrade, and there is no server-side ZIP path to fall back to.
+fn build_transfer_wasm_artifacts(root: &Path) -> Result<(), String> {
+    let script = root.join("scripts").join("build-transfer-wasm.mjs");
+    let mut command = Command::new("node");
+    command.arg(&script).current_dir(root);
+    run_command(&mut command, "failed to build transfer WASM artifacts")
 }
 
 fn cargo_build_command(options: &Options) -> Command {
@@ -123,11 +159,14 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     let digest = Sha256::digest(&bytes);
     Ok(hex::encode(digest))
 }
-
 fn create_local_package(
     root: &Path,
     app_binary: &Path,
     updater_binary: &Path,
+    backup_binary: &Path,
+    login_binary: &Path,
+    mcp_binary: &Path,
+    gpl: bool,
 ) -> Result<(), String> {
     let package_root = root.join("narou");
     if !app_binary.is_file() {
@@ -137,6 +176,18 @@ fn create_local_package(
         return Err(format!(
             "updater binary not found: {}",
             updater_binary.display()
+        ));
+    }
+    if !backup_binary.is_file() {
+        return Err(format!(
+            "backup binary not found: {}",
+            backup_binary.display()
+        ));
+    }
+    if !login_binary.is_file() {
+        return Err(format!(
+            "login binary not found: {}",
+            login_binary.display()
         ));
     }
 
@@ -150,15 +201,33 @@ fn create_local_package(
     copy_file(app_binary, &package_root.join(file_name(app_binary)?))?;
     let updater_name = format!("{}.new", file_name(updater_binary)?);
     copy_file(updater_binary, &package_root.join(updater_name))?;
+    copy_file(backup_binary, &package_root.join(file_name(backup_binary)?))?;
+    copy_file(login_binary, &package_root.join(file_name(login_binary)?))?;
+    if !mcp_binary.is_file() {
+        return Err(format!(
+            "mcp binary not found: {}",
+            mcp_binary.display()
+        ));
+    }
+    copy_file(mcp_binary, &package_root.join(file_name(mcp_binary)?))?;
 
     for dir in ["webnovel", "preset"] {
         copy_dir_recursive(&root.join(dir), &package_root.join(dir))?;
     }
-    for file in ["LICENSE", "README.md", "Third-Party-License.md"] {
+    for file in ["LICENSE", "README.md"] {
         let source = root.join(file);
         if source.is_file() {
             copy_file(&source, &package_root.join(file))?;
         }
+    }
+    // Match the release archive's notice selection for the chosen variant.
+    let notice = root.join(if gpl {
+        "Third-Party-License.md"
+    } else {
+        "Third-Party-License-non-GPL.md"
+    });
+    if notice.is_file() {
+        copy_file(&notice, &package_root.join("Third-Party-License.md"))?;
     }
     fs::write(
         package_root.join("commitversion"),
@@ -214,13 +283,12 @@ fn resolve_commit_version(root: &Path) -> String {
         .args(["describe", "--always"])
         .current_dir(root)
         .output();
-    if let Ok(output) = output {
-        if output.status.success() {
+    if let Ok(output) = output
+        && output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !text.is_empty() {
                 return text;
             }
         }
-    }
     env!("CARGO_PKG_VERSION").to_string()
 }

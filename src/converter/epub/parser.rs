@@ -202,12 +202,12 @@ fn parse_line_into(line: &str, out: &mut Vec<Block>) {
 
 /// 行頭の `［＃N字下げ］` 系プレフィックスを 1 つ除去する。
 fn strip_indent_prefix(line: &str) -> &str {
-    if let Some(rest) = line.strip_prefix("［＃") {
-        if let Some(end) = rest.find('］') {
-            let tag = &rest[..end];
-            if tag.ends_with("字下げ") && !tag.starts_with("ここ") {
-                return &rest[end + '］'.len_utf8()..];
-            }
+    if let Some(rest) = line.strip_prefix("［＃")
+        && let Some(end) = rest.find('］')
+    {
+        let tag = &rest[..end];
+        if tag.ends_with("字下げ") && !tag.starts_with("ここ") {
+            return &rest[end + '］'.len_utf8()..];
         }
     }
     line
